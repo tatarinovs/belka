@@ -8,7 +8,7 @@
     type OAuthService,
     type ProviderKind,
   } from "$lib/api";
-  import { PROVIDERS, buildConfig, missingFields, providerDef } from "$lib/providers";
+  import { PROVIDERS, buildConfig, missingFields, presetFields, providerDef } from "$lib/providers";
   import PasswordInput from "./PasswordInput.svelte";
 
   let { open, account = null, accounts, onclose, onsaved }: {
@@ -38,6 +38,8 @@
   let kind = $state<ProviderKind>("yandex");
   let name = $state("");
   let values = $state<Record<string, string | boolean>>({});
+  /** The service chosen among the provider's presets; empty if none. */
+  let presetId = $state("");
   let busy = $state(false);
   let error = $state("");
   /** Google and Yandex sign in through the browser unless the user enters tokens. */
@@ -60,6 +62,8 @@
   const clouds = $derived(accounts.filter((a) => a.kind !== "crypt"));
 
   const def = $derived(providerDef(kind));
+  const preset = $derived(def.presets?.find((p) => p.id === presetId));
+  const fields = $derived(presetFields(def, preset));
   const service = $derived<OAuthService | null>(kind === "google" || kind === "yandex" ? kind : null);
   const browserMode = $derived(service !== null && !manual);
   const missing = $derived(missingFields(def, values));
@@ -114,6 +118,7 @@
   async function selectKind(next: ProviderKind) {
     kind = next;
     values = {};
+    presetId = "";
     error = "";
     manual = false;
     if (next === "crypt") {
@@ -121,6 +126,17 @@
       repeat = "";
     }
     if (next === "google" || next === "yandex") await loadOAuthApp(next);
+  }
+
+  /** Switches the service, replacing the values the previous one filled in. */
+  function selectPreset(id: string) {
+    const next = def.presets?.find((p) => p.id === id);
+    const updated = { ...values };
+    for (const [key, value] of Object.entries(preset?.values ?? {})) {
+      if (updated[key] === value) delete updated[key];
+    }
+    values = { ...updated, ...next?.values };
+    presetId = id;
   }
 
   /** Which OAuth app a browser sign-in to `service` uses by default. */
@@ -271,9 +287,21 @@
           Можно изменить название. Пароль и папку шифрования изменить нельзя: для этого создайте новую
           зашифрованную папку.
         {:else}
-          {def.help}
+          {preset?.help ?? def.help}
         {/if}
       </p>
+
+      {#if def.presets && !editing}
+        <label>
+          <span>Сервис</span>
+          <select value={presetId} onchange={(e) => selectPreset(e.currentTarget.value)} disabled={busy}>
+            <option value="" disabled>Выберите сервис</option>
+            {#each def.presets as p (p.id)}
+              <option value={p.id}>{p.title}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
 
       <label>
         <span>Название</span>
@@ -356,7 +384,7 @@
           {/if}
         </div>
       {:else}
-        {#each def.fields as field (def.kind + field.key)}
+        {#each fields as field (def.kind + field.key)}
           {#if field.type === "checkbox"}
             <label class="check">
               <input

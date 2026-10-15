@@ -1,6 +1,8 @@
 pub mod clean;
 pub mod local_upload;
 pub mod remote_urls;
+pub mod restore;
+pub mod rotate;
 
 /// Counters reported at the end of a run; `failed > 0` yields a non-zero exit code.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

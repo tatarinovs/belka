@@ -284,9 +284,11 @@ Supported cloud providers (-p, --provider):
            WEBDAV_URL, WEBDAV_USER, WEBDAV_PASSWORD
            WEBDAV_ETAG_IS_MD5          optional, 'true' if the server's ETag is the file MD5
 
-  s3       S3 compatible (AWS, Cloudflare R2, MinIO, Yandex Object Storage)
+  s3       S3 compatible (AWS, Cloudflare R2, Backblaze B2, Wasabi, MinIO,
+           Yandex Object Storage, Selectel, VK Cloud, ...)
            S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
-           S3_REGION                   optional, default {DEFAULT_S3_REGION} (R2: auto)
+           S3_REGION                   optional; known services get it from the endpoint
+                                       (R2, B2, Wasabi, AWS, ...), others default to {DEFAULT_S3_REGION}
 
   synology Synology NAS (DSM File Station API)
            SYNOLOGY_URL                DSM host, e.g. 192.168.1.10, or a URL such as
@@ -304,6 +306,16 @@ Encryption (any provider, rclone crypt format):
            CRYPT_ROOT                  cloud folder that holds the encrypted tree, default /
            CRYPT_FILENAMES             standard (default, names encrypted) or off
            Plain passwords, not the obscured values from rclone.conf (see `rclone reveal`).
+
+Notifications (any combination; `belka --notify-test` checks them):
+           NOTIFY_TELEGRAM_TOKEN, NOTIFY_TELEGRAM_CHAT
+                                       bot token from @BotFather and the chat ID
+           NOTIFY_TELEGRAM_API         optional, Bot API server, default https://api.telegram.org
+           NOTIFY_WEBHOOK_URL          JSON POST; Slack, Discord, Mattermost accept it as is
+           NOTIFY_PING_URL             healthchecks.io-style URL: /start, success, /fail;
+                                       pinged after every run
+           NOTIFY_ON                   failure (default) or always, for Telegram and webhook
+           NOTIFY_NAME                 optional job name shown in messages
 
 Optional for URL mirroring: GITHUB_TOKEN (raises the GitHub API rate limit).
 

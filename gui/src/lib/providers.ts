@@ -9,6 +9,18 @@ export interface Field {
   hint?: string;
 }
 
+/** A known service behind a generic provider: fills in what it can. */
+export interface Preset {
+  id: string;
+  title: string;
+  /** Where to get the address and the credentials. */
+  help: string;
+  /** Values filled in when the preset is chosen. */
+  values?: Record<string, string>;
+  /** Placeholders replacing the provider's ones, for values that vary per account. */
+  placeholders?: Record<string, string>;
+}
+
 export interface ProviderDef {
   kind: ProviderKind;
   title: string;
@@ -19,7 +31,133 @@ export interface ProviderDef {
   share?: boolean;
   /** Links can have a password and an expiry date. */
   shareOptions?: boolean;
+  /** Services offered for quick setup; the last one is a generic server. */
+  presets?: Preset[];
 }
+
+const S3_PRESETS: Preset[] = [
+  {
+    id: "aws",
+    title: "Amazon S3",
+    help: "Endpoint региона бакета: https://s3.<регион>.amazonaws.com. Ключи — IAM → Users → Security credentials.",
+    placeholders: { endpoint: "https://s3.eu-central-1.amazonaws.com" },
+  },
+  {
+    id: "r2",
+    title: "Cloudflare R2",
+    help: "Account ID виден на странице R2 в панели Cloudflare, ключи — R2 → Manage API tokens.",
+    placeholders: { endpoint: "https://<ACCOUNT_ID>.r2.cloudflarestorage.com" },
+  },
+  {
+    id: "b2",
+    title: "Backblaze B2",
+    help: "Endpoint указан на странице бакета (Buckets → Endpoint). Ключ — Application Keys: keyID и applicationKey.",
+    placeholders: { endpoint: "https://s3.us-west-004.backblazeb2.com" },
+  },
+  {
+    id: "wasabi",
+    title: "Wasabi",
+    help: "Endpoint зависит от региона бакета: https://s3.<регион>.wasabisys.com. Ключи — Access Keys в консоли.",
+    placeholders: { endpoint: "https://s3.eu-central-1.wasabisys.com" },
+  },
+  {
+    id: "yandex",
+    title: "Yandex Object Storage",
+    help: "Статический ключ доступа сервисного аккаунта с ролью storage.editor.",
+    values: { endpoint: "https://storage.yandexcloud.net" },
+  },
+  {
+    id: "selectel",
+    title: "Selectel",
+    help: "Адрес пула ru-1; для другого пула замените ru-1 (например на ru-7). Ключи — S3-ключи сервисного пользователя.",
+    values: { endpoint: "https://s3.ru-1.storage.selcloud.ru" },
+  },
+  {
+    id: "vk",
+    title: "VK Cloud",
+    help: "Ключи создаются в разделе Объектное хранилище → Аккаунты.",
+    values: { endpoint: "https://hb.ru-msk.vkcloud-storage.ru" },
+  },
+  {
+    id: "timeweb",
+    title: "Timeweb Cloud",
+    help: "Ключи — на вкладке «Дашборд» бакета.",
+    values: { endpoint: "https://s3.twcstorage.ru" },
+  },
+  {
+    id: "storj",
+    title: "Storj",
+    help: "S3-ключи создаются в Access → Create S3 Credentials.",
+    values: { endpoint: "https://gateway.storjshare.io" },
+  },
+  {
+    id: "do",
+    title: "DigitalOcean Spaces",
+    help: "Endpoint региона: https://<регион>.digitaloceanspaces.com. Ключи — API → Spaces Keys.",
+    placeholders: { endpoint: "https://fra1.digitaloceanspaces.com" },
+  },
+  {
+    id: "minio",
+    title: "MinIO",
+    help: "Адрес API сервера MinIO (по умолчанию порт 9000), ключи — Access Keys в консоли.",
+    placeholders: { endpoint: "http://192.168.1.10:9000" },
+  },
+  {
+    id: "other",
+    title: "Другой S3-совместимый",
+    help: "Любое хранилище с S3 API и path-style адресацией.",
+  },
+];
+
+const WEBDAV_PRESETS: Preset[] = [
+  {
+    id: "nextcloud",
+    title: "Nextcloud",
+    help: "Пароль приложения: Настройки → Безопасность → «Создать новый пароль приложения».",
+    placeholders: { url: "https://cloud.example.com/remote.php/dav/files/<пользователь>/" },
+  },
+  {
+    id: "owncloud",
+    title: "ownCloud",
+    help: "Адрес WebDAV показан в настройках файлов (значок шестерёнки внизу слева).",
+    placeholders: { url: "https://cloud.example.com/remote.php/webdav/" },
+  },
+  {
+    id: "koofr",
+    title: "Koofr",
+    help: "Пользователь — e-mail, пароль — пароль приложения: Preferences → Passwords.",
+    values: { url: "https://app.koofr.net/dav/Koofr" },
+  },
+  {
+    id: "pcloud",
+    title: "pCloud",
+    help: "Для аккаунтов в регионе США адрес https://webdav.pcloud.com, для европейских — https://ewebdav.pcloud.com.",
+    values: { url: "https://ewebdav.pcloud.com" },
+  },
+  {
+    id: "4shared",
+    title: "4shared",
+    help: "E-mail и пароль от 4shared.",
+    values: { url: "https://webdav.4shared.com" },
+  },
+  {
+    id: "infinicloud",
+    title: "InfiniCLOUD",
+    help: "Адрес и пароль приложения — My Page → Apps Connection.",
+    placeholders: { url: "https://<сервер>.teracloud.jp/dav/" },
+  },
+  {
+    id: "synology",
+    title: "Synology (WebDAV Server)",
+    help: "Нужен пакет WebDAV Server; без него подойдёт тип «Synology NAS». HTTPS — порт 5006.",
+    placeholders: { url: "https://192.168.1.10:5006" },
+  },
+  {
+    id: "other",
+    title: "Другой WebDAV-сервер",
+    help: "Nextcloud, ownCloud, Synology и любой сервер WebDAV.",
+  },
+];
 
 export const PROVIDERS: ProviderDef[] = [
   {
@@ -66,6 +204,7 @@ export const PROVIDERS: ProviderDef[] = [
     title: "WebDAV",
     short: "W",
     help: "Nextcloud, ownCloud, Synology и любой сервер WebDAV.",
+    presets: WEBDAV_PRESETS,
     fields: [
       {
         key: "url",
@@ -87,7 +226,8 @@ export const PROVIDERS: ProviderDef[] = [
     kind: "s3",
     title: "S3-совместимое",
     short: "S3",
-    help: "AWS S3, Cloudflare R2, MinIO, Yandex Object Storage.",
+    help: "AWS S3, Cloudflare R2, Backblaze B2, MinIO, Yandex Object Storage и другие.",
+    presets: S3_PRESETS,
     fields: [
       { key: "endpoint", label: "Endpoint", type: "url", placeholder: "https://…r2.cloudflarestorage.com" },
       { key: "bucket", label: "Бакет" },
@@ -97,7 +237,8 @@ export const PROVIDERS: ProviderDef[] = [
         key: "region",
         label: "Регион",
         optional: true,
-        placeholder: "us-east-1 (R2: auto)",
+        placeholder: "по адресу endpoint, иначе us-east-1",
+        hint: "Для известных сервисов определяется по адресу; укажите, если сервер требует другой.",
       },
     ],
   },
@@ -138,6 +279,14 @@ export const PROVIDERS: ProviderDef[] = [
     fields: [],
   },
 ];
+
+/** The fields of `def` with the placeholders of `preset` applied. */
+export function presetFields(def: ProviderDef, preset: Preset | undefined): Field[] {
+  if (!preset?.placeholders) return def.fields;
+  return def.fields.map((f) =>
+    preset.placeholders?.[f.key] ? { ...f, placeholder: preset.placeholders[f.key] } : f,
+  );
+}
 
 export function providerDef(kind: ProviderKind): ProviderDef {
   return PROVIDERS.find((p) => p.kind === kind) ?? PROVIDERS[0];

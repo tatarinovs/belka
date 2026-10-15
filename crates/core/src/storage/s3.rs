@@ -106,6 +106,37 @@ struct InitiateMultipartUploadResult {
     upload_id: String,
 }
 
+/// The signing region of well-known services, derived from the endpoint, so
+/// that only the endpoint has to be entered. `None` for unknown hosts.
+pub fn region_for_endpoint(endpoint: &str) -> Option<String> {
+    let url = Url::parse(endpoint.trim()).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host.ends_with(".r2.cloudflarestorage.com") {
+        return Some("auto".into());
+    }
+    let fixed = match host.as_str() {
+        "storage.yandexcloud.net" => Some("ru-central1"),
+        "hb.vkcloud-storage.ru" => Some("ru-msk"),
+        _ => None,
+    };
+    if let Some(region) = fixed {
+        return Some(region.into());
+    }
+    // `<prefix><region><suffix>`, the region being a single DNS label.
+    const PATTERNS: [(&str, &str); 6] = [
+        ("s3.", ".amazonaws.com"),
+        ("s3.", ".backblazeb2.com"),
+        ("s3.", ".wasabisys.com"),
+        ("s3.", ".storage.selcloud.ru"),
+        ("hb.", ".vkcloud-storage.ru"),
+        ("", ".digitaloceanspaces.com"),
+    ];
+    PATTERNS.iter().find_map(|(prefix, suffix)| {
+        let region = host.strip_prefix(prefix)?.strip_suffix(suffix)?;
+        (!region.is_empty() && !region.contains('.')).then(|| region.to_string())
+    })
+}
+
 impl S3Provider {
     pub fn new(
         endpoint: &str,
@@ -815,6 +846,35 @@ mod tests {
             access_key: "AKIAIOSFODNN7EXAMPLE".into(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
             region: "us-east-1".into(),
+        }
+    }
+
+    #[test]
+    fn region_is_derived_from_known_endpoints() {
+        let cases = [
+            ("https://abc123.r2.cloudflarestorage.com", Some("auto")),
+            ("https://storage.yandexcloud.net", Some("ru-central1")),
+            (
+                "https://s3.eu-central-003.backblazeb2.com",
+                Some("eu-central-003"),
+            ),
+            ("https://s3.eu-west-1.wasabisys.com/", Some("eu-west-1")),
+            ("https://S3.eu-north-1.amazonaws.com", Some("eu-north-1")),
+            ("https://s3.ru-7.storage.selcloud.ru", Some("ru-7")),
+            ("https://hb.ru-msk.vkcloud-storage.ru", Some("ru-msk")),
+            ("https://hb.vkcloud-storage.ru", Some("ru-msk")),
+            ("https://fra1.digitaloceanspaces.com", Some("fra1")),
+            ("https://s3.amazonaws.com", None),
+            ("https://s3.twcstorage.ru", None),
+            ("http://192.168.1.5:9000", None),
+            ("not a url", None),
+        ];
+        for (endpoint, region) in cases {
+            assert_eq!(
+                region_for_endpoint(endpoint).as_deref(),
+                region,
+                "{endpoint}"
+            );
         }
     }
 

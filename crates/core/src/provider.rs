@@ -3,7 +3,7 @@
 
 use crate::storage::google::{GoogleAuth, GoogleDriveProvider};
 use crate::storage::mailru::MailruProvider;
-use crate::storage::s3::S3Provider;
+use crate::storage::s3::{region_for_endpoint, S3Provider};
 use crate::storage::synology::SynologyProvider;
 use crate::storage::webdav::WebDavProvider;
 use crate::storage::yandex::YandexDiskProvider;
@@ -100,13 +100,18 @@ impl ProviderConfig {
                 access_key_id,
                 secret_access_key,
                 region,
-            } => Box::new(S3Provider::new(
-                &endpoint,
-                bucket,
-                access_key_id,
-                secret_access_key,
-                region.unwrap_or_else(|| DEFAULT_S3_REGION.to_string()),
-            )?),
+            } => {
+                let region = region
+                    .or_else(|| region_for_endpoint(&endpoint))
+                    .unwrap_or_else(|| DEFAULT_S3_REGION.to_string());
+                Box::new(S3Provider::new(
+                    &endpoint,
+                    bucket,
+                    access_key_id,
+                    secret_access_key,
+                    region,
+                )?)
+            }
             Self::Synology {
                 url,
                 port,
