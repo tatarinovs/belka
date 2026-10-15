@@ -5,8 +5,8 @@ use super::{
     as_md5, parse_http_date, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider,
 };
 use crate::client::{
-    build_http_client, bytes_body, download, ensure_success, file_body, http_error, send,
-    upload_timeout, API_TIMEOUT,
+    build_http_client, bytes_body, download_into, ensure_success, http_error, send, source_body,
+    upload_timeout, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::format::format_bytes;
@@ -20,7 +20,6 @@ use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MO
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, warn};
 use url::Url;
@@ -270,9 +269,9 @@ impl S3Provider {
         }
     }
 
-    async fn put_single(&self, local: &Path, key: &str, progress: &Progress) -> Result<()> {
+    async fn put_single(&self, source: &dyn Source, key: &str, progress: &Progress) -> Result<()> {
         let resp = send(&format!("s3: upload '{key}'"), || {
-            let (body, len) = file_body(local, progress)?;
+            let (body, len) = (source_body(source, 0, progress)?, source.len());
             Ok(self
                 .request(Method::PUT, Some(key), &[], UNSIGNED_PAYLOAD)
                 .header(CONTENT_LENGTH, len)
@@ -287,7 +286,7 @@ impl S3Provider {
 
     async fn put_multipart(
         &self,
-        local: &Path,
+        source: &dyn Source,
         key: &str,
         size: u64,
         progress: &Progress,
@@ -312,7 +311,7 @@ impl S3Provider {
             upload_id: &init.upload_id,
         };
         let result = match self
-            .upload_parts(local, key, &init.upload_id, size, progress)
+            .upload_parts(source, key, &init.upload_id, size, progress)
             .await
         {
             Ok(etags) => self.complete_multipart(key, &init.upload_id, &etags).await,
@@ -343,7 +342,7 @@ impl S3Provider {
 
     async fn upload_parts(
         &self,
-        local: &Path,
+        source: &dyn Source,
         key: &str,
         upload_id: &str,
         size: u64,
@@ -353,9 +352,7 @@ impl S3Provider {
         progress.set_done(0);
         let part_size = MIN_PART_SIZE.max(size.div_ceil(MAX_PARTS));
         let total_parts = size.div_ceil(part_size);
-        let mut file = tokio::fs::File::open(local)
-            .await
-            .with_context(|| format!("Failed to open '{}'", local.display()))?;
+        let mut reader = source.open_at(0)?;
 
         let mut etags = Vec::with_capacity(total_parts as usize);
         let mut remaining = size;
@@ -363,9 +360,10 @@ impl S3Provider {
         while remaining > 0 {
             let len = part_size.min(remaining);
             let mut buf = vec![0u8; len as usize];
-            file.read_exact(&mut buf)
+            reader
+                .read_exact(&mut buf)
                 .await
-                .with_context(|| format!("Failed to read '{}'", local.display()))?;
+                .with_context(|| format!("Failed to read the data for '{key}'"))?;
             let data = Bytes::from(buf);
             let hash = hex::encode(Sha256::digest(&data));
             let number = part_number.to_string();
@@ -541,9 +539,9 @@ impl StorageProvider for S3Provider {
         }))
     }
 
-    async fn upload_file(
+    async fn upload(
         &self,
-        local_path: &Path,
+        source: &dyn Source,
         remote_path: &str,
         progress: &Progress,
     ) -> Result<()> {
@@ -551,21 +549,18 @@ impl StorageProvider for S3Provider {
         if key.is_empty() {
             bail!("Invalid S3 object key for '{remote_path}'");
         }
-        let size = tokio::fs::metadata(local_path)
-            .await
-            .with_context(|| format!("Failed to read metadata of '{}'", local_path.display()))?
-            .len();
+        let size = source.len();
         if size > MULTIPART_THRESHOLD {
-            self.put_multipart(local_path, &key, size, progress).await
+            self.put_multipart(source, &key, size, progress).await
         } else {
-            self.put_single(local_path, &key, progress).await
+            self.put_single(source, &key, progress).await
         }
     }
 
-    async fn download_file(
+    async fn download_to(
         &self,
         remote_path: &str,
-        local_path: &Path,
+        sink: &mut dyn Sink,
         progress: &Progress,
     ) -> Result<u64> {
         let key = Self::key_for(remote_path);
@@ -573,12 +568,9 @@ impl StorageProvider for S3Provider {
             bail!("Invalid S3 object key for '{remote_path}'");
         }
         // The request is signed anew for every attempt.
-        download(
-            &format!("s3: download '{key}'"),
-            local_path,
-            progress,
-            || async { Ok(self.request(Method::GET, Some(&key), &[], EMPTY_SHA256)) },
-        )
+        download_into(&format!("s3: download '{key}'"), sink, progress, || async {
+            Ok(self.request(Method::GET, Some(&key), &[], EMPTY_SHA256))
+        })
         .await
     }
 

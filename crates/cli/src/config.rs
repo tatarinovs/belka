@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
+use belka_core::crypt::CryptConfig;
 use belka_core::oauth::{OAuthApp, Service};
 use belka_core::provider::{DEFAULT_S3_REGION, MAILRU_WEBDAV_URL};
+use belka_core::storage::crypt::CryptProvider;
 use belka_core::storage::google::GoogleAuth;
 use belka_core::{ProviderConfig, StorageProvider};
 use clap::ValueEnum;
@@ -128,8 +130,42 @@ pub fn oauth_app(service: Service) -> Result<Option<OAuthApp>> {
     }
 }
 
+/// Builds the provider, wrapped in encryption when CRYPT_PASSWORD is set.
 pub fn init_provider(kind: ProviderKind) -> Result<Box<dyn StorageProvider>> {
-    provider_config(kind)?.build()
+    let provider = provider_config(kind)?.build()?;
+    Ok(match crypt_config()? {
+        Some((root, config)) => Box::new(CryptProvider::new(provider.into(), &root, &config)?),
+        None => provider,
+    })
+}
+
+/// The encryption settings and the cloud folder that holds the encrypted tree.
+fn crypt_config() -> Result<Option<(String, CryptConfig)>> {
+    let Some(password) = var("CRYPT_PASSWORD") else {
+        for name in ["CRYPT_PASSWORD2", "CRYPT_ROOT", "CRYPT_FILENAMES"] {
+            if var(name).is_some() {
+                bail!("{name} is set without CRYPT_PASSWORD");
+            }
+        }
+        return Ok(None);
+    };
+    let encrypt_names = match var("CRYPT_FILENAMES")
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("standard") => true,
+        Some("off") => false,
+        Some(other) => bail!("CRYPT_FILENAMES must be 'standard' or 'off', not '{other}'"),
+    };
+    let config = CryptConfig {
+        password,
+        salt: var("CRYPT_PASSWORD2").unwrap_or_default(),
+        encrypt_names,
+    };
+    Ok(Some((
+        var("CRYPT_ROOT").unwrap_or_else(|| "/".into()),
+        config,
+    )))
 }
 
 /// Reads the settings of `kind` from the environment.
@@ -231,6 +267,14 @@ Supported cloud providers (-p, --provider):
   s3       S3 compatible (AWS, Cloudflare R2, MinIO, Yandex Object Storage)
            S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
            S3_REGION                   optional, default {DEFAULT_S3_REGION} (R2: auto)
+
+Encryption (any provider, rclone crypt format):
+           CRYPT_PASSWORD              enables encryption: files are encrypted before
+                                       upload and decrypted on download
+           CRYPT_PASSWORD2             optional salt, rclone's password2
+           CRYPT_ROOT                  cloud folder that holds the encrypted tree, default /
+           CRYPT_FILENAMES             standard (default, names encrypted) or off
+           Plain passwords, not the obscured values from rclone.conf (see `rclone reveal`).
 
 Optional for URL mirroring: GITHUB_TOKEN (raises the GitHub API rate limit).
 

@@ -1,10 +1,12 @@
 mod accounts;
 mod local;
+mod preview;
 mod transfers;
 
-use accounts::{Account, AccountStore};
+use accounts::{Account, AccountStore, CryptFolder, CryptLocation, CRYPT_KIND};
 use anyhow::{bail, Context, Result};
 use belka_core::oauth::{self, OAuthApp, Service};
+use belka_core::storage::crypt::CryptProvider;
 use belka_core::storage::{check_name, rename_target};
 use belka_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name};
 use belka_core::{ProviderConfig, RemoteFileInfo, StorageProvider};
@@ -27,6 +29,7 @@ struct AppState {
     transfers: Arc<Transfers>,
     /// Aborts the browser sign-in in progress.
     sign_in_cancel: Mutex<Option<oneshot::Sender<()>>>,
+    previews: preview::Previews,
 }
 
 impl AppState {
@@ -34,8 +37,14 @@ impl AppState {
         if let Some(p) = self.providers.lock().unwrap().get(account_id) {
             return Ok(p.clone());
         }
-        let config = self.accounts.lock().unwrap().credentials(account_id)?;
-        let provider: Arc<dyn StorageProvider> = config.build()?.into();
+        let provider: Arc<dyn StorageProvider> = if self.account(account_id)?.kind == CRYPT_KIND {
+            let folder = self.accounts.lock().unwrap().crypt_folder(account_id)?;
+            let base = self.provider(&folder.base)?;
+            Arc::new(CryptProvider::new(base, &folder.root, &folder.config)?)
+        } else {
+            let config = self.accounts.lock().unwrap().credentials(account_id)?;
+            config.build()?.into()
+        };
         self.providers
             .lock()
             .unwrap()
@@ -43,15 +52,18 @@ impl AppState {
         Ok(provider)
     }
 
-    fn account_name(&self, account_id: &str) -> Result<String> {
+    fn account(&self, account_id: &str) -> Result<Account> {
         self.accounts
             .lock()
             .unwrap()
             .list()?
             .into_iter()
             .find(|a| a.id == account_id)
-            .map(|a| a.name)
             .context("Account not found")
+    }
+
+    fn account_name(&self, account_id: &str) -> Result<String> {
+        self.account(account_id).map(|a| a.name)
     }
 }
 
@@ -64,7 +76,18 @@ fn to_msg(err: anyhow::Error) -> String {
 
 #[tauri::command]
 fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<Account>> {
-    state.accounts.lock().unwrap().list().map_err(to_msg)
+    let store = state.accounts.lock().unwrap();
+    let mut accounts = store.list().map_err(to_msg)?;
+    // Encrypted folders added before the location was kept in the list.
+    for account in &mut accounts {
+        if account.kind == CRYPT_KIND && account.crypt.is_none() {
+            account.crypt = store.crypt_folder(&account.id).ok().map(|f| CryptLocation {
+                base: f.base,
+                root: f.root,
+            });
+        }
+    }
+    Ok(accounts)
 }
 
 /// Checks that the credentials work before saving the account.
@@ -178,10 +201,59 @@ fn oauth_cancel(state: State<'_, AppState>) {
     }
 }
 
+/// Adds an encrypted folder in account `folder.base`. An empty folder or
+/// one encrypted with the same password is accepted.
+#[tauri::command]
+async fn add_crypt_folder(
+    state: State<'_, AppState>,
+    name: String,
+    folder: CryptFolder,
+) -> CmdResult<Account> {
+    async {
+        if state.account(&folder.base)?.kind == CRYPT_KIND {
+            bail!("An encrypted folder cannot be placed inside another one");
+        }
+        let base = state.provider(&folder.base)?;
+        let (root, config) = (folder.root.clone(), folder.config.clone());
+        // Key derivation is deliberately slow.
+        let provider =
+            tauri::async_runtime::spawn_blocking(move || CryptProvider::new(base, &root, &config))
+                .await??;
+        provider.verify_password().await?;
+        let account = state.accounts.lock().unwrap().add_crypt(&name, &folder)?;
+        state
+            .providers
+            .lock()
+            .unwrap()
+            .insert(account.id.clone(), Arc::new(provider));
+        Ok(account)
+    }
+    .await
+    .map_err(to_msg)
+}
+
+/// Refuses to remove an account that encrypted folders are stored in.
 #[tauri::command]
 fn remove_account(state: State<'_, AppState>, id: String) -> CmdResult<()> {
-    state.providers.lock().unwrap().remove(&id);
-    state.accounts.lock().unwrap().remove(&id).map_err(to_msg)
+    let remove = || {
+        let store = state.accounts.lock().unwrap();
+        let dependent: Vec<String> = store
+            .list()?
+            .into_iter()
+            .filter(|a| a.kind == CRYPT_KIND)
+            .filter(|a| store.crypt_folder(&a.id).is_ok_and(|f| f.base == id))
+            .map(|a| format!("«{}»", a.name))
+            .collect();
+        if !dependent.is_empty() {
+            bail!(
+                "Encrypted folders {} are stored in this account; remove them first",
+                dependent.join(", ")
+            );
+        }
+        state.providers.lock().unwrap().remove(&id);
+        store.remove(&id)
+    };
+    remove().map_err(to_msg)
 }
 
 #[tauri::command]
@@ -309,6 +381,58 @@ async fn cloud_unshare(
     }
     .await
     .map_err(to_msg)
+}
+
+/// Downloads a cloud file into the preview cache (once) and returns where it
+/// is; with `text`, also its content.
+#[tauri::command]
+async fn preview_file(
+    state: State<'_, AppState>,
+    account_id: String,
+    path: String,
+    size: u64,
+    modified: Option<String>,
+    text: bool,
+) -> CmdResult<preview::Preview> {
+    async {
+        let provider = state.provider(&account_id)?;
+        let item = preview::Item {
+            account_id: &account_id,
+            path: &normalize_remote_dir(&path),
+            size,
+            modified: modified.as_deref(),
+        };
+        state.previews.load(&*provider, item, text).await
+    }
+    .await
+    .map_err(to_msg)
+}
+
+#[tauri::command]
+fn preview_progress(state: State<'_, AppState>) -> (u64, u64) {
+    state.previews.progress()
+}
+
+#[tauri::command]
+fn preview_cancel(state: State<'_, AppState>) {
+    state.previews.cancel();
+}
+
+/// Opens a cached preview in the program the system associates with it.
+#[tauri::command]
+fn preview_open(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<()> {
+    let path = state.previews.cached(&path).map_err(to_msg)?;
+    app.opener()
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|err| err.to_string())
+}
+
+/// Opens a local file in the program the system associates with it.
+#[tauri::command]
+fn local_open(app: tauri::AppHandle, path: String) -> CmdResult<()> {
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -593,11 +717,13 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
+            let preview_dir = app.path().app_cache_dir()?.join("preview");
             app.manage(AppState {
                 accounts: Mutex::new(AccountStore::new(config_dir)),
                 providers: Mutex::new(HashMap::new()),
                 transfers: Transfers::new(),
                 sign_in_cancel: Mutex::new(None),
+                previews: preview::Previews::new(preview_dir),
             });
             // The page shows the hidden window once it is drawn; if it fails
             // to load, the window still appears.
@@ -614,6 +740,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             add_account,
+            add_crypt_folder,
             oauth_apps,
             oauth_sign_in,
             oauth_cancel,
@@ -628,6 +755,11 @@ pub fn run() {
             cloud_delete,
             cloud_share,
             cloud_unshare,
+            preview_file,
+            preview_progress,
+            preview_cancel,
+            preview_open,
+            local_open,
             local_mkdir,
             local_rename,
             local_delete,

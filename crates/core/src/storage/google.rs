@@ -2,8 +2,8 @@
 
 use super::{as_md5, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider};
 use crate::client::{
-    backoff, client_builder, download, ensure_success, http_error, reader_body, send,
-    upload_timeout, Failure, API_TIMEOUT, MAX_ATTEMPTS,
+    backoff, client_builder, download_into, ensure_success, http_error, send, source_body,
+    upload_timeout, Failure, Sink, Source, API_TIMEOUT, MAX_ATTEMPTS,
 };
 use crate::progress::Progress;
 use crate::utils::path::{normalize_remote_dir, split_remote};
@@ -14,10 +14,7 @@ use reqwest::{redirect, Client, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::SeekFrom;
-use std::path::Path;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncSeekExt;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -348,19 +345,16 @@ impl GoogleDriveProvider {
             .context("Google Drive did not return an upload session URL")
     }
 
-    /// Sends the file from `offset` to the end into the upload session.
+    /// Sends the data from `offset` to the end into the upload session.
     async fn put_from(
         &self,
         session: &str,
-        local: &Path,
+        source: &dyn Source,
         offset: u64,
         size: u64,
         progress: &Progress,
     ) -> Result<UploadState, Failure> {
-        let mut file = tokio::fs::File::open(local)
-            .await
-            .with_context(|| format!("Failed to open '{}'", local.display()))?;
-        file.seek(SeekFrom::Start(offset)).await?;
+        let body = source_body(source, offset, progress)?;
         let remaining = size - offset;
         let mut req = self
             .client
@@ -370,8 +364,7 @@ impl GoogleDriveProvider {
         if size > 0 {
             req = req.header(CONTENT_RANGE, format!("bytes {offset}-{}/{size}", size - 1));
         }
-        progress.set_done(offset);
-        let resp = req.body(reader_body(file, progress.clone())).send().await?;
+        let resp = req.body(body).send().await?;
         classify_upload_response(resp).await
     }
 
@@ -394,7 +387,7 @@ impl GoogleDriveProvider {
     async fn upload_resumable(
         &self,
         session: &str,
-        local: &Path,
+        source: &dyn Source,
         size: u64,
         progress: &Progress,
     ) -> Result<()> {
@@ -402,7 +395,7 @@ impl GoogleDriveProvider {
         let mut offset = 0;
         let mut attempt = 1;
         loop {
-            match self.put_from(session, local, offset, size, progress).await {
+            match self.put_from(session, source, offset, size, progress).await {
                 Ok(UploadState::Done) => return Ok(()),
                 Ok(UploadState::Incomplete(next)) => {
                     if next <= offset {
@@ -478,9 +471,9 @@ impl StorageProvider for GoogleDriveProvider {
             .map(|file| file.into_info(path)))
     }
 
-    async fn upload_file(
+    async fn upload(
         &self,
-        local_path: &Path,
+        source: &dyn Source,
         remote_path: &str,
         progress: &Progress,
     ) -> Result<()> {
@@ -493,10 +486,7 @@ impl StorageProvider for GoogleDriveProvider {
             .await?
             .with_context(|| format!("Failed to resolve folder '{parent}'"))?;
         let existing = self.find_child(&parent_id, &name, Some(false)).await?;
-        let size = tokio::fs::metadata(local_path)
-            .await
-            .with_context(|| format!("Failed to read metadata of '{}'", local_path.display()))?
-            .len();
+        let size = source.len();
 
         let session = self
             .start_session(
@@ -506,14 +496,14 @@ impl StorageProvider for GoogleDriveProvider {
                 size,
             )
             .await?;
-        self.upload_resumable(&session, local_path, size, progress)
+        self.upload_resumable(&session, source, size, progress)
             .await
     }
 
-    async fn download_file(
+    async fn download_to(
         &self,
         remote_path: &str,
-        local_path: &Path,
+        sink: &mut dyn Sink,
         progress: &Progress,
     ) -> Result<u64> {
         let path = normalize_remote_dir(remote_path);
@@ -529,9 +519,9 @@ impl StorageProvider for GoogleDriveProvider {
             bail!("'{path}' is a Google Docs file and cannot be downloaded as is");
         }
         let url = format!("{FILES_API}/{}", item.id);
-        download(
+        download_into(
             &format!("google: download '{path}'"),
-            local_path,
+            sink,
             progress,
             || async {
                 let token = self.access_token().await?;

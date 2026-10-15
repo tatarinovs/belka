@@ -2,8 +2,8 @@
 
 use super::{as_md5, parse_http_date, rename_target, RemoteFileInfo, StorageProvider};
 use crate::client::{
-    build_http_client, download, ensure_success, file_body, http_error, send, send_with,
-    upload_timeout, RetryPolicy, API_TIMEOUT,
+    build_http_client, download_into, ensure_success, http_error, send, send_with, source_body,
+    upload_timeout, RetryPolicy, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::{encode_component, normalize_remote_dir};
@@ -14,7 +14,6 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
-use std::path::Path;
 use tracing::{debug, warn};
 use url::Url;
 
@@ -217,16 +216,16 @@ impl StorageProvider for WebDavProvider {
         Ok(entry.map(|e| self.to_info(e, path)))
     }
 
-    async fn upload_file(
+    async fn upload(
         &self,
-        local_path: &Path,
+        source: &dyn Source,
         remote_path: &str,
         progress: &Progress,
     ) -> Result<()> {
         let path = normalize_remote_dir(remote_path);
         let url = self.url_for(&path, false);
         let resp = send(&format!("webdav: upload '{path}'"), || {
-            let (body, len) = file_body(local_path, progress)?;
+            let (body, len) = (source_body(source, 0, progress)?, source.len());
             Ok(self
                 .request(Method::PUT, &url)
                 .header(CONTENT_TYPE, "application/octet-stream")
@@ -241,17 +240,17 @@ impl StorageProvider for WebDavProvider {
         }
     }
 
-    async fn download_file(
+    async fn download_to(
         &self,
         remote_path: &str,
-        local_path: &Path,
+        sink: &mut dyn Sink,
         progress: &Progress,
     ) -> Result<u64> {
         let path = normalize_remote_dir(remote_path);
         let url = self.url_for(&path, false);
-        download(
+        download_into(
             &format!("webdav: download '{path}'"),
-            local_path,
+            sink,
             progress,
             || async { Ok(self.request(Method::GET, &url)) },
         )

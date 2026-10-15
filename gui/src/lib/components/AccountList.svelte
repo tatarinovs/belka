@@ -157,6 +157,7 @@
   .badge[data-kind="google"] { background: #1e8e3e; }
   .badge[data-kind="webdav"] { background: #7c4dcc; }
   .badge[data-kind="s3"] { background: #c77700; }
+  .badge[data-kind="crypt"] { background: #455a64; }
 
   .remove {
     visibility: hidden;

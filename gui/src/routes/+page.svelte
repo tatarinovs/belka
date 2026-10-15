@@ -13,6 +13,7 @@
   import AccountMenu from "$lib/components/AccountMenu.svelte";
   import AddAccountDialog from "$lib/components/AddAccountDialog.svelte";
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
+  import PreviewDialog from "$lib/components/PreviewDialog.svelte";
   import Icon from "$lib/components/Icon.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
 
@@ -56,6 +57,8 @@
   let activePane = $state<"cloud" | "local">("cloud");
   let cloudPath = $state("/");
   let localPath = $state(stored(KEY_LOCAL) ?? "");
+  /** Files of the cloud folder being previewed and where the preview starts. */
+  let previewing = $state<{ files: Entry[]; start: number } | null>(null);
   /** Pane that files dragged from Explorer are currently over. */
   let externalOver = $state<string | null>(null);
 
@@ -103,14 +106,41 @@
     reveal: (path) => revealItemInDir(path),
   };
 
-  async function cloudListing(accountId: string, path: string): Promise<Listing> {
-    const entries = await api.listDir(accountId, path);
+  async function cloudListing(account: Account, path: string): Promise<Listing> {
+    const entries = markEncrypted(account, await api.listDir(account.id, path));
     return {
       path,
       parent: path === "/" ? null : parentPath(path),
       crumbs: splitPath(path),
       entries,
     };
+  }
+
+  /** Marks what is stored encrypted: everything in an encrypted folder, and
+   * in a regular cloud the encrypted folders and what is inside them. */
+  function markEncrypted(account: Account, entries: Entry[]): Entry[] {
+    if (account.kind === "crypt") {
+      return entries.map((e) => ({ ...e, locked: "Хранится в облаке зашифрованным" }));
+    }
+    const folders = accounts
+      .filter((a) => a.crypt?.base === account.id)
+      .map((a) => ({ account: a, root: "/" + a.crypt!.root.replace(/^\/+|\/+$/g, "") }));
+    if (!folders.length) return entries;
+    return entries.map((e) => {
+      for (const { account: folder, root } of folders) {
+        if (e.path === root) {
+          return {
+            ...e,
+            locked: `Зашифрованная папка «${folder.name}»: откройте, чтобы увидеть файлы`,
+            opensAccount: folder.id,
+          };
+        }
+        if (root === "/" || e.path.startsWith(root + "/")) {
+          return { ...e, locked: `Зашифрованные данные папки «${folder.name}»` };
+        }
+      }
+      return e;
+    });
   }
 
   function selectAccount(account: Account) {
@@ -280,7 +310,7 @@
           <FilePane
             bind:this={cloudPane}
             id="cloud"
-            load={(path) => cloudListing(selected.id, path)}
+            load={(path) => cloudListing(selected, path)}
             initialPath="/"
             rootPath="/"
             rootLabel={selected.name}
@@ -293,6 +323,11 @@
             ondragto={(target) => dragTo("cloud", target)}
             onswitch={() => localPane?.focus()}
             onnavigate={(path) => (cloudPath = path)}
+            onpreview={(entry, files) => (previewing = { files, start: files.indexOf(entry) })}
+            onopenaccount={(id) => {
+              const folder = accounts.find((a) => a.id === id);
+              if (folder) selectAccount(folder);
+            }}
             ops={cloudOps(selected)}
             copyLabel="Скачать на компьютер"
             canCopy={!busy && !!localPath}
@@ -357,6 +392,7 @@
           remember(KEY_LOCAL, path);
         }}
         ops={localOps}
+        onopenfile={(entry) => api.localOpen(entry.path).catch((err) => (notice = errorText(err)))}
         copyLabel="Загрузить в облако"
         canCopy={!busy && !!selected}
       >
@@ -395,7 +431,19 @@
   </div>
 {/if}
 
-<AddAccountDialog open={adding} onclose={() => (adding = false)} onadded={added} />
+{#if previewing && selected}
+  <PreviewDialog
+    account={selected}
+    files={previewing.files}
+    start={previewing.start}
+    onclose={() => {
+      previewing = null;
+      cloudPane?.focus();
+    }}
+  />
+{/if}
+
+<AddAccountDialog open={adding} {accounts} onclose={() => (adding = false)} onadded={added} />
 
 <style>
   main {

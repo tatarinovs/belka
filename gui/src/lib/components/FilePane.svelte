@@ -52,6 +52,9 @@
     ondragto,
     onswitch,
     onnavigate,
+    onopenaccount,
+    onpreview,
+    onopenfile,
   }: {
     /** Pane id used for drag and drop between panes. */
     id: string;
@@ -79,6 +82,12 @@
     /** Tab: move focus to the other pane. */
     onswitch: () => void;
     onnavigate?: (path: string) => void;
+    /** A row that stands for an encrypted folder was opened. */
+    onopenaccount?: (accountId: string) => void;
+    /** Space or double click on a file; `files` are the folder's files in display order. */
+    onpreview?: (entry: Entry, files: Entry[]) => void;
+    /** Enter or double click on a file, instead of the preview. */
+    onopenfile?: (entry: Entry) => void;
   } = $props();
 
   type SortKey = "name" | "size" | "modified";
@@ -205,7 +214,14 @@
   });
 
   function open(entry: Entry) {
-    if (entry.is_dir) navigate(entry.path);
+    if (entry.opensAccount && onopenaccount) onopenaccount(entry.opensAccount);
+    else if (entry.is_dir) navigate(entry.path);
+    else if (onopenfile) onopenfile(entry);
+    else preview(entry);
+  }
+
+  function preview(entry: Entry) {
+    if (onpreview && !entry.is_dir) onpreview(entry, sorted.filter((e) => !e.is_dir));
   }
 
   function goUp() {
@@ -321,6 +337,12 @@
         case "F5": oncopy(); break;
         case "Tab": onswitch(); break;
         case "Escape": selected.clear(); break;
+        case " ": {
+          const entry = sorted[index];
+          if (!entry || entry.is_dir || !onpreview) return;
+          preview(entry);
+          break;
+        }
         case "F2": if (selectedEntries.length === 1) startRename(selectedEntries[0]); break;
         case "Delete": removeSelected(); break;
         case "F7": newFolder(); break;
@@ -433,6 +455,12 @@
     const single = picked.length === 1 ? picked[0] : null;
     const items: MenuItem[] = [];
     if (single?.is_dir) items.push({ label: "Открыть", icon: "folder", shortcut: "Enter", action: () => open(single) });
+    if (single && !single.is_dir && onopenfile) {
+      items.push({ label: "Открыть", icon: "file", shortcut: "Enter", action: () => open(single) });
+    }
+    if (single && !single.is_dir && onpreview) {
+      items.push({ label: "Просмотр", icon: "eye", shortcut: "Пробел", action: () => preview(single) });
+    }
     if (picked.length && copyLabel) {
       items.push({
         label: copyLabel,
@@ -567,7 +595,12 @@
           }}
         >
           <span class="name" role="gridcell">
-            <span class="ico" data-kind={entry.icon ?? (entry.is_dir ? "dir" : "file")}><Icon name={iconFor(entry)} /></span>
+            <span class="ico" data-kind={entry.icon ?? (entry.is_dir ? "dir" : "file")} title={entry.locked}>
+              <Icon name={iconFor(entry)} />
+              {#if entry.locked}
+                <span class="lock"><Icon name="lock" size={10} /></span>
+              {/if}
+            </span>
             {#if renaming === entry.path}
               <input
                 class="rename"
@@ -788,8 +821,24 @@
   }
 
   .ico {
+    position: relative;
     display: inline-grid;
     color: var(--muted);
+  }
+
+  .lock {
+    position: absolute;
+    right: -4px;
+    bottom: -3px;
+    display: grid;
+    padding: 1px;
+    border-radius: 50%;
+    background: var(--surface);
+    color: #455a64;
+  }
+
+  .row.selected .lock {
+    background: var(--selected);
   }
 
   .ico[data-kind="dir"] {

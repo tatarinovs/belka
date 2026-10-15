@@ -19,6 +19,8 @@
     computer: "M3 5h18v11H3zm5 15h8m-4-4v4",
     arrowRight: "M5 12h14m-6-6 6 6-6 6",
     arrowLeft: "M19 12H5m6-6-6 6 6 6",
+    eye: "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+    lock: "M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z",
     link: "M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1",
   } as const;
   export type IconName = keyof typeof PATHS;

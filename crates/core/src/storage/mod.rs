@@ -1,9 +1,11 @@
+pub mod crypt;
 pub mod google;
 pub mod mailru;
 pub mod s3;
 pub mod webdav;
 pub mod yandex;
 
+use crate::client::{FileSource, PartSink, Sink, Source};
 use crate::progress::Progress;
 use crate::utils::path::{join_remote, split_remote};
 use anyhow::{bail, Result};
@@ -40,24 +42,49 @@ pub trait StorageProvider: Send + Sync {
     /// Returns `None` if nothing exists at `remote_path`.
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>>;
 
-    /// Uploads or overwrites a file. The parent directory must already exist.
-    /// Dropping the future cancels the upload.
+    /// Uploads or overwrites a file with the data of `source`. The parent
+    /// directory must already exist. Dropping the future cancels the upload.
+    async fn upload(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()>;
+
+    /// Uploads a local file; see [`StorageProvider::upload`].
     async fn upload_file(
         &self,
         local_path: &Path,
         remote_path: &str,
         progress: &Progress,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        self.upload(&FileSource::new(local_path)?, remote_path, progress)
+            .await
+    }
+
+    /// Downloads a file into `sink`, resuming after network failures where
+    /// the server allows it. Returns the number of bytes written to the sink.
+    async fn download_to(
+        &self,
+        remote_path: &str,
+        sink: &mut dyn Sink,
+        progress: &Progress,
+    ) -> Result<u64>;
 
     /// Downloads a file, replacing `local_path` only once the download is
     /// complete. Dropping the future cancels the download and removes the
-    /// partial data. Returns the number of bytes received.
+    /// partial data. Returns the size of the file.
     async fn download_file(
         &self,
         remote_path: &str,
         local_path: &Path,
         progress: &Progress,
-    ) -> Result<u64>;
+    ) -> Result<u64> {
+        let mut part = PartSink::new(local_path);
+        let size = self.download_to(remote_path, &mut part, progress).await?;
+        part.commit(local_path).await?;
+        Ok(size)
+    }
 
     /// Deletes a file, or a directory with all of its content.
     /// A path that does not exist is not an error.

@@ -99,6 +99,13 @@ export const PROVIDERS: ProviderDef[] = [
       },
     ],
   },
+  {
+    kind: "crypt",
+    title: "Зашифрованная папка",
+    short: "🔒",
+    help: "Папка в подключённом облаке, файлы в которой шифруются на этом компьютере (формат rclone crypt).",
+    fields: [],
+  },
 ];
 
 export function providerDef(kind: ProviderKind): ProviderDef {

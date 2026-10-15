@@ -275,6 +275,7 @@ mod tests {
     use super::*;
     use crate::storage::RemoteFileInfo;
     use async_trait::async_trait;
+    use belka_core::client::{Sink, Source};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -297,19 +298,19 @@ mod tests {
         async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {
             Ok(self.files.lock().unwrap().get(remote_path).cloned())
         }
-        async fn upload_file(
+        async fn upload(
             &self,
-            _local_path: &Path,
+            _source: &dyn Source,
             remote_path: &str,
             _progress: &Progress,
         ) -> Result<()> {
             self.uploads.lock().unwrap().push(remote_path.to_string());
             Ok(())
         }
-        async fn download_file(
+        async fn download_to(
             &self,
             _remote_path: &str,
-            _local_path: &Path,
+            _sink: &mut dyn Sink,
             _progress: &Progress,
         ) -> Result<u64> {
             unimplemented!("not used by local upload")

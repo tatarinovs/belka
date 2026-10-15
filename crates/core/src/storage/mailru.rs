@@ -3,7 +3,7 @@
 
 use super::webdav::WebDavProvider;
 use super::{RemoteFileInfo, StorageProvider};
-use crate::client::{build_http_client, ensure_success, send, API_TIMEOUT};
+use crate::client::{build_http_client, ensure_success, send, Sink, Source, API_TIMEOUT};
 use crate::progress::Progress;
 use crate::provider::MAILRU_WEBDAV_URL;
 use crate::utils::path::normalize_remote_dir;
@@ -11,7 +11,6 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -163,26 +162,22 @@ impl StorageProvider for MailruProvider {
         self.dav.get_file_info(remote_path).await
     }
 
-    async fn upload_file(
+    async fn upload(
         &self,
-        local_path: &Path,
+        source: &dyn Source,
         remote_path: &str,
         progress: &Progress,
     ) -> Result<()> {
-        self.dav
-            .upload_file(local_path, remote_path, progress)
-            .await
+        self.dav.upload(source, remote_path, progress).await
     }
 
-    async fn download_file(
+    async fn download_to(
         &self,
         remote_path: &str,
-        local_path: &Path,
+        sink: &mut dyn Sink,
         progress: &Progress,
     ) -> Result<u64> {
-        self.dav
-            .download_file(remote_path, local_path, progress)
-            .await
+        self.dav.download_to(remote_path, sink, progress).await
     }
 
     async fn delete(&self, remote_path: &str, is_dir: bool) -> Result<()> {

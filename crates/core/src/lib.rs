@@ -2,6 +2,7 @@
 //! `belka` CLI and the desktop GUI.
 
 pub mod client;
+pub mod crypt;
 pub mod oauth;
 pub mod progress;
 pub mod provider;

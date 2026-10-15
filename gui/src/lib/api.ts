@@ -1,11 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ProviderKind = "yandex" | "mailru" | "google" | "webdav" | "s3";
+export type ProviderKind = "yandex" | "mailru" | "google" | "webdav" | "s3" | "crypt";
 
 export interface Account {
   id: string;
   name: string;
   kind: ProviderKind;
+  /** Where an encrypted folder lives. */
+  crypt?: { base: string; root: string };
 }
 
 /** A row of either pane: `RemoteFileInfo` from the core crate or `LocalEntry`. */
@@ -17,6 +19,10 @@ export interface Entry {
   modified: string | null;
   /** Local virtual root only. */
   icon?: "drive" | "place";
+  /** Stored encrypted: the row gets a lock, the text is its tooltip. */
+  locked?: string;
+  /** Opening the row switches to this encrypted folder account. */
+  opensAccount?: string;
 }
 
 export type RemoteEntry = Entry;
@@ -56,6 +62,28 @@ export interface Transfer {
   total: number;
 }
 
+/** Mirrors `CryptFolder` from the GUI backend. */
+export interface CryptFolder {
+  /** Id of the account that stores the encrypted files. */
+  base: string;
+  /** Folder of that account that holds the encrypted tree. */
+  root: string;
+  password: string;
+  /** rclone's password2; empty for rclone's built-in salt. */
+  salt: string;
+  encrypt_names: boolean;
+}
+
+/** A cloud file downloaded for preview. */
+export interface Preview {
+  /** The cached file. */
+  path: string;
+  /** Content of a text file. */
+  text: string | null;
+  /** The text was cut at 1 MB. */
+  truncated: boolean;
+}
+
 export type OAuthService = "google" | "yandex";
 
 /** A registered OAuth client used for browser sign-in. */
@@ -81,6 +109,9 @@ export const api = {
   oauthSignIn: (service: OAuthService, customApp: OAuthApp | null, name: string) =>
     invoke<Account>("oauth_sign_in", { service, customApp, name }),
   oauthCancel: () => invoke<void>("oauth_cancel"),
+  /** Checks the password against files already in the folder, then saves. */
+  addCryptFolder: (name: string, folder: CryptFolder) =>
+    invoke<Account>("add_crypt_folder", { name, folder }),
   removeAccount: (id: string) => invoke<void>("remove_account", { id }),
   listDir: (accountId: string, path: string) =>
     invoke<RemoteEntry[]>("list_dir", { accountId, path }),
@@ -121,6 +152,22 @@ export const api = {
       accountId,
       items: items.map(({ path, is_dir }) => ({ path, is_dir })),
     }),
+  /** Downloads a file into the preview cache once; cancels the previous preview. */
+  previewFile: (accountId: string, entry: Entry, text: boolean) =>
+    invoke<Preview>("preview_file", {
+      accountId,
+      path: entry.path,
+      size: entry.size,
+      modified: entry.modified,
+      text,
+    }),
+  /** Bytes downloaded and total of the preview in progress. */
+  previewProgress: () => invoke<[number, number]>("preview_progress"),
+  previewCancel: () => invoke<void>("preview_cancel"),
+  /** Opens a cached preview in the program associated with it. */
+  previewOpen: (path: string) => invoke<void>("preview_open", { path }),
+  /** Opens a local file in the program associated with it. */
+  localOpen: (path: string) => invoke<void>("local_open", { path }),
   localMkdir: (parent: string, name: string) => invoke<string>("local_mkdir", { parent, name }),
   /** Resolves to the new path. */
   localRename: (path: string, newName: string) =>

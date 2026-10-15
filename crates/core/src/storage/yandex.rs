@@ -2,8 +2,8 @@
 
 use super::{as_md5, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider};
 use crate::client::{
-    build_http_client, download, ensure_success, file_body, http_error, retry_transient, send,
-    upload_timeout, Failure, API_TIMEOUT,
+    build_http_client, download_into, ensure_success, http_error, retry_transient, send,
+    source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::normalize_remote_dir;
@@ -12,7 +12,6 @@ use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 const API: &str = "https://cloud-api.yandex.net/v1/disk/resources";
@@ -98,7 +97,7 @@ impl YandexDiskProvider {
     /// Requests a fresh upload URL and streams the file to it.
     async fn upload_once(
         &self,
-        local: &Path,
+        source: &dyn Source,
         remote: &str,
         progress: &Progress,
     ) -> Result<(), Failure> {
@@ -117,7 +116,8 @@ impl YandexDiskProvider {
         }
         let link: Link = resp.json().await.context("Invalid upload URL response")?;
 
-        let (body, len) = file_body(local, progress)?;
+        let len = source.len();
+        let body = source_body(source, 0, progress)?;
         let resp = self
             .client
             .put(&link.href)
@@ -234,30 +234,30 @@ impl StorageProvider for YandexDiskProvider {
         Ok(Some(resource.into_info()))
     }
 
-    async fn upload_file(
+    async fn upload(
         &self,
-        local_path: &Path,
+        source: &dyn Source,
         remote_path: &str,
         progress: &Progress,
     ) -> Result<()> {
         let path = normalize_remote_dir(remote_path);
         retry_transient(&format!("yandex: upload '{path}'"), || {
-            self.upload_once(local_path, &path, progress)
+            self.upload_once(source, &path, progress)
         })
         .await
     }
 
-    async fn download_file(
+    async fn download_to(
         &self,
         remote_path: &str,
-        local_path: &Path,
+        sink: &mut dyn Sink,
         progress: &Progress,
     ) -> Result<u64> {
         let path = normalize_remote_dir(remote_path);
         // Download links expire, so every attempt asks for a fresh one.
-        download(
+        download_into(
             &format!("yandex: download '{path}'"),
-            local_path,
+            sink,
             progress,
             || async {
                 let link = self.download_link(&path).await?;

@@ -1,14 +1,19 @@
 //! HTTP plumbing shared by all providers: client setup, retries with
 //! exponential backoff, uniform error messages, streamed bodies with progress
 //! and resumable downloads.
+//!
+//! Uploads read from a [`Source`] and downloads write into a [`Sink`], so data
+//! can be transformed on the way (encrypted, decrypted) without temporary files.
 
 use crate::progress::Progress;
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{header, Body, Client, ClientBuilder, RequestBuilder, Response, StatusCode};
 use std::fmt::Display;
 use std::future::Future;
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -50,21 +55,81 @@ pub fn upload_timeout(size: u64) -> Duration {
 /// Size of the chunks a streamed body is read in; also the progress granularity.
 const BODY_CHUNK: usize = 64 * 1024;
 
+/// A reader handed out by a [`Source`].
+pub type SourceReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+
+/// Data to upload. Its size is known up front and it can be read from any
+/// offset, so a failed upload is retried or resumed without temporary files.
+pub trait Source: Send + Sync {
+    fn len(&self) -> u64;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reads the data from `offset` to the end.
+    fn open_at(&self, offset: u64) -> Result<SourceReader>;
+}
+
+/// A local file.
+pub struct FileSource {
+    path: PathBuf,
+    len: u64,
+}
+
+impl FileSource {
+    pub fn new(path: &Path) -> Result<Self> {
+        let len = std::fs::metadata(path)
+            .with_context(|| format!("Failed to read metadata of '{}'", path.display()))?
+            .len();
+        Ok(Self {
+            path: path.to_owned(),
+            len,
+        })
+    }
+}
+
+impl Source for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn open_at(&self, offset: u64) -> Result<SourceReader> {
+        let mut file = std::fs::File::open(&self.path)
+            .with_context(|| format!("Failed to open '{}'", self.path.display()))?;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("Failed to read '{}'", self.path.display()))?;
+        Ok(Box::new(tokio::fs::File::from_std(file)))
+    }
+}
+
+/// Data in memory.
+pub struct BytesSource(pub Bytes);
+
+impl Source for BytesSource {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn open_at(&self, offset: u64) -> Result<SourceReader> {
+        let start = (offset as usize).min(self.0.len());
+        Ok(Box::new(std::io::Cursor::new(self.0.slice(start..))))
+    }
+}
+
+/// A streaming request body with `source` from `offset` to the end. Sets
+/// `progress` to `offset` of the source size and advances it as data is sent.
+pub fn source_body(source: &dyn Source, offset: u64, progress: &Progress) -> Result<Body> {
+    progress.set_total(source.len());
+    progress.set_done(offset);
+    Ok(reader_body(source.open_at(offset)?, progress.clone()))
+}
+
 /// Opens a local file as a streaming request body (nothing is buffered in memory).
 /// Resets `progress` to 0 of the file size and advances it as the body is sent.
 pub fn file_body(path: &Path, progress: &Progress) -> Result<(Body, u64)> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open '{}'", path.display()))?;
-    let len = file
-        .metadata()
-        .with_context(|| format!("Failed to read metadata of '{}'", path.display()))?
-        .len();
-    progress.set_total(len);
-    progress.set_done(0);
-    Ok((
-        reader_body(tokio::fs::File::from_std(file), progress.clone()),
-        len,
-    ))
+    let source = FileSource::new(path)?;
+    Ok((source_body(&source, 0, progress)?, source.len()))
 }
 
 /// A streaming body that adds every chunk it yields to `progress`.
@@ -319,17 +384,140 @@ pub async fn download_to_file(client: &Client, url: &str, dest: &Path) -> Result
     .await
 }
 
-/// Downloads into `dest` with retries. `request` builds the GET request for
+/// Where downloaded data goes.
+#[async_trait]
+pub trait Sink: Send {
+    /// How many bytes of the remote data the sink holds: a download resumed
+    /// after a network failure continues from here.
+    fn position(&self) -> u64;
+
+    async fn write(&mut self, data: &[u8]) -> Result<()>;
+
+    /// Drops everything written so far: the download starts over.
+    async fn reset(&mut self) -> Result<()>;
+}
+
+/// Writes into `<dest>.part`, which replaces `dest` on [`PartSink::commit`].
+/// The partial file is removed when the sink is dropped without committing,
+/// which is how a cancelled download cleans up.
+pub struct PartSink {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+    len: u64,
+    committed: bool,
+}
+
+impl PartSink {
+    pub fn new(dest: &Path) -> Self {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(".part");
+        Self {
+            path: dest.with_file_name(name),
+            file: None,
+            len: 0,
+            committed: false,
+        }
+    }
+
+    pub async fn commit(mut self, dest: &Path) -> Result<()> {
+        if self.file.is_none() {
+            self.reset().await?;
+        }
+        let mut file = self.file.take().expect("opened above");
+        file.flush()
+            .await
+            .with_context(|| format!("Failed to write '{}'", self.path.display()))?;
+        drop(file);
+        tokio::fs::rename(&self.path, dest)
+            .await
+            .with_context(|| format!("Failed to move the download to '{}'", dest.display()))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Sink for PartSink {
+    fn position(&self) -> u64 {
+        self.len
+    }
+
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        if self.file.is_none() {
+            self.reset().await?;
+        }
+        let file = self.file.as_mut().expect("opened above");
+        file.write_all(data)
+            .await
+            .with_context(|| format!("Failed to write '{}'", self.path.display()))?;
+        self.len += data.len() as u64;
+        Ok(())
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        self.file = None;
+        let file = tokio::fs::File::create(&self.path)
+            .await
+            .with_context(|| format!("Failed to create '{}'", self.path.display()))?;
+        self.file = Some(file);
+        self.len = 0;
+        Ok(())
+    }
+}
+
+impl Drop for PartSink {
+    fn drop(&mut self) {
+        // Windows cannot delete a file that is still open.
+        self.file = None;
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Collects a download in memory.
+#[derive(Default)]
+pub struct MemorySink(pub Vec<u8>);
+
+#[async_trait]
+impl Sink for MemorySink {
+    fn position(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    async fn reset(&mut self) -> Result<()> {
+        self.0.clear();
+        Ok(())
+    }
+}
+
+/// Downloads into `dest` with retries; see [`download_into`]. Data goes to
+/// `<dest>.part`, which replaces `dest` only once complete.
+pub async fn download<F, Fut>(op: &str, dest: &Path, progress: &Progress, request: F) -> Result<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<RequestBuilder>>,
+{
+    let mut part = PartSink::new(dest);
+    let size = download_into(op, &mut part, progress, request).await?;
+    part.commit(dest).await?;
+    debug!("Downloaded {size} bytes to {}", dest.display());
+    Ok(size)
+}
+
+/// Downloads into `sink` with retries. `request` builds the GET request for
 /// every attempt (so signatures, tokens and expiring links stay fresh) and must
 /// not set an overall timeout. After a network failure the download resumes
-/// with a `Range` request when the server supports it.
-///
-/// Data goes to `<dest>.part`, which replaces `dest` only once complete. The
-/// partial file is removed on failure and when the future is dropped, which
-/// is how a transfer is cancelled.
-pub async fn download<F, Fut>(
+/// from the sink's position with a `Range` request when the server supports it.
+/// Returns the number of bytes received.
+pub async fn download_into<F, Fut>(
     op: &str,
-    dest: &Path,
+    sink: &mut dyn Sink,
     progress: &Progress,
     mut request: F,
 ) -> Result<u64>
@@ -337,63 +525,32 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<RequestBuilder>>,
 {
-    let part = PartFile::new(dest);
-    match tokio::fs::remove_file(&part.path).await {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| format!("Failed to remove '{}'", part.path.display()))
-        }
-    }
+    sink.reset().await?;
     progress.set_done(0);
-
-    let size = retry_transient(op, || download_attempt(&part.path, progress, request())).await?;
-    tokio::fs::rename(&part.path, dest)
-        .await
-        .with_context(|| format!("Failed to move the download to '{}'", dest.display()))?;
-    part.keep();
-    debug!("Downloaded {size} bytes to {}", dest.display());
-    Ok(size)
-}
-
-/// Removes the partial download when dropped, unless [`PartFile::keep`] is called.
-struct PartFile {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl PartFile {
-    fn new(dest: &Path) -> Self {
-        let mut name = dest.file_name().unwrap_or_default().to_os_string();
-        name.push(".part");
-        Self {
-            path: dest.with_file_name(name),
-            armed: true,
+    let mut attempt = 1;
+    loop {
+        match download_attempt(sink, progress, request()).await {
+            Ok(size) => return Ok(size),
+            Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
+                let delay = backoff(attempt);
+                warn!(
+                    "{op}: {err:#}; retrying in {:.1}s (attempt {attempt}/{MAX_ATTEMPTS})",
+                    delay.as_secs_f32()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(failure) => return Err(failure.into_inner()),
         }
-    }
-
-    fn keep(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PartFile {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        attempt += 1;
     }
 }
 
 async fn download_attempt(
-    part: &Path,
+    sink: &mut dyn Sink,
     progress: &Progress,
     request: impl Future<Output = Result<RequestBuilder>>,
 ) -> std::result::Result<u64, Failure> {
-    let offset = match tokio::fs::metadata(part).await {
-        Ok(meta) => meta.len(),
-        Err(_) => 0,
-    };
+    let offset = sink.position();
     let mut req = request.await?;
     if offset > 0 {
         req = req.header(header::RANGE, format!("bytes={offset}-"));
@@ -414,7 +571,7 @@ async fn download_attempt(
             Some((start, total)) if start == offset => (offset, total),
             _ => {
                 // Not the range we asked for: start over.
-                reset_file(part).await?;
+                sink.reset().await?;
                 return Err(Failure::Transient(anyhow!(
                     "server returned an unexpected range"
                 )));
@@ -422,9 +579,12 @@ async fn download_attempt(
         }
     } else if status.is_success() {
         // A full response: either a fresh start or the server ignored Range.
+        if offset > 0 {
+            sink.reset().await?;
+        }
         (0, resp.content_length())
     } else if offset > 0 && status == StatusCode::RANGE_NOT_SATISFIABLE {
-        reset_file(part).await?;
+        sink.reset().await?;
         return Err(Failure::Transient(anyhow!(
             "server rejected the resume range"
         )));
@@ -435,15 +595,6 @@ async fn download_attempt(
         progress.set_total(total);
     }
     progress.set_done(pos);
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(pos > 0)
-        .truncate(pos == 0)
-        .open(part)
-        .await
-        .with_context(|| format!("Failed to create '{}'", part.display()))?;
 
     loop {
         let chunk = match tokio::time::timeout(DOWNLOAD_IDLE_TIMEOUT, resp.chunk()).await {
@@ -458,15 +609,10 @@ async fn download_attempt(
             Ok(chunk) => chunk.map_err(|err| Failure::Transient(err.into()))?,
         };
         let Some(chunk) = chunk else { break };
-        file.write_all(&chunk)
-            .await
-            .with_context(|| format!("Failed to write '{}'", part.display()))?;
+        sink.write(&chunk).await?;
         pos += chunk.len() as u64;
         progress.set_done(pos);
     }
-    file.flush()
-        .await
-        .with_context(|| format!("Failed to write '{}'", part.display()))?;
 
     if let Some(expected) = expected {
         if expected != pos {
@@ -476,13 +622,6 @@ async fn download_attempt(
         }
     }
     Ok(pos)
-}
-
-async fn reset_file(path: &Path) -> std::result::Result<(), Failure> {
-    tokio::fs::File::create(path)
-        .await
-        .with_context(|| format!("Failed to reset '{}'", path.display()))?;
-    Ok(())
 }
 
 /// Parses `Content-Range: bytes <start>-<end>/<total>` into (start, total).

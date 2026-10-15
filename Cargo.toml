@@ -24,6 +24,12 @@ url = "2.5"
 percent-encoding = "2.3"
 futures-util = "0.3"
 
+# Key derivation (scrypt) is far too slow without optimizations.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

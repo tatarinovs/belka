@@ -3,14 +3,17 @@
     api,
     errorText,
     type Account,
+    type CryptFolder,
     type OAuthApp,
     type OAuthService,
     type ProviderKind,
   } from "$lib/api";
   import { PROVIDERS, buildConfig, missingFields, providerDef } from "$lib/providers";
 
-  let { open, onclose, onadded }: {
+  let { open, accounts, onclose, onadded }: {
     open: boolean;
+    /** Clouds an encrypted folder can be placed in. */
+    accounts: Account[];
     onclose: () => void;
     onadded: (account: Account) => void;
   } = $props();
@@ -41,6 +44,14 @@
   let hasBuiltin = $state(false);
   let useCustom = $state(false);
   let waiting = $state(false);
+  let crypt = $state<CryptFolder>(emptyCrypt());
+  let repeat = $state("");
+
+  function emptyCrypt(): CryptFolder {
+    return { base: "", root: "/Encrypted", password: "", salt: "", encrypt_names: true };
+  }
+
+  const clouds = $derived(accounts.filter((a) => a.kind !== "crypt"));
 
   const def = $derived(providerDef(kind));
   const service = $derived<OAuthService | null>(kind === "google" || kind === "yandex" ? kind : null);
@@ -63,6 +74,10 @@
     values = {};
     error = "";
     manual = false;
+    if (next === "crypt") {
+      crypt = { ...emptyCrypt(), base: clouds[0]?.id ?? "" };
+      repeat = "";
+    }
     if (next === "google" || next === "yandex") {
       app = { client_id: "", client_secret: "" };
       hasBuiltin = false;
@@ -81,6 +96,10 @@
     error = "";
     if (browserMode && service) {
       await signIn(service);
+      return;
+    }
+    if (kind === "crypt") {
+      await addCrypt();
       return;
     }
     if (missing.length) {
@@ -119,6 +138,28 @@
     } finally {
       busy = false;
       waiting = false;
+    }
+  }
+
+  async function addCrypt() {
+    const base = clouds.find((a) => a.id === crypt.base);
+    if (!base) error = "Выберите облако.";
+    else if (!crypt.root.trim()) error = "Укажите папку в облаке.";
+    else if (!crypt.password) error = "Задайте пароль.";
+    else if (crypt.password !== repeat) error = "Пароли не совпадают.";
+    if (error || !base) return;
+    busy = true;
+    try {
+      const root = crypt.root.trim();
+      const account = await api.addCryptFolder(name.trim() || `${base.name} · ${root} 🔒`, {
+        ...crypt,
+        root,
+      });
+      onadded(account);
+    } catch (err) {
+      error = errorText(err);
+    } finally {
+      busy = false;
     }
   }
 
@@ -176,7 +217,51 @@
         />
       </label>
 
-      {#if browserMode && service}
+      {#if kind === "crypt"}
+        {#if !clouds.length}
+          <p class="error">Сначала подключите облако, в котором будет лежать папка.</p>
+        {:else}
+          <label>
+            <span>Облако *</span>
+            <select bind:value={crypt.base} disabled={busy}>
+              {#each clouds as cloud (cloud.id)}
+                <option value={cloud.id}>{cloud.name} — {providerDef(cloud.kind).title}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            <span>Папка в облаке *</span>
+            <input bind:value={crypt.root} spellcheck="false" disabled={busy} />
+          </label>
+          <label>
+            <span>Пароль *</span>
+            <input type="password" bind:value={crypt.password} autocomplete="new-password" disabled={busy} />
+          </label>
+          <label>
+            <span>Пароль ещё раз *</span>
+            <input type="password" bind:value={repeat} autocomplete="new-password" disabled={busy} />
+          </label>
+          <label class="check">
+            <input type="checkbox" bind:checked={crypt.encrypt_names} disabled={busy} />
+            <span>Шифровать имена файлов и папок</span>
+          </label>
+          <details>
+            <summary>Совместимость с rclone</summary>
+            <p class="help small">
+              Файлы можно открыть через rclone: remote типа crypt на эту папку с тем же паролем,
+              filename_encryption = {crypt.encrypt_names ? "standard" : "off"}.
+            </p>
+            <label>
+              <span>Соль (password2 в rclone), если задана</span>
+              <input type="password" bind:value={crypt.salt} autocomplete="off" disabled={busy} />
+            </label>
+          </details>
+          <p class="warning">
+            Пароль невозможно восстановить: без него файлы не расшифровать ни Belka, ни кому-либо
+            ещё. Сохраните его в надёжном месте.
+          </p>
+        {/if}
+      {:else if browserMode && service}
         <div class="app">
           {#if hasBuiltin}
             <label class="check">
@@ -248,13 +333,15 @@
     {/if}
 
     <footer>
-      <span class="note">Данные входа хранятся в системном хранилище учётных данных.</span>
+      <span class="note">
+        {kind === "crypt" ? "Пароль хранится" : "Данные входа хранятся"} в системном хранилище учётных данных.
+      </span>
       {#if waiting}
         <button type="button" class="btn" onclick={() => api.oauthCancel()}>Отменить вход</button>
       {:else}
         <button type="button" class="btn" onclick={close} disabled={busy}>Отмена</button>
         <button type="submit" class="btn primary" disabled={busy}>
-          {busy ? "Проверка…" : browserMode ? "Войти через браузер" : "Подключить"}
+          {busy ? "Проверка…" : browserMode ? "Войти через браузер" : kind === "crypt" ? "Создать" : "Подключить"}
         </button>
       {/if}
     </footer>
@@ -353,6 +440,27 @@
     font-size: inherit;
   }
 
+  .warning {
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: color-mix(in srgb, #e0a43a 18%, transparent);
+    font-size: 12px;
+  }
+
+  details summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  details[open] {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  select,
   input:not([type="checkbox"]) {
     height: 30px;
     padding: 0 8px;
@@ -361,6 +469,7 @@
     background: var(--bg);
   }
 
+  select:focus,
   input:not([type="checkbox"]):focus {
     border-color: var(--accent);
     outline: none;
