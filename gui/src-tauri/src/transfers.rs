@@ -1,8 +1,11 @@
 //! The transfer queue: uploads and downloads run as background tasks, at most
 //! [`MAX_PARALLEL`] at a time. The frontend polls [`Transfers::list`] and reads
 //! progress counters directly, so running transfers never block on the UI.
+//! A queue can hold thousands of files, so the page gets the running ones,
+//! the head of the queue and the latest finished ones, plus counts of all.
 
 use anyhow::{Context, Result};
+use belka_core::client::MAX_ATTEMPTS;
 use belka_core::utils::path::split_remote;
 use belka_core::{Progress, StorageProvider};
 use serde::Serialize;
@@ -14,6 +17,10 @@ use tauri::async_runtime::{spawn, JoinHandle};
 use tokio::sync::Semaphore;
 
 const MAX_PARALLEL: usize = 3;
+/// Queued transfers sent to the page; the rest are only counted.
+const SHOWN_QUEUED: usize = 50;
+/// The most recently finished transfers sent to the page.
+const SHOWN_FINISHED: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,6 +63,29 @@ struct Job {
     status: Status,
     progress: Progress,
     handle: Option<JoinHandle<()>>,
+    /// Order in which transfers finished; 0 while active.
+    finished: u64,
+}
+
+impl Job {
+    fn view(&self) -> TransferView {
+        let (remote_dir, name) = split_remote(&self.spec.remote);
+        TransferView {
+            id: self.id,
+            direction: self.spec.direction,
+            account_id: self.spec.account_id.clone(),
+            account_name: self.spec.account_name.clone(),
+            name,
+            local_path: self.spec.local.display().to_string(),
+            remote_path: self.spec.remote.clone(),
+            remote_dir,
+            status: self.status.clone(),
+            done: self.progress.done(),
+            total: self.progress.total(),
+            attempt: self.progress.attempt(),
+            max_attempts: MAX_ATTEMPTS,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -72,11 +102,30 @@ pub struct TransferView {
     status: Status,
     done: u64,
     total: u64,
+    /// Above 1 while network failures are retried.
+    attempt: u32,
+    max_attempts: u32,
+}
+
+#[derive(Default, Serialize)]
+pub struct Counts {
+    queued: usize,
+    running: usize,
+    done: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+#[derive(Serialize)]
+pub struct TransferList {
+    items: Vec<TransferView>,
+    counts: Counts,
 }
 
 pub struct Transfers {
     jobs: Mutex<Vec<Job>>,
     next_id: AtomicU64,
+    finished_seq: AtomicU64,
     slots: Arc<Semaphore>,
     /// Remote folders already created, as (account id, path). Folder creation
     /// is serialized so parallel uploads never create the same folder twice
@@ -89,6 +138,7 @@ impl Transfers {
         Arc::new(Self {
             jobs: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            finished_seq: AtomicU64::new(1),
             slots: Arc::new(Semaphore::new(MAX_PARALLEL)),
             ensured: tokio::sync::Mutex::new(HashSet::new()),
         })
@@ -104,6 +154,7 @@ impl Transfers {
             status: Status::Queued,
             progress: progress.clone(),
             handle: None,
+            finished: 0,
         });
         self.start(id, spec, progress, provider);
         id
@@ -144,6 +195,9 @@ impl Transfers {
         let mut jobs = self.jobs.lock().unwrap();
         match jobs.iter_mut().find(|j| j.id == id) {
             Some(job) if job.status.is_active() => {
+                if !status.is_active() {
+                    job.finished = self.finished_seq.fetch_add(1, Ordering::Relaxed);
+                }
                 job.status = status;
                 true
             }
@@ -157,6 +211,13 @@ impl Transfers {
         provider: &dyn StorageProvider,
         progress: &Progress,
     ) -> Result<()> {
+        tracing::debug!(
+            "{:?} '{}' <-> '{}' ({})",
+            spec.direction,
+            spec.remote,
+            spec.local.display(),
+            spec.account_name
+        );
         match spec.direction {
             Direction::Download => {
                 if let Some(dir) = spec.local.parent() {
@@ -185,14 +246,24 @@ impl Transfers {
         dir: &str,
         provider: &dyn StorageProvider,
     ) -> Result<()> {
-        let key = (account_id.to_string(), dir.to_string());
         let mut ensured = self.ensured.lock().await;
-        if !ensured.contains(&key) {
-            provider
-                .ensure_dir(dir)
-                .await
-                .with_context(|| format!("Failed to create folder '{dir}'"))?;
-            ensured.insert(key);
+        if ensured.contains(&(account_id.to_string(), dir.to_string())) {
+            return Ok(());
+        }
+        provider
+            .ensure_dir(dir)
+            .await
+            .with_context(|| format!("Failed to create folder '{dir}'"))?;
+        // Its parents exist now as well.
+        let mut path = dir.to_string();
+        loop {
+            let parent = split_remote(&path).0;
+            let top = parent == path;
+            ensured.insert((account_id.to_string(), path));
+            if top {
+                break;
+            }
+            path = parent;
         }
         Ok(())
     }
@@ -205,28 +276,40 @@ impl Transfers {
         });
     }
 
-    pub fn list(&self) -> Vec<TransferView> {
-        self.jobs
-            .lock()
-            .unwrap()
+    pub fn list(&self) -> TransferList {
+        let jobs = self.jobs.lock().unwrap();
+        let mut counts = Counts::default();
+        for job in jobs.iter() {
+            *match job.status {
+                Status::Queued => &mut counts.queued,
+                Status::Running => &mut counts.running,
+                Status::Done => &mut counts.done,
+                Status::Failed { .. } => &mut counts.failed,
+                Status::Cancelled => &mut counts.cancelled,
+            } += 1;
+        }
+        let mut finished: Vec<u64> = jobs.iter().map(|j| j.finished).filter(|&f| f > 0).collect();
+        let oldest_shown = if finished.len() > SHOWN_FINISHED {
+            *finished
+                .select_nth_unstable_by(SHOWN_FINISHED - 1, |a, b| b.cmp(a))
+                .1
+        } else {
+            0
+        };
+        let mut queued = 0;
+        let items = jobs
             .iter()
-            .map(|job| {
-                let (remote_dir, name) = split_remote(&job.spec.remote);
-                TransferView {
-                    id: job.id,
-                    direction: job.spec.direction,
-                    account_id: job.spec.account_id.clone(),
-                    account_name: job.spec.account_name.clone(),
-                    name,
-                    local_path: job.spec.local.display().to_string(),
-                    remote_path: job.spec.remote.clone(),
-                    remote_dir,
-                    status: job.status.clone(),
-                    done: job.progress.done(),
-                    total: job.progress.total(),
+            .filter(|job| match job.status {
+                Status::Running => true,
+                Status::Queued => {
+                    queued += 1;
+                    queued <= SHOWN_QUEUED
                 }
+                _ => job.finished >= oldest_shown,
             })
-            .collect()
+            .map(Job::view)
+            .collect();
+        TransferList { items, counts }
     }
 
     /// Stops a queued or running transfer. Dropping the task's future cancels
@@ -235,6 +318,7 @@ impl Transfers {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs.iter_mut().find(|j| j.id == id && j.status.is_active()) {
             job.status = Status::Cancelled;
+            job.finished = self.finished_seq.fetch_add(1, Ordering::Relaxed);
             if let Some(handle) = job.handle.take() {
                 handle.abort();
             }
@@ -274,7 +358,9 @@ impl Transfers {
                 return;
             };
             job.status = Status::Queued;
+            job.finished = 0;
             job.progress.set_done(0);
+            job.progress.set_attempt(1);
             (job.spec.clone(), job.progress.clone())
         };
         self.start(id, spec, progress, provider);
@@ -283,5 +369,51 @@ impl Transfers {
     /// Removes every finished transfer (done, failed or cancelled) from the list.
     pub fn clear_finished(&self) {
         self.jobs.lock().unwrap().retain(|j| j.status.is_active());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: u64, status: Status, finished: u64) -> Job {
+        Job {
+            id,
+            spec: Spec {
+                direction: Direction::Upload,
+                account_id: "a".into(),
+                account_name: "A".into(),
+                local: PathBuf::from("x"),
+                remote: format!("/f{id}"),
+                size: 0,
+            },
+            status,
+            progress: Progress::new(),
+            handle: None,
+            finished,
+        }
+    }
+
+    #[test]
+    fn list_sends_the_head_of_a_long_queue() {
+        let transfers = Transfers::new();
+        {
+            let mut jobs = transfers.jobs.lock().unwrap();
+            // 150 finished in reverse order, so the latest are the first ones.
+            jobs.extend((1..=150).map(|id| job(id, Status::Done, 151 - id)));
+            jobs.push(job(151, Status::Running, 0));
+            jobs.extend((152..=400).map(|id| job(id, Status::Queued, 0)));
+        }
+        let list = transfers.list();
+        assert_eq!(
+            (list.counts.done, list.counts.running, list.counts.queued),
+            (150, 1, 249)
+        );
+        let ids: Vec<u64> = list.items.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), SHOWN_FINISHED + 1 + SHOWN_QUEUED);
+        assert_eq!(ids[0], 1);
+        assert_eq!(ids[SHOWN_FINISHED - 1], SHOWN_FINISHED as u64);
+        assert_eq!(ids[SHOWN_FINISHED], 151);
+        assert_eq!(*ids.last().unwrap(), 151 + SHOWN_QUEUED as u64);
     }
 }

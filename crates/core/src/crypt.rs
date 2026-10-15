@@ -147,6 +147,42 @@ impl Cipher {
 
     // ---- content ----
 
+    /// Encrypts data held in memory into a whole encrypted file.
+    pub fn encrypt_bytes(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut nonce = [0u8; NONCE_SIZE];
+        getrandom::fill(&mut nonce).map_err(|err| anyhow::anyhow!("No random source: {err}"))?;
+        let mut out = Vec::with_capacity(encrypted_size(data.len() as u64) as usize);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&nonce);
+        for chunk in data.chunks(BLOCK_DATA) {
+            let mut block = chunk.to_vec();
+            let tag = self.seal(&nonce, &mut block);
+            out.extend_from_slice(&tag);
+            out.extend_from_slice(&block);
+            increment(&mut nonce);
+        }
+        Ok(out)
+    }
+
+    /// Decrypts a whole encrypted file held in memory.
+    pub fn decrypt_bytes(&self, file: &[u8]) -> Result<Vec<u8>> {
+        let header = HEADER_SIZE as usize;
+        let Some(size) = decrypted_size(file.len() as u64).filter(|_| file.starts_with(MAGIC))
+        else {
+            bail!("The file is not encrypted or is damaged");
+        };
+        let mut nonce: [u8; NONCE_SIZE] = file[MAGIC.len()..header].try_into().expect("24 bytes");
+        let mut out = Vec::with_capacity(size as usize);
+        for block in file[header..].chunks(BLOCK_SIZE) {
+            let (tag, data) = block.split_at(TAG_SIZE);
+            let mut data = data.to_vec();
+            self.open(&nonce, tag, &mut data)?;
+            out.extend_from_slice(&data);
+            increment(&mut nonce);
+        }
+        Ok(out)
+    }
+
     fn seal(&self, nonce: &[u8; NONCE_SIZE], data: &mut [u8]) -> Tag {
         self.content
             .encrypt_in_place_detached(nonce.into(), b"", data)
@@ -362,6 +398,40 @@ impl Sink for DecryptSink<'_> {
         self.written = 0;
         self.out.reset().await
     }
+}
+
+const SEALED_MAGIC: &[u8; 8] = b"BELKA\x00\x00\x01";
+const SEALED_SALT: usize = 16;
+
+/// Encrypts `data` with a password alone, for files such as an export of
+/// accounts: a magic, a random salt, then an encrypted file in the rclone
+/// format with the salt in hex as `password2`. The random salt keeps equal
+/// passwords from giving equal keys. Key derivation is deliberately slow.
+pub fn seal(password: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let mut salt = [0u8; SEALED_SALT];
+    getrandom::fill(&mut salt).map_err(|err| anyhow::anyhow!("No random source: {err}"))?;
+    let mut out = SEALED_MAGIC.to_vec();
+    out.extend_from_slice(&salt);
+    out.extend(sealed_cipher(password, &salt)?.encrypt_bytes(data)?);
+    Ok(out)
+}
+
+/// Opens a file made by [`seal`].
+pub fn unseal(password: &str, file: &[u8]) -> Result<Vec<u8>> {
+    let Some(rest) = file.strip_prefix(SEALED_MAGIC) else {
+        bail!("Not a file of this program, or it is damaged");
+    };
+    ensure!(rest.len() >= SEALED_SALT, "The file is damaged");
+    let (salt, data) = rest.split_at(SEALED_SALT);
+    sealed_cipher(password, salt)?.decrypt_bytes(data)
+}
+
+fn sealed_cipher(password: &str, salt: &[u8]) -> Result<Cipher> {
+    Cipher::new(&CryptConfig {
+        password: password.to_string(),
+        salt: hex::encode(salt),
+        encrypt_names: false,
+    })
 }
 
 /// Size of a file after encryption.
@@ -662,6 +732,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bytes_match_the_stream_format() {
+        let c = cipher(true);
+        for size in [0usize, 1, 65536, 150_000] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 13 % 251) as u8).collect();
+            let file = c.encrypt_bytes(&data).unwrap();
+            assert_eq!(file.len() as u64, encrypted_size(size as u64));
+            assert_eq!(decrypt(&c, &file, 1000).await.unwrap(), data);
+            assert_eq!(c.decrypt_bytes(&file).unwrap(), data);
+        }
+        let file = c.encrypt_bytes(b"secret").unwrap();
+        assert!(cipher_with("other", "", true).decrypt_bytes(&file).is_err());
+        assert!(c.decrypt_bytes(b"short").is_err());
+    }
+
+    #[test]
+    fn sealed_files_need_the_password() {
+        let data = "аккаунты".as_bytes();
+        let file = seal("pass", data).unwrap();
+        assert_ne!(seal("pass", data).unwrap(), file, "the salt is random");
+        assert_eq!(unseal("pass", &file).unwrap(), data);
+        assert!(unseal("other", &file).is_err());
+        assert!(unseal("pass", &file[..20]).is_err());
+        assert!(unseal("pass", b"{\"accounts\": []}").is_err());
+        assert!(seal("", data).is_err());
     }
 
     #[tokio::test]

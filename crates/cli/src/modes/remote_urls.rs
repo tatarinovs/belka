@@ -4,30 +4,32 @@ use super::Stats;
 use crate::client::{
     build_http_client, download_to_file, http_error, send, API_TIMEOUT, USER_AGENT,
 };
+use crate::format::format_bytes;
+use crate::hash::compute_md5_file;
 use crate::storage::{RemoteFileInfo, StorageProvider};
-use crate::utils::format::format_bytes;
-use crate::utils::hash::compute_md5_file;
 use crate::utils::path::{encode_component, join_remote, normalize_remote_dir, sanitize_file_name};
-use crate::utils::text::parse_list;
 use anyhow::{bail, Context, Result};
 use belka_core::Progress;
 use percent_encoding::percent_decode_str;
-use regex::Regex;
+use regex_lite::Regex;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT as USER_AGENT_HEADER};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use tracing::{error, info, warn};
 use url::Url;
 
 pub const DEFAULT_ASSET_FILTER: &str = r"(?i)\.(apk|exe|zip|tar\.gz)$";
 const URLS_FILE: &str = "urls.txt";
 
-/// Matches managed release files: `[tag] asset-name`.
-static VERSIONED_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\[([^\]]+)\]\s*(.+)$").expect("valid regex"));
+/// Splits a managed release file name `[tag] asset-name` into the tag and
+/// the asset name.
+fn versioned_name(name: &str) -> Option<(&str, &str)> {
+    let (tag, asset) = name.strip_prefix('[')?.split_once(']')?;
+    let asset = asset.trim_start();
+    (!tag.is_empty() && !asset.is_empty()).then_some((tag, asset))
+}
 
 pub struct MirrorOptions {
     pub dry_run: bool,
@@ -154,6 +156,17 @@ pub async fn load_url_list(
          Create it or pass --urls-file",
         remote_candidates.join(", ")
     )
+}
+
+/// Parses a list file such as `urls.txt`: one entry per line, blank lines
+/// and `#` comments are ignored, a UTF-8 BOM is tolerated.
+fn parse_list(text: &str) -> Vec<String> {
+    text.trim_start_matches('\u{feff}')
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
 }
 
 fn read_local_list(path: &Path) -> Result<UrlList> {
@@ -408,11 +421,7 @@ fn old_versions<'a>(
     items
         .iter()
         .filter(|item| !item.is_dir)
-        .filter(|item| {
-            VERSIONED_NAME
-                .captures(&item.name)
-                .is_some_and(|caps| &caps[2] == asset && &caps[1] != tag)
-        })
+        .filter(|item| versioned_name(&item.name).is_some_and(|(t, a)| a == asset && t != tag))
         .collect()
 }
 
@@ -584,6 +593,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_lines_comments_and_bom() {
+        let text = "\u{feff}# header\r\nhttps://a\r\n\r\n  https://b  \n#x\n";
+        assert_eq!(parse_list(text), vec!["https://a", "https://b"]);
+    }
+
+    #[test]
     fn old_versions_only_match_same_asset() {
         let items = vec![
             file("[v1.0] app.apk"),
@@ -652,8 +667,11 @@ mod tests {
         };
         let name = task.remote_name();
         assert_eq!(name, "[release_1.0] app.apk");
-        let caps = VERSIONED_NAME.captures(&name).unwrap();
-        assert_eq!((&caps[1], &caps[2]), ("release_1.0", "app.apk"));
+        assert_eq!(versioned_name(&name), Some(("release_1.0", "app.apk")));
+        assert_eq!(versioned_name("[] a"), None);
+        assert_eq!(versioned_name("[v1]"), None);
+        assert_eq!(versioned_name("[v1]app.apk"), Some(("v1", "app.apk")));
+        assert_eq!(versioned_name("app.apk"), None);
     }
 
     #[test]

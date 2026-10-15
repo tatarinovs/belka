@@ -3,6 +3,7 @@
 //! start, and starting a preview cancels the one still downloading.
 
 use anyhow::{bail, Context, Result};
+use belka_core::client::MAX_ATTEMPTS;
 use belka_core::{Progress, StorageProvider};
 use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
@@ -33,6 +34,16 @@ pub struct Preview {
     text: Option<String>,
     /// The text was cut at [`TEXT_LIMIT`].
     truncated: bool,
+}
+
+/// How far the preview in progress is.
+#[derive(Serialize)]
+pub struct PreviewProgress {
+    done: u64,
+    total: u64,
+    /// Above 1 while network failures are retried.
+    attempt: u32,
+    max_attempts: u32,
 }
 
 /// A cloud file to preview; `size` and `modified` tell versions apart.
@@ -102,13 +113,15 @@ impl Previews {
         })
     }
 
-    /// Bytes downloaded and total of the preview in progress.
-    pub fn progress(&self) -> (u64, u64) {
-        self.current
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map_or((0, 0), |c| (c.progress.done(), c.progress.total()))
+    pub fn progress(&self) -> PreviewProgress {
+        let current = self.current.lock().unwrap();
+        let progress = current.as_ref().map(|c| &c.progress);
+        PreviewProgress {
+            done: progress.map_or(0, Progress::done),
+            total: progress.map_or(0, Progress::total),
+            attempt: progress.map_or(1, Progress::attempt),
+            max_attempts: MAX_ATTEMPTS,
+        }
     }
 
     pub fn cancel(&self) {

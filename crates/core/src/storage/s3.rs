@@ -2,24 +2,30 @@
 //! Storage, ...) using path-style requests signed with AWS Signature V4.
 
 use super::{
-    as_md5, parse_http_date, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider,
+    as_md5, base_name, parse_http_date, parse_rfc3339, rename_target, RemoteFileInfo,
+    StorageProvider,
 };
 use crate::client::{
     build_http_client, bytes_body, download_into, ensure_success, http_error, send, source_body,
     upload_timeout, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
-use crate::utils::format::format_bytes;
 use crate::utils::path::{encode_component, encode_path, normalize_remote_dir};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use bytes::Bytes;
 use chrono::Utc;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
+use md5::Md5;
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tracing::{debug, warn};
 use url::Url;
@@ -30,6 +36,12 @@ const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 const MIN_PART_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_PARTS: u64 = 10_000;
+/// Parts uploaded at the same time; each one is held in memory while it is sent.
+const PARALLEL_PARTS: usize = 3;
+/// Server-side copies running at the same time when a folder is renamed.
+const PARALLEL_COPIES: usize = 8;
+/// The most keys DeleteObjects accepts in one request.
+const DELETE_BATCH: usize = 1000;
 /// Server-side copies of large objects can take a while.
 const COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -79,6 +91,13 @@ struct S3Object {
 struct S3Prefix {
     #[serde(rename = "Prefix")]
     prefix: String,
+}
+
+/// A multipart upload in progress.
+struct Multipart<'a> {
+    key: &'a str,
+    upload_id: &'a str,
+    total_parts: u64,
 }
 
 #[derive(Deserialize)]
@@ -269,6 +288,39 @@ impl S3Provider {
         }
     }
 
+    /// Deletes objects in batches; keys that do not exist are not an error.
+    async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        for batch in keys.chunks(DELETE_BATCH) {
+            let mut body = String::from("<Delete><Quiet>true</Quiet>");
+            for key in batch {
+                body.push_str(&format!("<Object><Key>{}</Key></Object>", xml_escape(key)));
+            }
+            body.push_str("</Delete>");
+            let body = Bytes::from(body);
+            let hash = hex::encode(Sha256::digest(&body));
+            // DeleteObjects requires a checksum of the body.
+            let md5 = BASE64.encode(Md5::digest(&body));
+            let resp = send("s3: delete objects", || {
+                Ok(self
+                    .request(Method::POST, None, &[("delete", "")], &hash)
+                    .header("Content-MD5", &md5)
+                    .header(CONTENT_TYPE, "application/xml")
+                    .timeout(API_TIMEOUT)
+                    .body(body.clone()))
+            })
+            .await?;
+            let text = ensure_success(resp, "Failed to delete objects")
+                .await?
+                .text()
+                .await?;
+            // In quiet mode only the keys that failed are listed.
+            if text.contains("<Error>") {
+                bail!("Failed to delete some objects: {}", text.trim());
+            }
+        }
+        Ok(())
+    }
+
     async fn put_single(&self, source: &dyn Source, key: &str, progress: &Progress) -> Result<()> {
         let resp = send(&format!("s3: upload '{key}'"), || {
             let (body, len) = (source_body(source, 0, progress)?, source.len());
@@ -351,58 +403,75 @@ impl S3Provider {
         progress.set_total(size);
         progress.set_done(0);
         let part_size = MIN_PART_SIZE.max(size.div_ceil(MAX_PARTS));
-        let total_parts = size.div_ceil(part_size);
-        let mut reader = source.open_at(0)?;
+        let upload = Multipart {
+            key,
+            upload_id,
+            total_parts: size.div_ceil(part_size),
+        };
+        // `buffered` keeps the order, so the ETags line up with part numbers.
+        stream::iter(0..upload.total_parts)
+            .map(|i| {
+                let offset = i * part_size;
+                let len = part_size.min(size - offset);
+                self.upload_part(&upload, source, i + 1, offset, len, progress)
+            })
+            .buffered(PARALLEL_PARTS)
+            .try_collect()
+            .await
+    }
 
-        let mut etags = Vec::with_capacity(total_parts as usize);
-        let mut remaining = size;
-        let mut part_number = 1u64;
-        while remaining > 0 {
-            let len = part_size.min(remaining);
-            let mut buf = vec![0u8; len as usize];
-            reader
-                .read_exact(&mut buf)
-                .await
-                .with_context(|| format!("Failed to read the data for '{key}'"))?;
-            let data = Bytes::from(buf);
-            let hash = hex::encode(Sha256::digest(&data));
-            let number = part_number.to_string();
+    /// Uploads part `number`, the `len` bytes of `source` from `offset`, and
+    /// returns its ETag.
+    async fn upload_part(
+        &self,
+        upload: &Multipart<'_>,
+        source: &dyn Source,
+        number: u64,
+        offset: u64,
+        len: u64,
+        progress: &Progress,
+    ) -> Result<String> {
+        let key = upload.key;
+        let mut buf = vec![0u8; len as usize];
+        source
+            .open_at(offset)?
+            .read_exact(&mut buf)
+            .await
+            .with_context(|| format!("Failed to read the data for '{key}'"))?;
+        let data = Bytes::from(buf);
+        let hash = hex::encode(Sha256::digest(&data));
+        let number_text = number.to_string();
+        // What this part has added to `progress`, taken back when it is sent again.
+        let sent = Arc::new(AtomicU64::new(0));
 
-            let resp = send(
-                &format!("s3: upload part {part_number}/{total_parts}"),
-                || {
-                    // A retried part starts over from the bytes confirmed before it.
-                    progress.set_done(size - remaining);
-                    Ok(self
-                        .request(
-                            Method::PUT,
-                            Some(key),
-                            &[("partNumber", &number), ("uploadId", upload_id)],
-                            &hash,
-                        )
-                        .header(CONTENT_LENGTH, data.len())
-                        .timeout(upload_timeout(len))
-                        .body(bytes_body(data.clone(), progress.clone())))
-                },
-            )
-            .await?;
-            let resp = ensure_success(resp, format!("Upload of part {part_number} failed")).await?;
-            let etag = resp
-                .headers()
-                .get(ETAG)
-                .and_then(|v| v.to_str().ok())
-                .context("S3 did not return an ETag for the uploaded part")?
-                .to_string();
-            etags.push(etag);
-
-            remaining -= len;
-            debug!(
-                "'{key}': part {part_number}/{total_parts} done ({} left)",
-                format_bytes(remaining)
-            );
-            part_number += 1;
-        }
-        Ok(etags)
+        let op = format!("s3: upload part {number}/{}", upload.total_parts);
+        let resp = send(&op, || {
+            progress.sub(sent.swap(0, Ordering::Relaxed));
+            let (progress, sent) = (progress.clone(), sent.clone());
+            Ok(self
+                .request(
+                    Method::PUT,
+                    Some(key),
+                    &[("partNumber", &number_text), ("uploadId", upload.upload_id)],
+                    &hash,
+                )
+                .header(CONTENT_LENGTH, data.len())
+                .timeout(upload_timeout(len))
+                .body(bytes_body(data.clone(), move |n| {
+                    progress.add(n);
+                    sent.fetch_add(n, Ordering::Relaxed);
+                })))
+        })
+        .await?;
+        let resp = ensure_success(resp, format!("Upload of part {number} failed")).await?;
+        let etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .context("S3 did not return an ETag for the uploaded part")?
+            .to_string();
+        debug!("'{key}': part {number}/{} done", upload.total_parts);
+        Ok(etag)
     }
 
     async fn complete_multipart(&self, key: &str, upload_id: &str, etags: &[String]) -> Result<()> {
@@ -471,7 +540,7 @@ impl Drop for AbortOnDrop<'_> {
 
 #[async_trait]
 impl StorageProvider for S3Provider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "S3 compatible storage"
     }
 
@@ -527,7 +596,7 @@ impl StorageProvider for S3Provider {
         let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
 
         Ok(Some(RemoteFileInfo {
-            name: key.rsplit('/').next().unwrap_or_default().to_string(),
+            name: base_name(&key).to_string(),
             path: format!("/{key}"),
             is_dir: false,
             size: header(CONTENT_LENGTH)
@@ -584,11 +653,12 @@ impl StorageProvider for S3Provider {
         }
         let prefix = format!("{key}/");
         let (objects, _) = self.list_objects(&prefix, false).await?;
-        for object in &objects {
-            self.delete_object(&object.key).await?;
-        }
+        let mut keys: Vec<String> = objects.into_iter().map(|o| o.key).collect();
         // Folder marker object created by other tools, if any.
-        self.delete_object(&prefix).await
+        if !keys.contains(&prefix) {
+            keys.push(prefix);
+        }
+        self.delete_objects(&keys).await
     }
 
     /// S3 has no rename: objects are copied to the new key, then deleted.
@@ -615,32 +685,20 @@ impl StorageProvider for S3Provider {
         }
         let (objects, _) = self.list_objects(&from_prefix, false).await?;
         // Copy everything first, so a failure never leaves the folder half moved.
-        for object in &objects {
-            let target = format!("{to_prefix}{}", &object.key[from_prefix.len()..]);
-            self.copy_object(&object.key, &target).await?;
-        }
-        for object in &objects {
-            self.delete_object(&object.key).await?;
-        }
-        Ok(())
-    }
-
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        let key = Self::key_for(remote_path);
-        let resp = send("s3: GET", || {
-            Ok(self
-                .request(Method::GET, Some(&key), &[], EMPTY_SHA256)
-                .timeout(API_TIMEOUT))
-        })
-        .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let text = ensure_success(resp, format!("Failed to read '{key}'"))
-            .await?
-            .text()
+        let copies: Vec<(String, String)> = objects
+            .iter()
+            .map(|o| {
+                let target = format!("{to_prefix}{}", &o.key[from_prefix.len()..]);
+                (o.key.clone(), target)
+            })
+            .collect();
+        stream::iter(copies)
+            .map(|(from, to)| async move { self.copy_object(&from, &to).await })
+            .buffer_unordered(PARALLEL_COPIES)
+            .try_collect::<Vec<()>>()
             .await?;
-        Ok(Some(text))
+        let keys: Vec<String> = objects.into_iter().map(|o| o.key).collect();
+        self.delete_objects(&keys).await
     }
 
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
@@ -652,22 +710,14 @@ impl StorageProvider for S3Provider {
         };
         let (objects, prefixes) = self.list_objects(&prefix, true).await?;
 
-        let dirs = prefixes.into_iter().map(|p| {
-            let path = p.prefix.trim_end_matches('/').to_string();
-            RemoteFileInfo {
-                name: path.rsplit('/').next().unwrap_or_default().to_string(),
-                path: format!("/{path}"),
-                is_dir: true,
-                size: 0,
-                md5: None,
-                modified: None,
-            }
-        });
+        let dirs = prefixes
+            .into_iter()
+            .map(|p| RemoteFileInfo::dir(format!("/{}", p.prefix.trim_end_matches('/'))));
         let files = objects
             .into_iter()
             .filter(|o| o.key != prefix && !o.key.ends_with('/'))
             .map(|o| RemoteFileInfo {
-                name: o.key.rsplit('/').next().unwrap_or_default().to_string(),
+                name: base_name(&o.key).to_string(),
                 path: format!("/{}", o.key),
                 is_dir: false,
                 size: o.size,

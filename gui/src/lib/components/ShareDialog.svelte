@@ -51,7 +51,7 @@
   }
 </script>
 
-<dialog
+<dialog class="modal"
   bind:this={dialog}
   onclose={onclose}
   oncancel={(e) => {
@@ -96,16 +96,6 @@
 <style>
   dialog {
     width: min(420px, calc(100vw - 32px));
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow);
-  }
-
-  dialog::backdrop {
-    background: rgb(0 0 0 / 0.35);
   }
 
   form {
@@ -122,17 +112,6 @@
     font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  label > span {
-    color: var(--muted);
-    font-size: 12px;
   }
 
   input {

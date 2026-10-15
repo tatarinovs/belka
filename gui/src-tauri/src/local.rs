@@ -56,9 +56,17 @@ pub fn list(path: &str, places: &[Place]) -> Result<LocalListing> {
         .with_context(|| format!("Cannot open folder '{}'", dir.display()))?;
     for entry in read.flatten() {
         // Entries that cannot be inspected (no access, broken links) are skipped.
-        let Ok(meta) = std::fs::metadata(entry.path()) else {
+        // On Windows the listing already holds the metadata; only a link needs
+        // a separate call for its target.
+        let Ok(mut meta) = entry.metadata() else {
             continue;
         };
+        if meta.file_type().is_symlink() {
+            let Ok(target) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            meta = target;
+        }
         if is_hidden(&entry.file_name().to_string_lossy(), &meta) {
             continue;
         }

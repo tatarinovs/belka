@@ -7,9 +7,11 @@
 
   let collapsed = $state(false);
 
-  const queued = $derived(transfers.items.filter((t) => t.state === "queued").length);
-  const running = $derived(transfers.activeCount - queued);
-  const finished = $derived(transfers.items.length - transfers.activeCount);
+  const queued = $derived(transfers.counts.queued);
+  const running = $derived(transfers.counts.running);
+  const finished = $derived(transfers.total - transfers.activeCount);
+  /** Transfers the backend only counted. */
+  const hidden = $derived(transfers.total - transfers.items.length);
 
   const summary = $derived.by(() => {
     const parts: string[] = [];
@@ -30,11 +32,14 @@
       case "queued":
         return t.total ? `В очереди · ${formatBytes(t.total)}` : "В очереди";
       case "running": {
+        const retry = t.attempt > 1 ? `попытка ${t.attempt} из ${t.max_attempts}` : "";
+        if (!t.done && retry) return `Связь прервалась · ${retry}`;
+        if (!t.done && transfers.waiting[t.id]) return "Ждём ответа сервера…";
         const speed = transfers.speeds[t.id];
-        const size = t.total
-          ? `${formatBytes(t.done)} из ${formatBytes(t.total)}`
-          : formatBytes(t.done);
-        return speed ? `${size} · ${formatBytes(speed)}/с` : size;
+        const parts = [t.total ? `${formatBytes(t.done)} из ${formatBytes(t.total)}` : formatBytes(t.done)];
+        if (speed) parts.push(`${formatBytes(speed)}/с`);
+        if (retry) parts.push(retry);
+        return parts.join(" · ");
       }
       case "done":
         return `Готово · ${formatBytes(t.total || t.done)}`;
@@ -46,7 +51,7 @@
   }
 </script>
 
-{#if transfers.items.length}
+{#if transfers.total}
   <section class:collapsed>
     <header>
       <button class="toggle" onclick={() => (collapsed = !collapsed)} aria-expanded={!collapsed}>
@@ -96,6 +101,9 @@
             </div>
           </li>
         {/each}
+        {#if hidden > 0}
+          <li class="more">…и ещё {hidden}</li>
+        {/if}
       </ul>
     {/if}
   </section>
@@ -181,6 +189,11 @@
     gap: 10px;
     padding: 6px 12px;
     border-bottom: 1px solid var(--border);
+  }
+
+  li.more {
+    color: var(--muted);
+    font-size: 12px;
   }
 
   li:last-child {

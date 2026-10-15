@@ -21,8 +21,9 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::StateFlags;
 use tokio::sync::oneshot;
-use tracing_subscriber::EnvFilter;
-use transfers::{Direction, Spec, TransferView, Transfers};
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::prelude::*;
+use transfers::{Direction, Spec, TransferList, Transfers};
 
 struct AppState {
     accounts: Mutex<AccountStore>,
@@ -97,8 +98,11 @@ impl AppState {
 /// Commands return errors as strings with the full context chain.
 type CmdResult<T> = std::result::Result<T, String>;
 
+/// Also logged: the page shows the message, but the log keeps it.
 fn to_msg(err: anyhow::Error) -> String {
-    format!("{err:#}")
+    let msg = format!("{err:#}");
+    tracing::warn!("{msg}");
+    msg
 }
 
 #[tauri::command]
@@ -347,6 +351,49 @@ fn remove_account(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     remove().map_err(to_msg)
 }
 
+/// Saves all accounts with their credentials into file `path`, encrypted
+/// with `password`.
+#[tauri::command]
+async fn export_accounts(
+    state: State<'_, AppState>,
+    path: String,
+    password: String,
+) -> CmdResult<usize> {
+    async {
+        let backup = state.accounts.lock().unwrap().export()?;
+        let count = backup.account_count();
+        let data = serde_json::to_vec(&backup)?;
+        // Key derivation is deliberately slow.
+        let file =
+            tauri::async_runtime::spawn_blocking(move || belka_core::crypt::seal(&password, &data))
+                .await??;
+        std::fs::write(&path, file).with_context(|| format!("Failed to write '{path}'"))?;
+        Ok(count)
+    }
+    .await
+    .map_err(to_msg)
+}
+
+/// Adds the accounts from a file made by [`export_accounts`].
+#[tauri::command]
+async fn import_accounts(
+    state: State<'_, AppState>,
+    path: String,
+    password: String,
+) -> CmdResult<accounts::Imported> {
+    async {
+        let file = std::fs::read(&path).with_context(|| format!("Failed to read '{path}'"))?;
+        let data = tauri::async_runtime::spawn_blocking(move || {
+            belka_core::crypt::unseal(&password, &file)
+        })
+        .await??;
+        let backup = serde_json::from_slice(&data).context("The file is damaged")?;
+        state.accounts.lock().unwrap().import(backup)
+    }
+    .await
+    .map_err(to_msg)
+}
+
 #[tauri::command]
 async fn list_dir(
     state: State<'_, AppState>,
@@ -534,7 +581,7 @@ async fn preview_file(
 }
 
 #[tauri::command]
-fn preview_progress(state: State<'_, AppState>) -> (u64, u64) {
+fn preview_progress(state: State<'_, AppState>) -> preview::PreviewProgress {
     state.previews.progress()
 }
 
@@ -798,7 +845,7 @@ async fn list_local(app: tauri::AppHandle, path: String) -> CmdResult<local::Loc
 }
 
 #[tauri::command]
-fn list_transfers(state: State<'_, AppState>) -> Vec<TransferView> {
+fn list_transfers(state: State<'_, AppState>) -> TransferList {
     state.transfers.list()
 }
 
@@ -829,11 +876,21 @@ fn clear_transfers(state: State<'_, AppState>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let filter = EnvFilter::try_from_env("BELKA_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn,belka_core=info,belka_gui_lib=info"));
+    // BELKA_LOG takes levels per target, e.g. "debug,reqwest=trace".
+    let filter = std::env::var("BELKA_LOG")
+        .ok()
+        .and_then(|value| value.parse::<Targets>().ok())
+        .unwrap_or_else(|| {
+            Targets::new()
+                .with_default(LevelFilter::WARN)
+                .with_target("belka_core", LevelFilter::INFO)
+                .with_target("belka_gui_lib", LevelFilter::INFO)
+        });
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_max_level(LevelFilter::TRACE)
         .with_target(false)
+        .finish()
+        .with(filter)
         .init();
 
     tauri::Builder::default()
@@ -880,6 +937,8 @@ pub fn run() {
             update_account,
             reorder_accounts,
             remove_account,
+            export_accounts,
+            import_accounts,
             list_dir,
             download,
             upload,

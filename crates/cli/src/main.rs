@@ -1,4 +1,6 @@
 mod config;
+mod format;
+mod hash;
 mod login;
 mod modes;
 
@@ -10,12 +12,13 @@ use config::ProviderKind;
 use modes::local_upload::UploadOptions;
 use modes::remote_urls::{MirrorOptions, UrlList, DEFAULT_ASSET_FILTER};
 use modes::Stats;
-use regex::Regex;
+use regex_lite::Regex;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::prelude::*;
 
 const EXIT_FATAL: u8 = 1;
 const EXIT_PARTIAL: u8 = 3;
@@ -253,16 +256,20 @@ async fn run(cli: &Cli) -> Result<Stats> {
 
 fn init_logging(verbose: bool, quiet: bool, to_stderr: bool) {
     let level = match (verbose, quiet) {
-        (true, _) => "debug",
-        (_, true) => "warn",
-        _ => "info",
+        (true, _) => LevelFilter::DEBUG,
+        (_, true) => LevelFilter::WARN,
+        _ => LevelFilter::INFO,
     };
-    // BELKA_LOG accepts tracing filter syntax, e.g. "debug,reqwest=trace".
-    let filter = EnvFilter::try_from_env("BELKA_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(format!("warn,belka={level},belka_core={level}")));
+    // BELKA_LOG takes levels per target, e.g. "debug,reqwest=trace".
+    let filter = log_filter_from_env().unwrap_or_else(|| {
+        Targets::new()
+            .with_default(LevelFilter::WARN)
+            .with_target("belka", level)
+            .with_target("belka_core", level)
+    });
 
     let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_max_level(LevelFilter::TRACE)
         .with_target(false)
         .with_timer(LocalTimer);
     // --login prints .env lines to stdout, so its log must not mix in.
@@ -270,11 +277,26 @@ fn init_logging(verbose: bool, quiet: bool, to_stderr: bool) {
         builder
             .with_ansi(use_ansi(std::io::stderr().is_terminal()))
             .with_writer(std::io::stderr)
+            .finish()
+            .with(filter)
             .init();
     } else {
         builder
             .with_ansi(use_ansi(std::io::stdout().is_terminal()))
+            .finish()
+            .with(filter)
             .init();
+    }
+}
+
+fn log_filter_from_env() -> Option<Targets> {
+    let value = std::env::var("BELKA_LOG").ok()?;
+    match value.parse() {
+        Ok(filter) => Some(filter),
+        Err(err) => {
+            eprintln!("BELKA_LOG is ignored: {err}");
+            None
+        }
     }
 }
 

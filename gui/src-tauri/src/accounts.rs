@@ -4,6 +4,9 @@
 //!
 //! An encrypted folder is an account of kind [`CRYPT_KIND`] that refers to
 //! another account and keeps its password in the keyring.
+//!
+//! All of it can be exported into one file sealed with a password
+//! ([`belka_core::crypt::seal`]) and imported on another computer.
 
 use anyhow::{bail, Context, Result};
 use belka_core::crypt::CryptConfig;
@@ -176,6 +179,132 @@ impl AccountStore {
     pub fn crypt_folder(&self, id: &str) -> Result<CryptFolder> {
         serde_json::from_str(&secret(id)?).context("Stored encryption settings are corrupted")
     }
+
+    /// All accounts with their credentials, and the user's own OAuth apps.
+    pub fn export(&self) -> Result<Backup> {
+        let accounts = self
+            .list()?
+            .into_iter()
+            .map(|account| {
+                let secret =
+                    secret(&account.id).with_context(|| format!("Account «{}»", account.name))?;
+                Ok(SavedAccount { account, secret })
+            })
+            .collect::<Result<_>>()?;
+        let oauth_apps = [Service::Google, Service::Yandex]
+            .into_iter()
+            .filter_map(|service| load_oauth_app(service).map(|app| SavedOAuthApp { service, app }))
+            .collect();
+        Ok(Backup {
+            accounts,
+            oauth_apps,
+        })
+    }
+
+    /// Adds the accounts of `backup` that are not here yet; ones with the same
+    /// id are the same account and stay as they are. OAuth apps are taken only
+    /// if there is none for the service. Every entry is checked before
+    /// anything is saved.
+    pub fn import(&self, backup: Backup) -> Result<Imported> {
+        let mut accounts = self.list()?;
+        let mut new: Vec<(Account, String)> = Vec::new();
+        let mut skipped = 0;
+        for SavedAccount {
+            mut account,
+            secret,
+        } in backup.accounts
+        {
+            if accounts
+                .iter()
+                .chain(new.iter().map(|(a, _)| a))
+                .any(|a| a.id == account.id)
+            {
+                skipped += 1;
+                continue;
+            }
+            let corrupted = || format!("The settings of account «{}» are corrupted", account.name);
+            if account.kind == CRYPT_KIND {
+                let folder: CryptFolder = serde_json::from_str(&secret).with_context(corrupted)?;
+                account.crypt = Some(CryptLocation {
+                    base: folder.base,
+                    root: folder.root,
+                });
+            } else {
+                let config: ProviderConfig =
+                    serde_json::from_str(&secret).with_context(corrupted)?;
+                if config.kind() != account.kind {
+                    bail!(corrupted());
+                }
+            }
+            if account.name.trim().is_empty() || account.id.is_empty() {
+                bail!(corrupted());
+            }
+            new.push((account, secret));
+        }
+
+        let added = new.len();
+        let mut written = Vec::new();
+        let result = new.iter().try_for_each(|(account, secret)| {
+            entry(&account.id)?
+                .set_password(secret)
+                .context("Failed to save credentials to the system keyring")?;
+            written.push(account.id.as_str());
+            Ok(())
+        });
+        let result = result.and_then(|()| {
+            accounts.extend(new.iter().map(|(a, _)| a.clone()));
+            self.save(&accounts)
+        });
+        if let Err(err) = result {
+            for id in written {
+                if let Ok(e) = entry(id) {
+                    let _ = e.delete_credential();
+                }
+            }
+            return Err(err);
+        }
+        for SavedOAuthApp { service, app } in backup.oauth_apps {
+            if load_oauth_app(service).is_none() {
+                save_oauth_app(service, &app)?;
+            }
+        }
+        Ok(Imported { added, skipped })
+    }
+}
+
+/// What an export of accounts holds, before it is sealed with a password.
+#[derive(Serialize, Deserialize)]
+pub struct Backup {
+    accounts: Vec<SavedAccount>,
+    #[serde(default)]
+    oauth_apps: Vec<SavedOAuthApp>,
+}
+
+impl Backup {
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedAccount {
+    #[serde(flatten)]
+    account: Account,
+    /// The keyring entry as is: `ProviderConfig` or `CryptFolder` in JSON.
+    secret: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedOAuthApp {
+    service: Service,
+    app: OAuthApp,
+}
+
+#[derive(Serialize)]
+pub struct Imported {
+    pub added: usize,
+    /// Accounts that are here already.
+    pub skipped: usize,
 }
 
 /// The user's own OAuth app for `service`, so it is entered only once.

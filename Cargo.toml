@@ -12,7 +12,8 @@ authors = ["Belka Team"]
 [workspace.dependencies]
 belka-core = { path = "crates/core" }
 tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# TLS is chosen per platform in crates/core.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 bytes = "1"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }

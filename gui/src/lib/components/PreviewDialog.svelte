@@ -19,6 +19,8 @@
   let loading = $state(false);
   let error = $state("");
   let progress = $state<[number, number]>([0, 0]);
+  /** What the download is doing when no data comes, or "". */
+  let stalled = $state("");
   /** Large files the user agreed to download. */
   let confirmed = $state(new Set<string>());
   let requestSeq = 0;
@@ -54,9 +56,15 @@
     error = "";
     loading = true;
     progress = [0, item.size];
+    stalled = "";
+    const started = Date.now();
     const timer = setInterval(async () => {
-      const [done, total] = await api.previewProgress();
-      if (seq === requestSeq) progress = [done, total || item.size];
+      const { done, total, attempt, max_attempts } = await api.previewProgress();
+      if (seq !== requestSeq) return;
+      progress = [done, total || item.size];
+      if (attempt > 1) stalled = `Связь прервалась · попытка ${attempt} из ${max_attempts}`;
+      else if (!done && Date.now() - started > 5000) stalled = "Ждём ответа сервера…";
+      else stalled = "";
     }, 200);
     try {
       const result = await api.previewFile(account.id, item, kind === "text");
@@ -85,7 +93,7 @@
   }
 </script>
 
-<dialog bind:this={dialog} onclose={onclose} {onkeydown}>
+<dialog class="modal" bind:this={dialog} onclose={onclose} {onkeydown}>
   <header>
     <span class="name" title={entry?.path}>{entry?.name}</span>
     <span class="meta">
@@ -128,6 +136,9 @@
       <div class="message">
         <p>Загрузка… {progress[1] ? Math.floor((progress[0] / progress[1]) * 100) : 0}%</p>
         <div class="bar"><div style:width="{progress[1] ? (progress[0] / progress[1]) * 100 : 0}%"></div></div>
+        {#if stalled}
+          <p class="stalled">{stalled}</p>
+        {/if}
       </div>
     {:else if kind === "image"}
       <img {src} alt={entry.name} />
@@ -157,12 +168,6 @@
     height: calc(100vh - 64px);
     max-width: none;
     max-height: none;
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow);
   }
 
   dialog:not([open]) {
@@ -215,6 +220,11 @@
     width: 100%;
     height: 100%;
     border: 0;
+  }
+
+  .stalled {
+    color: var(--muted);
+    font-size: 12px;
   }
 
   .text {

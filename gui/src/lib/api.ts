@@ -53,6 +53,9 @@ export type ProviderConfig = { kind: ProviderKind } & Record<string, string | nu
 
 export type TransferState = "queued" | "running" | "done" | "failed" | "cancelled";
 
+/** How many transfers are in each state, including ones not in the list. */
+export type TransferCounts = Record<TransferState, number>;
+
 /** Mirrors `TransferView` from the GUI backend. */
 export interface Transfer {
   id: number;
@@ -67,6 +70,9 @@ export interface Transfer {
   error?: string;
   done: number;
   total: number;
+  /** Above 1 while network failures are retried. */
+  attempt: number;
+  max_attempts: number;
 }
 
 /** Mirrors `CryptFolder` from the GUI backend. */
@@ -131,6 +137,13 @@ export const api = {
     invoke<Account>("add_crypt_folder", { name, folder }),
   removeAccount: (id: string) => invoke<void>("remove_account", { id }),
   reorderAccounts: (ids: string[]) => invoke<void>("reorder_accounts", { ids }),
+  /** Saves all accounts with credentials into a file encrypted with `password`.
+   * Resolves to the number of accounts. */
+  exportAccounts: (path: string, password: string) =>
+    invoke<number>("export_accounts", { path, password }),
+  /** Adds the accounts from an exported file; ones already here are skipped. */
+  importAccounts: (path: string, password: string) =>
+    invoke<{ added: number; skipped: number }>("import_accounts", { path, password }),
   listDir: (accountId: string, path: string) =>
     invoke<RemoteEntry[]>("list_dir", { accountId, path }),
 
@@ -182,7 +195,8 @@ export const api = {
       text,
     }),
   /** Bytes downloaded and total of the preview in progress. */
-  previewProgress: () => invoke<[number, number]>("preview_progress"),
+  previewProgress: () =>
+    invoke<{ done: number; total: number; attempt: number; max_attempts: number }>("preview_progress"),
   previewCancel: () => invoke<void>("preview_cancel"),
   /** Opens a cached preview in the program associated with it. */
   previewOpen: (path: string) => invoke<void>("preview_open", { path }),
@@ -195,7 +209,8 @@ export const api = {
   /** Moves to the Recycle Bin. */
   localDelete: (paths: string[]) => invoke<void>("local_delete", { paths }),
 
-  listTransfers: () => invoke<Transfer[]>("list_transfers"),
+  /** The running transfers, the head of the queue and the latest finished ones. */
+  listTransfers: () => invoke<{ items: Transfer[]; counts: TransferCounts }>("list_transfers"),
   cancelTransfer: (id: number) => invoke<void>("cancel_transfer", { id }),
   cancelAllTransfers: () => invoke<void>("cancel_all_transfers"),
   retryTransfer: (id: number) => invoke<void>("retry_transfer", { id }),

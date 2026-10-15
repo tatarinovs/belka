@@ -226,7 +226,7 @@
   }
 </script>
 
-<dialog
+<dialog class="modal"
   bind:this={dialog}
   onclose={close}
   oncancel={(e) => {
@@ -435,16 +435,6 @@
   dialog {
     width: min(520px, calc(100vw - 32px));
     max-height: calc(100vh - 32px);
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow);
-  }
-
-  dialog::backdrop {
-    background: rgb(0 0 0 / 0.35);
   }
 
   form {
@@ -452,12 +442,6 @@
     flex-direction: column;
     gap: 12px;
     padding: 18px 20px;
-  }
-
-  h2 {
-    margin: 0;
-    font-size: 16px;
-    font-weight: 600;
   }
 
   .kind-fixed {
@@ -481,17 +465,6 @@
     padding: 10px;
     border: 1px solid var(--border);
     border-radius: 8px;
-  }
-
-  label {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  label > span {
-    color: var(--muted);
-    font-size: 12px;
   }
 
   label.check {

@@ -2,17 +2,17 @@
 //! own API, which accepts the same app password.
 
 use super::webdav::WebDavProvider;
-use super::{RemoteFileInfo, StorageProvider};
-use crate::client::{build_http_client, ensure_success, send, Sink, Source, API_TIMEOUT};
+use super::{RemoteFileInfo, StorageProvider, TokenCache};
+use crate::client::{
+    build_http_client, ensure_success, json_response, send, Sink, Source, API_TIMEOUT,
+};
 use crate::progress::Progress;
 use crate::provider::MAILRU_WEBDAV_URL;
 use crate::utils::path::normalize_remote_dir;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 const TOKEN_URL: &str = "https://o2.mail.ru/token";
 /// The client id of Mail.ru's own desktop app, which allows password sign-in.
@@ -25,7 +25,7 @@ pub struct MailruProvider {
     user: String,
     password: String,
     client: Client,
-    token: Mutex<Option<(String, Instant)>>,
+    token: TokenCache,
 }
 
 #[derive(Deserialize)]
@@ -58,17 +58,15 @@ impl MailruProvider {
             user,
             password,
             client: build_http_client()?,
-            token: Mutex::new(None),
+            token: TokenCache::default(),
         })
     }
 
     async fn access_token(&self) -> Result<String> {
-        let mut cached = self.token.lock().await;
-        if let Some((token, expires_at)) = cached.as_ref() {
-            if *expires_at > Instant::now() + Duration::from_secs(300) {
-                return Ok(token.clone());
-            }
-        }
+        self.token.get(|| self.sign_in()).await
+    }
+
+    async fn sign_in(&self) -> Result<(String, Option<u64>)> {
         let resp = send("mailru: sign in", || {
             Ok(self
                 .client
@@ -82,11 +80,7 @@ impl MailruProvider {
                 .timeout(API_TIMEOUT))
         })
         .await?;
-        let token: TokenResponse = ensure_success(resp, "Mail.ru sign-in failed")
-            .await?
-            .json()
-            .await
-            .context("Invalid Mail.ru token response")?;
+        let token: TokenResponse = json_response(resp, "Mail.ru sign-in failed").await?;
         let Some(access_token) = token.access_token else {
             let reason = token.error_description.or(token.error).unwrap_or_default();
             // A password made for WebDAV only works for files but not here.
@@ -94,9 +88,7 @@ impl MailruProvider {
                 "Mail.ru refused to sign in for public links: {reason}. Links need an app                  password with full access to Mail, Cloud and Calendar (all protocols)"
             );
         };
-        let expires_at = Instant::now() + Duration::from_secs(token.expires_in.unwrap_or(3600));
-        *cached = Some((access_token.clone(), expires_at));
-        Ok(access_token)
+        Ok((access_token, token.expires_in))
     }
 
     /// Calls a method of the cloud API with form parameters.
@@ -135,18 +127,14 @@ impl MailruProvider {
             bail!("'{path}' does not exist");
         }
         let info: Envelope<ItemInfo> =
-            ensure_success(resp, format!("Failed to get info for '{path}'"))
-                .await?
-                .json()
-                .await
-                .context("Invalid Mail.ru item response")?;
+            json_response(resp, format!("Failed to get info for '{path}'")).await?;
         Ok(info.body.weblink.filter(|w| !w.is_empty()))
     }
 }
 
 #[async_trait]
 impl StorageProvider for MailruProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.dav.name()
     }
 
@@ -188,10 +176,6 @@ impl StorageProvider for MailruProvider {
         self.dav.rename(remote_path, new_name, is_dir).await
     }
 
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        self.dav.read_text_file(remote_path).await
-    }
-
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
         self.dav.list_dir(remote_dir).await
     }
@@ -208,11 +192,8 @@ impl StorageProvider for MailruProvider {
         if resp.status() == StatusCode::NOT_FOUND {
             bail!("'{path}' does not exist");
         }
-        let published: Envelope<String> = ensure_success(resp, format!("Failed to share '{path}'"))
-            .await?
-            .json()
-            .await
-            .context("Invalid Mail.ru publish response")?;
+        let published: Envelope<String> =
+            json_response(resp, format!("Failed to share '{path}'")).await?;
         Ok(format!("{PUBLIC_URL}{}", published.body))
     }
 

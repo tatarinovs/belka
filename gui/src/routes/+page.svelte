@@ -6,7 +6,7 @@
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { api, errorText, type Account, type Entry, type Listing } from "$lib/api";
   import { dnd, paneAt } from "$lib/dnd.svelte";
-  import { parentPath, splitPath } from "$lib/format";
+  import { baseName, parentPath, splitPath } from "$lib/format";
   import { providerDef } from "$lib/providers";
   import { transfers } from "$lib/transfers.svelte";
   import AccountList from "$lib/components/AccountList.svelte";
@@ -17,10 +17,21 @@
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
   import ShareDialog from "$lib/components/ShareDialog.svelte";
   import Icon from "$lib/components/Icon.svelte";
+  import TabBar, { type Tab } from "$lib/components/TabBar.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
 
+  const KEY_TABS = "tabs";
+  // Used before tabs appeared; read once to keep the last place.
   const KEY_ACCOUNT = "lastAccount";
   const KEY_LOCAL = "lastLocalPath";
+
+  type CloudTab = { id: string; account: string; path: string };
+  type LocalTab = { id: string; path: string };
+  type TabAction = "new" | "close" | "next" | "prev";
+
+  function newId() {
+    return crypto.randomUUID();
+  }
 
   function stored(key: string): string | null {
     try {
@@ -40,7 +51,10 @@
 
   let accounts = $state<Account[]>([]);
   let loaded = $state(false);
-  let selectedId = $state<string | null>(null);
+  let cloudTabs = $state<CloudTab[]>([]);
+  let cloudTabId = $state<string | null>(null);
+  let localTabs = $state<LocalTab[]>([]);
+  let localTabId = $state<string | null>(null);
   let adding = $state(false);
   /** The account whose settings dialog is open. */
   let editing = $state<Account | null>(null);
@@ -60,8 +74,11 @@
   let cloudPane = $state<FilePane>();
   let localPane = $state<FilePane>();
   let activePane = $state<"cloud" | "local">("cloud");
-  let cloudPath = $state("/");
-  let localPath = $state(stored(KEY_LOCAL) ?? "");
+  const cloudTab = $derived(cloudTabs.find((t) => t.id === cloudTabId) ?? null);
+  const localTab = $derived(localTabs.find((t) => t.id === localTabId) ?? null);
+  const selectedId = $derived(cloudTab?.account ?? null);
+  const cloudPath = $derived(cloudTab?.path ?? "/");
+  const localPath = $derived(localTab?.path ?? "");
   /** Files of the cloud folder being previewed and where the preview starts. */
   let previewing = $state<{ files: Entry[]; start: number } | null>(null);
   /** Cloud items the link settings dialog is open for. */
@@ -154,15 +171,125 @@
     });
   }
 
+  /** Opens `account` in the active cloud tab, as choosing a drive does in Total Commander. */
   function selectAccount(account: Account) {
-    selectedId = account.id;
-    cloudPath = "/";
-    remember(KEY_ACCOUNT, account.id);
+    if (cloudTab) {
+      cloudTab.account = account.id;
+      cloudTab.path = "/";
+    } else {
+      openCloudTab(account.id, "/");
+    }
   }
+
+  function openCloudTab(account: string, path: string) {
+    const tab = { id: newId(), account, path };
+    const at = cloudTabs.findIndex((t) => t.id === cloudTabId);
+    cloudTabs.splice(at < 0 ? cloudTabs.length : at + 1, 0, tab);
+    cloudTabId = tab.id;
+  }
+
+  function openLocalTab(path: string) {
+    const tab = { id: newId(), path };
+    const at = localTabs.findIndex((t) => t.id === localTabId);
+    localTabs.splice(at < 0 ? localTabs.length : at + 1, 0, tab);
+    localTabId = tab.id;
+  }
+
+  function closeTab(side: "cloud" | "local", id: string) {
+    const tabs = side === "cloud" ? cloudTabs : localTabs;
+    if (tabs.length < 2) return;
+    const at = tabs.findIndex((t) => t.id === id);
+    if (at < 0) return;
+    tabs.splice(at, 1);
+    const next = tabs[Math.min(at, tabs.length - 1)].id;
+    if (side === "cloud" && cloudTabId === id) cloudTabId = next;
+    if (side === "local" && localTabId === id) localTabId = next;
+  }
+
+  function reorderTabs<T extends { id: string }>(tabs: T[], ids: string[]): T[] {
+    return ids.map((id) => tabs.find((t) => t.id === id)).filter((t) => t !== undefined);
+  }
+
+  /** Tab commands for the pane's tabs: Ctrl+T, Ctrl+W, Ctrl+Tab and the "+" button. */
+  async function tabKey(side: "cloud" | "local", action: TabAction) {
+    const tabs = side === "cloud" ? cloudTabs : localTabs;
+    const current = side === "cloud" ? cloudTabId : localTabId;
+    if (action === "new") {
+      if (side === "cloud" && cloudTab) openCloudTab(cloudTab.account, cloudTab.path);
+      else if (side === "local") openLocalTab(localPath);
+    } else if (action === "close") {
+      if (current) closeTab(side, current);
+    } else {
+      const at = tabs.findIndex((t) => t.id === current);
+      const next = tabs[(at + (action === "next" ? 1 : tabs.length - 1)) % tabs.length]?.id ?? null;
+      if (side === "cloud") cloudTabId = next;
+      else localTabId = next;
+    }
+    // The pane is remounted for the new tab; keep the keyboard in it.
+    activePane = side;
+    await tick();
+    (side === "cloud" ? cloudPane : localPane)?.focus();
+  }
+
+  function localLabel(path: string) {
+    if (!path) return "Этот компьютер";
+    return baseName(path);
+  }
+
+  const cloudTabItems = $derived(
+    cloudTabs.map((t): Tab => {
+      const account = accounts.find((a) => a.id === t.account);
+      const name = account?.name ?? "?";
+      return {
+        id: t.id,
+        label: t.path === "/" ? name : (t.path.split("/").filter(Boolean).at(-1) ?? t.path),
+        title: `${name}: ${t.path}`,
+        kind: account?.kind,
+        badge: account ? providerDef(account.kind).short : undefined,
+      };
+    }),
+  );
+
+  const localTabItems = $derived(
+    localTabs.map((t): Tab => ({ id: t.id, label: localLabel(t.path), title: t.path || "Этот компьютер" })),
+  );
+
+  /** Restores the tabs of the last session, dropping ones of removed accounts. */
+  function restoreTabs(list: Account[]) {
+    let saved: {
+      cloud?: { tabs: CloudTab[]; active: string | null };
+      local?: { tabs: LocalTab[]; active: string | null };
+    } = {};
+    try {
+      saved = JSON.parse(stored(KEY_TABS) ?? "{}");
+    } catch {
+      // Start with fresh tabs.
+    }
+    const known = new Set(list.map((a) => a.id));
+    cloudTabs = (saved.cloud?.tabs ?? []).filter((t) => known.has(t.account));
+    if (!cloudTabs.length && list.length) {
+      const last = stored(KEY_ACCOUNT) ?? "";
+      cloudTabs = [{ id: newId(), account: known.has(last) ? last : list[0].id, path: "/" }];
+    }
+    cloudTabId = cloudTabs.find((t) => t.id === saved.cloud?.active)?.id ?? cloudTabs[0]?.id ?? null;
+    localTabs = saved.local?.tabs?.length ? saved.local.tabs : [{ id: newId(), path: stored(KEY_LOCAL) ?? "" }];
+    localTabId = localTabs.find((t) => t.id === saved.local?.active)?.id ?? localTabs[0].id;
+  }
+
+  $effect(() => {
+    if (!loaded) return;
+    remember(
+      KEY_TABS,
+      JSON.stringify({
+        cloud: { tabs: cloudTabs, active: cloudTabId },
+        local: { tabs: localTabs, active: localTabId },
+      }),
+    );
+  });
 
   function added(account: Account) {
     accounts = [...accounts, account];
-    selectAccount(account);
+    openCloudTab(account.id, "/");
     adding = false;
   }
 
@@ -194,8 +321,19 @@
   async function removeAccount(account: Account) {
     await api.removeAccount(account.id);
     accounts = accounts.filter((a) => a.id !== account.id);
-    if (selectedId === account.id && accounts[0]) selectAccount(accounts[0]);
-    else if (!accounts.length) selectedId = null;
+    // Tabs of the removed account close; if none are left, another account opens.
+    const left = cloudTabs.filter((t) => t.account !== account.id);
+    if (!left.length && accounts[0]) {
+      left.push({ id: newId(), account: accounts[0].id, path: "/" });
+    }
+    cloudTabs = left;
+    if (!left.some((t) => t.id === cloudTabId)) cloudTabId = left[0]?.id ?? null;
+  }
+
+  /** Shows accounts added from an exported file; with none before, opens the first. */
+  async function importedAccounts() {
+    accounts = await api.listAccounts();
+    if (!cloudTabs.length && accounts[0]) openCloudTab(accounts[0].id, "/");
   }
 
   async function remove(account: Account) {
@@ -263,7 +401,7 @@
     if (!localPaths.length) return;
     const dir = cloudPane.getPath();
     const existing = new Set(cloudPane.getEntries().map((e) => e.name.toLowerCase()));
-    const names = localPaths.map((p) => p.split(/[\\/]/).filter(Boolean).at(-1) ?? p);
+    const names = localPaths.map(baseName);
     const sources = localPaths;
     await run("Подготовка загрузки…", async () => {
       const conflicts = names.filter((n) => existing.has(n.toLowerCase()));
@@ -299,10 +437,12 @@
       .listAccounts()
       .then((list) => {
         accounts = list;
-        const last = stored(KEY_ACCOUNT);
-        selectedId = list.find((a) => a.id === last)?.id ?? list[0]?.id ?? null;
+        restoreTabs(list);
       })
-      .catch((err) => (notice = errorText(err)))
+      .catch((err) => {
+        notice = errorText(err);
+        restoreTabs([]);
+      })
       .finally(async () => {
         loaded = true;
         // The window starts hidden so the user never sees a blank webview.
@@ -345,13 +485,26 @@
 <main>
   <div class="panes">
     <div class="slot">
-      {#if selected}
-        {#key selected.id}
+      {#if cloudTabs.length}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div onpointerdown={() => (activePane = "cloud")}>
+          <TabBar
+            tabs={cloudTabItems}
+            activeId={cloudTabId}
+            onselect={(id) => (cloudTabId = id)}
+            onclose={(id) => closeTab("cloud", id)}
+            onnew={() => tabKey("cloud", "new")}
+            onreorder={(ids) => (cloudTabs = reorderTabs(cloudTabs, ids))}
+          />
+        </div>
+      {/if}
+      {#if selected && cloudTab}
+        {#key `${cloudTab.id}:${selected.id}`}
           <FilePane
             bind:this={cloudPane}
             id="cloud"
             load={(path) => cloudListing(selected, path)}
-            initialPath="/"
+            initialPath={cloudTab.path}
             rootPath="/"
             rootLabel={selected.name}
             rootIcon="cloud"
@@ -362,7 +515,14 @@
             oncopy={toLocal}
             ondragto={(target) => dragTo("cloud", target)}
             onswitch={() => localPane?.focus()}
-            onnavigate={(path) => (cloudPath = path)}
+            onnavigate={(path) => {
+              if (cloudTab) cloudTab.path = path;
+            }}
+            onopentab={(entry) => {
+              if (entry.opensAccount) openCloudTab(entry.opensAccount, "/");
+              else openCloudTab(selected.id, entry.path);
+            }}
+            ontabkey={(action) => tabKey("cloud", action)}
             onpreview={(entry, files) => (previewing = { files, start: files.indexOf(entry) })}
             onopenaccount={(id) => {
               const folder = accounts.find((a) => a.id === id);
@@ -385,12 +545,13 @@
             {/snippet}
             {#snippet actions()}
               <button
-                class="btn primary"
+                class="btn primary arrow"
                 onclick={toLocal}
                 disabled={!!busy || !localPath}
                 title={localPath ? `Скачать выбранное в ${localPath} (F5)` : "Справа откройте папку на компьютере"}
+                aria-label="Скачать"
               >
-                Скачать <Icon name="arrowRight" size={14} />
+                <Icon name="arrowRight" size={16} />
               </button>
             {/snippet}
           </FilePane>
@@ -417,6 +578,19 @@
     </div>
 
     <div class="slot">
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div onpointerdown={() => (activePane = "local")}>
+        <TabBar
+          tabs={localTabItems}
+          activeId={localTabId}
+          onselect={(id) => (localTabId = id)}
+          onclose={(id) => closeTab("local", id)}
+          onnew={() => tabKey("local", "new")}
+          onreorder={(ids) => (localTabs = reorderTabs(localTabs, ids))}
+        />
+      </div>
+      {#if localTab}
+        {#key localTab.id}
       <FilePane
         bind:this={localPane}
         id="local"
@@ -432,25 +606,29 @@
         ondragto={(target) => dragTo("local", target)}
         onswitch={() => cloudPane?.focus()}
         onnavigate={(path) => {
-          localPath = path;
-          remember(KEY_LOCAL, path);
+          if (localTab) localTab.path = path;
         }}
+        onopentab={(entry) => openLocalTab(entry.path)}
+        ontabkey={(action) => tabKey("local", action)}
         ops={localOps}
         onopenfile={(entry) => api.localOpen(entry.path).catch((err) => (notice = errorText(err)))}
         copyLabel="Загрузить в облако"
         canCopy={!busy && !!selected}
       >
-        {#snippet actions()}
+        {#snippet leading()}
           <button
-            class="btn primary"
+            class="btn primary arrow"
             onclick={() => toCloud()}
             disabled={!!busy || !selected}
             title="Загрузить выбранное в открытую слева папку облака (F5)"
+            aria-label="Загрузить"
           >
-            <Icon name="arrowLeft" size={14} /> Загрузить
+            <Icon name="arrowLeft" size={16} />
           </button>
         {/snippet}
       </FilePane>
+        {/key}
+      {/if}
     </div>
   </div>
 
@@ -511,6 +689,7 @@
   onedit={(a) => (editing = a)}
   onremove={removeAccount}
   onreorder={reorderAccounts}
+  onimported={importedAccounts}
 />
 
 <AccountDialog
@@ -543,6 +722,17 @@
     flex-direction: column;
     min-width: 0;
     min-height: 0;
+  }
+
+  /* The transfer buttons face each other across the divider. */
+  .slot :global(.btn.arrow) {
+    justify-content: center;
+    width: 36px;
+    padding: 0;
+  }
+
+  .slot + .slot :global(.btn.arrow) {
+    margin-right: 6px;
   }
 
   .slot + .slot {

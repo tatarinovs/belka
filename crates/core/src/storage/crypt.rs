@@ -3,7 +3,7 @@
 //! uploaded and decrypted while it is downloaded, without temporary files.
 
 use super::{check_name, RemoteFileInfo, StorageProvider};
-use crate::client::{MemorySink, Sink, Source};
+use crate::client::{Sink, Source};
 use crate::crypt::{decrypted_size, Cipher, CryptConfig, DecryptSink, EncryptedSource};
 use crate::progress::Progress;
 use crate::utils::path::{join_remote, normalize_remote_dir, split_remote};
@@ -17,14 +17,13 @@ pub struct CryptProvider {
     /// The folder of `inner` that holds the encrypted tree.
     root: String,
     cipher: Arc<Cipher>,
-    name: &'static str,
+    name: String,
 }
 
 impl CryptProvider {
     /// Key derivation takes a moment by design, so build once and reuse.
     pub fn new(inner: Arc<dyn StorageProvider>, root: &str, config: &CryptConfig) -> Result<Self> {
-        // Built once per account or run, so leaking the name is fine.
-        let name = Box::leak(format!("{} (encrypted)", inner.name()).into_boxed_str());
+        let name = format!("{} (encrypted)", inner.name());
         Ok(Self {
             inner,
             name,
@@ -102,8 +101,8 @@ impl CryptProvider {
 
 #[async_trait]
 impl StorageProvider for CryptProvider {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     async fn check_access(&self, remote_dir: &str) -> Result<()> {
@@ -118,14 +117,7 @@ impl StorageProvider for CryptProvider {
         let path = normalize_remote_dir(remote_path);
         let (parent, _) = split_remote(&path);
         if path == "/" {
-            return Ok(Some(RemoteFileInfo {
-                name: String::new(),
-                path,
-                is_dir: true,
-                size: 0,
-                md5: None,
-                modified: None,
-            }));
+            return Ok(Some(RemoteFileInfo::dir(path)));
         }
         let file = self.inner_file(&path);
         let dir = self.inner_dir(&path);
@@ -197,19 +189,6 @@ impl StorageProvider for CryptProvider {
             })
     }
 
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        let file = self.inner_file(remote_path);
-        if self.inner.get_file_info(&file).await?.is_none() {
-            return Ok(None);
-        }
-        let mut data = MemorySink::default();
-        self.download_to(remote_path, &mut data, &Progress::new())
-            .await?;
-        String::from_utf8(data.0)
-            .map(Some)
-            .with_context(|| format!("'{remote_path}' is not a text file"))
-    }
-
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
         let dir = normalize_remote_dir(remote_dir);
         let items = self.inner.list_dir(&self.inner_dir(&dir)).await?;
@@ -260,7 +239,7 @@ mod tests {
 
     #[async_trait]
     impl StorageProvider for LocalDir {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "local"
         }
         async fn ensure_dir(&self, dir: &str) -> Result<()> {

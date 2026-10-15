@@ -1,9 +1,11 @@
 //! Yandex Disk REST API: https://yandex.ru/dev/disk-api/doc/
 
-use super::{as_md5, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider};
+use super::{
+    as_md5, create_dirs, parse_rfc3339, rename_target, Mkdir, RemoteFileInfo, StorageProvider,
+};
 use crate::client::{
-    build_http_client, download_into, ensure_success, http_error, retry_transient, send,
-    source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT,
+    build_http_client, download_into, ensure_success, http_error, json_response, retry_transient,
+    send, source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::normalize_remote_dir;
@@ -141,12 +143,34 @@ impl YandexDiskProvider {
         if resp.status() == StatusCode::NOT_FOUND {
             bail!("'{path}' does not exist");
         }
-        let link: Link = ensure_success(resp, format!("Failed to get download URL for '{path}'"))
-            .await?
-            .json()
-            .await
-            .context("Invalid download URL response")?;
+        let link: Link =
+            json_response(resp, format!("Failed to get download URL for '{path}'")).await?;
         Ok(link.href)
+    }
+
+    /// Creates one folder; Yandex tells "exists" from "no parent" only in the body.
+    async fn mkdir(&self, path: String) -> Result<Mkdir> {
+        let resp = send("yandex: create folder", || {
+            Ok(self.api(Method::PUT, "").query(&[("path", path.as_str())]))
+        })
+        .await?;
+        match resp.status() {
+            StatusCode::CREATED | StatusCode::OK => Ok(Mkdir::Done),
+            StatusCode::CONFLICT => {
+                let body = resp.text().await.unwrap_or_default();
+                if body.contains("DiskPathPointsToExistentDirectoryError") {
+                    Ok(Mkdir::Done)
+                } else if body.contains("DiskPathDoesntExistsError") {
+                    Ok(Mkdir::ParentMissing)
+                } else {
+                    bail!(
+                        "Failed to create folder '{path}': HTTP 409: {}",
+                        body.trim()
+                    )
+                }
+            }
+            _ => Err(http_error(resp, format!("Failed to create folder '{path}'")).await),
+        }
     }
 
     async fn wait_for_operation(&self, href: &str) -> Result<()> {
@@ -160,11 +184,7 @@ impl YandexDiskProvider {
                     .timeout(API_TIMEOUT))
             })
             .await?;
-            let op: Operation = ensure_success(resp, "Failed to query operation status")
-                .await?
-                .json()
-                .await
-                .context("Invalid operation status response")?;
+            let op: Operation = json_response(resp, "Failed to query operation status").await?;
             match op.status.as_str() {
                 "success" => return Ok(()),
                 "failed" => bail!("Yandex Disk reported that the operation failed"),
@@ -179,7 +199,7 @@ impl YandexDiskProvider {
 
 #[async_trait]
 impl StorageProvider for YandexDiskProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Yandex Disk"
     }
 
@@ -194,25 +214,7 @@ impl StorageProvider for YandexDiskProvider {
             None => {}
         }
 
-        let mut current = String::new();
-        for segment in dir.split('/').filter(|s| !s.is_empty()) {
-            current.push('/');
-            current.push_str(segment);
-            let resp = send("yandex: create folder", || {
-                Ok(self
-                    .api(Method::PUT, "")
-                    .query(&[("path", current.as_str())]))
-            })
-            .await?;
-            // 409 means the folder already exists (we create parents first).
-            if !matches!(
-                resp.status(),
-                StatusCode::CREATED | StatusCode::OK | StatusCode::CONFLICT
-            ) {
-                return Err(http_error(resp, format!("Failed to create folder '{current}'")).await);
-            }
-        }
-        Ok(())
+        create_dirs(&dir, |path| self.mkdir(path)).await
     }
 
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {
@@ -226,11 +228,8 @@ impl StorageProvider for YandexDiskProvider {
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let resource: Resource = ensure_success(resp, format!("Failed to get info for '{path}'"))
-            .await?
-            .json()
-            .await
-            .context("Invalid resource response from Yandex Disk")?;
+        let resource: Resource =
+            json_response(resp, format!("Failed to get info for '{path}'")).await?;
         Ok(Some(resource.into_info()))
     }
 
@@ -241,7 +240,7 @@ impl StorageProvider for YandexDiskProvider {
         progress: &Progress,
     ) -> Result<()> {
         let path = normalize_remote_dir(remote_path);
-        retry_transient(&format!("yandex: upload '{path}'"), || {
+        retry_transient(&format!("yandex: upload '{path}'"), progress, || {
             self.upload_once(source, &path, progress)
         })
         .await
@@ -312,35 +311,6 @@ impl StorageProvider for YandexDiskProvider {
         }
     }
 
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        let path = normalize_remote_dir(remote_path);
-        let resp = send("yandex: request download URL", || {
-            Ok(self
-                .api(Method::GET, "/download")
-                .query(&[("path", path.as_str())]))
-        })
-        .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let link: Link = ensure_success(resp, format!("Failed to get download URL for '{path}'"))
-            .await?
-            .json()
-            .await
-            .context("Invalid download URL response")?;
-
-        let resp = send("yandex: download", || {
-            Ok(self.client.get(&link.href).timeout(API_TIMEOUT))
-        })
-        .await?;
-        let text = ensure_success(resp, format!("Failed to download '{path}'"))
-            .await?
-            .text()
-            .await
-            .with_context(|| format!("Failed to read '{path}'"))?;
-        Ok(Some(text))
-    }
-
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
         let dir = normalize_remote_dir(remote_dir);
         let limit = PAGE_SIZE.to_string();
@@ -359,11 +329,7 @@ impl StorageProvider for YandexDiskProvider {
             if resp.status() == StatusCode::NOT_FOUND {
                 break;
             }
-            let listing: Listing = ensure_success(resp, format!("Failed to list '{dir}'"))
-                .await?
-                .json()
-                .await
-                .context("Invalid folder listing from Yandex Disk")?;
+            let listing: Listing = json_response(resp, format!("Failed to list '{dir}'")).await?;
             let page = listing.embedded.map(|e| e.items).unwrap_or_default();
             let count = page.len();
             items.extend(page.into_iter().map(Resource::into_info));
@@ -394,11 +360,7 @@ impl StorageProvider for YandexDiskProvider {
         })
         .await?;
         let published: Published =
-            ensure_success(resp, format!("Failed to get the link to '{path}'"))
-                .await?
-                .json()
-                .await
-                .context("Invalid resource response from Yandex Disk")?;
+            json_response(resp, format!("Failed to get the link to '{path}'")).await?;
         published
             .public_url
             .context("Yandex Disk did not return a public link")

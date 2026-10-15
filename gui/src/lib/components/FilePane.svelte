@@ -57,6 +57,8 @@
     onopenaccount,
     onpreview,
     onopenfile,
+    onopentab,
+    ontabkey,
   }: {
     /** Pane id used for drag and drop between panes. */
     id: string;
@@ -90,6 +92,10 @@
     onpreview?: (entry: Entry, files: Entry[]) => void;
     /** Enter or double click on a file, instead of the preview. */
     onopenfile?: (entry: Entry) => void;
+    /** Opens a folder in a new tab (context menu, middle click, Ctrl+Enter). */
+    onopentab?: (entry: Entry) => void;
+    /** Ctrl+T, Ctrl+W, Ctrl+Tab and Ctrl+Shift+Tab. */
+    ontabkey?: (action: "new" | "close" | "next" | "prev") => void;
   } = $props();
 
   type SortKey = "name" | "size" | "modified";
@@ -321,7 +327,17 @@
       grid.querySelector(`[data-path="${CSS.escape(entry.path)}"]`)?.scrollIntoView({ block: "nearest" });
     };
     const ctrl = event.ctrlKey || event.metaKey;
-    if (ctrl && event.key.toLowerCase() === "a") {
+    if (ctrl && ontabkey && event.key === "Tab") {
+      ontabkey(event.shiftKey ? "prev" : "next");
+    } else if (ctrl && ontabkey && event.code === "KeyT") {
+      ontabkey("new");
+    } else if (ctrl && ontabkey && event.code === "KeyW") {
+      ontabkey("close");
+    } else if (ctrl && event.key === "Enter" && onopentab) {
+      const entry = sorted[index];
+      if (!entry || !(entry.is_dir || entry.opensAccount)) return;
+      onopentab(entry);
+    } else if (ctrl && event.key.toLowerCase() === "a") {
       selected.clear();
       for (const e of sorted) selected.add(e.path);
     } else if (ctrl && event.key.toLowerCase() === "r") {
@@ -457,6 +473,9 @@
     const single = picked.length === 1 ? picked[0] : null;
     const items: MenuItem[] = [];
     if (single?.is_dir) items.push({ label: "Открыть", icon: "folder", shortcut: "Enter", action: () => open(single) });
+    if (single?.is_dir && onopentab) {
+      items.push({ label: "Открыть в новой вкладке", shortcut: "Ctrl+Enter", action: () => onopentab(single) });
+    }
     if (single && !single.is_dir && onopenfile) {
       items.push({ label: "Открыть", icon: "file", shortcut: "Enter", action: () => open(single) });
     }
@@ -594,6 +613,10 @@
           onpointerdown={(e) => pointerdown(e, entry)}
           onclick={(e) => click(e, entry)}
           ondblclick={() => open(entry)}
+          onauxclick={(e) => {
+            if (e.button === 1 && entry.is_dir && onopentab) onopentab(entry);
+          }}
+          onmousedown={(e) => e.button === 1 && e.preventDefault()}
           oncontextmenu={(e) => {
             e.stopPropagation();
             openMenu(e, entry);

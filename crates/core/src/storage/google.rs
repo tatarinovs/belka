@@ -1,12 +1,12 @@
 //! Google Drive API v3 with resumable uploads.
 
-use super::{as_md5, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider};
+use super::{as_md5, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider, TokenCache};
 use crate::client::{
-    backoff, client_builder, download_into, ensure_success, http_error, send, source_body,
-    upload_timeout, Failure, Sink, Source, API_TIMEOUT, MAX_ATTEMPTS,
+    client_builder, download_into, ensure_success, http_error, json_response, pause_before_retry,
+    send, source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT, MAX_ATTEMPTS,
 };
 use crate::progress::Progress;
-use crate::utils::path::{normalize_remote_dir, split_remote};
+use crate::utils::path::{join_remote, normalize_remote_dir, split_remote};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE};
@@ -14,9 +14,8 @@ use reqwest::{redirect, Client, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 const FILES_API: &str = "https://www.googleapis.com/drive/v3/files";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3/files";
@@ -37,15 +36,10 @@ pub enum GoogleAuth {
     },
 }
 
-struct CachedToken {
-    value: String,
-    expires_at: Instant,
-}
-
 pub struct GoogleDriveProvider {
     client: Client,
     auth: GoogleAuth,
-    token: Mutex<Option<CachedToken>>,
+    token: TokenCache,
     /// Folder path -> id. The lock also serializes folder creation so that
     /// parallel uploads never create duplicate folders.
     folders: Mutex<HashMap<String, String>>,
@@ -129,7 +123,7 @@ impl GoogleDriveProvider {
         Ok(Self {
             client,
             auth,
-            token: Mutex::new(None),
+            token: TokenCache::default(),
             folders: Mutex::new(HashMap::new()),
         })
     }
@@ -144,36 +138,34 @@ impl GoogleDriveProvider {
             } => (client_id, client_secret, refresh_token),
         };
 
-        let mut cached = self.token.lock().await;
-        if let Some(token) = cached.as_ref() {
-            if token.expires_at > Instant::now() + Duration::from_secs(300) {
-                return Ok(token.value.clone());
-            }
-        }
+        self.token
+            .get(|| self.refresh(client_id, client_secret, refresh_token))
+            .await
+    }
+
+    async fn refresh(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        refresh_token: &str,
+    ) -> Result<(String, Option<u64>)> {
         let resp = send("google: refresh access token", || {
             Ok(self
                 .client
                 .post(TOKEN_URL)
                 .form(&[
-                    ("client_id", client_id.as_str()),
-                    ("client_secret", client_secret.as_str()),
-                    ("refresh_token", refresh_token.as_str()),
+                    ("client_id", client_id),
+                    ("client_secret", client_secret),
+                    ("refresh_token", refresh_token),
                     ("grant_type", "refresh_token"),
                 ])
                 .timeout(API_TIMEOUT))
         })
         .await?;
-        let token: TokenResponse = ensure_success(resp, "Failed to refresh Google access token")
-            .await?
-            .json()
-            .await
-            .context("Invalid OAuth token response")?;
+        let token: TokenResponse =
+            json_response(resp, "Failed to refresh Google access token").await?;
         debug!("Obtained a new Google access token");
-        *cached = Some(CachedToken {
-            value: token.access_token.clone(),
-            expires_at: Instant::now() + Duration::from_secs(token.expires_in.unwrap_or(3600)),
-        });
-        Ok(token.access_token)
+        Ok((token.access_token, token.expires_in))
     }
 
     async fn query_files(&self, q: &str, limit: Option<usize>) -> Result<Vec<DriveFile>> {
@@ -201,11 +193,7 @@ impl GoogleDriveProvider {
                 Ok(req)
             })
             .await?;
-            let page: FileList = ensure_success(resp, "Google Drive query failed")
-                .await?
-                .json()
-                .await
-                .context("Invalid file list response")?;
+            let page: FileList = json_response(resp, "Google Drive query failed").await?;
             files.extend(page.files);
             if limit.is_some_and(|l| files.len() >= l) {
                 break;
@@ -286,11 +274,8 @@ impl GoogleDriveProvider {
         struct Created {
             id: String,
         }
-        let created: Created = ensure_success(resp, format!("Failed to create folder '{name}'"))
-            .await?
-            .json()
-            .await
-            .context("Invalid create folder response")?;
+        let created: Created =
+            json_response(resp, format!("Failed to create folder '{name}'")).await?;
         Ok(created.id)
     }
 
@@ -308,6 +293,15 @@ impl GoogleDriveProvider {
             Some(parent_id) => self.find_child(&parent_id, &name, folder).await,
             None => Ok(None),
         }
+    }
+
+    /// Forgets the cached ids of `dir` and the folders in it.
+    async fn forget_folders(&self, dir: &str) {
+        let prefix = format!("{dir}/");
+        self.folders
+            .lock()
+            .await
+            .retain(|cached, _| cached != dir && !cached.starts_with(&prefix));
     }
 
     async fn start_session(
@@ -392,6 +386,7 @@ impl GoogleDriveProvider {
         progress: &Progress,
     ) -> Result<()> {
         progress.set_total(size);
+        progress.set_attempt(1);
         let mut offset = 0;
         let mut attempt = 1;
         loop {
@@ -411,12 +406,7 @@ impl GoogleDriveProvider {
                     if attempt >= MAX_ATTEMPTS {
                         return Err(err);
                     }
-                    let delay = backoff(attempt);
-                    warn!(
-                        "google: upload interrupted: {err:#}; resuming in {:.1}s (attempt {attempt}/{MAX_ATTEMPTS})",
-                        delay.as_secs_f32()
-                    );
-                    tokio::time::sleep(delay).await;
+                    pause_before_retry("google: upload interrupted", &err, attempt, progress).await;
                     attempt += 1;
                     match self.query_offset(session, size).await? {
                         UploadState::Done => return Ok(()),
@@ -454,7 +444,7 @@ async fn classify_upload_response(resp: Response) -> Result<UploadState, Failure
 
 #[async_trait]
 impl StorageProvider for GoogleDriveProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Google Drive"
     }
 
@@ -557,11 +547,7 @@ impl StorageProvider for GoogleDriveProvider {
             return Err(http_error(resp, format!("Failed to delete '{path}'")).await);
         }
         if is_dir {
-            let prefix = format!("{path}/");
-            self.folders
-                .lock()
-                .await
-                .retain(|cached, _| cached != &path && !cached.starts_with(&prefix));
+            self.forget_folders(&path).await;
         }
         Ok(())
     }
@@ -597,36 +583,9 @@ impl StorageProvider for GoogleDriveProvider {
         .await?;
         ensure_success(resp, format!("Failed to rename '{path}'")).await?;
         if is_dir {
-            let prefix = format!("{path}/");
-            self.folders
-                .lock()
-                .await
-                .retain(|cached, _| cached != &path && !cached.starts_with(&prefix));
+            self.forget_folders(&path).await;
         }
         Ok(())
-    }
-
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        let path = normalize_remote_dir(remote_path);
-        let Some(item) = self.find_item(&path, Some(false)).await? else {
-            return Ok(None);
-        };
-        let token = self.access_token().await?;
-        let url = format!("{FILES_API}/{}", item.id);
-        let resp = send("google: download", || {
-            Ok(self
-                .client
-                .get(&url)
-                .bearer_auth(&token)
-                .query(&[("alt", "media")])
-                .timeout(API_TIMEOUT))
-        })
-        .await?;
-        let text = ensure_success(resp, format!("Failed to download '{path}'"))
-            .await?
-            .text()
-            .await?;
-        Ok(Some(text))
     }
 
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
@@ -643,7 +602,7 @@ impl StorageProvider for GoogleDriveProvider {
             .await?
             .into_iter()
             .map(|file| {
-                let path = crate::utils::path::join_remote(&dir, &file.name);
+                let path = join_remote(&dir, &file.name);
                 file.into_info(path)
             })
             .collect())
@@ -686,11 +645,7 @@ impl StorageProvider for GoogleDriveProvider {
             #[serde(rename = "webViewLink")]
             web_view_link: Option<String>,
         }
-        let link: Link = ensure_success(resp, format!("Failed to get the link to '{path}'"))
-            .await?
-            .json()
-            .await
-            .context("Invalid file response")?;
+        let link: Link = json_response(resp, format!("Failed to get the link to '{path}'")).await?;
         link.web_view_link
             .context("Google Drive did not return a link")
     }

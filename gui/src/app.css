@@ -140,3 +140,53 @@ button {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* Modal dialogs: the frame, the title and labelled fields. Components add
+   their own size and layout. */
+.modal {
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.modal::backdrop {
+  background: rgb(0 0 0 / 0.35);
+}
+
+.modal h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.modal label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.modal label > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* A provider badge; components set its size. */
+.badge {
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  background: var(--kind-color, #6b7280);
+}
+
+[data-kind="yandex"] { --kind-color: #e8492f; }
+[data-kind="mailru"] { --kind-color: #1a73e8; }
+[data-kind="google"] { --kind-color: #1e8e3e; }
+[data-kind="webdav"] { --kind-color: #7c4dcc; }
+[data-kind="s3"] { --kind-color: #c77700; }
+[data-kind="synology"] { --kind-color: #2f6f9f; }
+[data-kind="crypt"] { --kind-color: #455a64; }

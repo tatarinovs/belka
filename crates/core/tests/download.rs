@@ -1,6 +1,6 @@
 //! Resumable downloads against a scripted local HTTP server.
 
-use belka_core::client::{build_http_client, download, file_body};
+use belka_core::client::{build_http_client, download, source_body, FileSource, Source};
 use belka_core::Progress;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -115,6 +115,7 @@ async fn downloads_and_reports_progress() {
     assert_eq!(size, CONTENT.len() as u64);
     assert_eq!(std::fs::read(&dest).unwrap(), CONTENT);
     assert_eq!((progress.done(), progress.total()), (size, size));
+    assert_eq!(progress.attempt(), 1);
     assert!(!part_of(&dest).exists());
 }
 
@@ -127,11 +128,13 @@ async fn resumes_after_a_dropped_connection() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
+    let progress = Progress::new();
 
-    fetch(&server.url, &dest, &Progress::new()).await.unwrap();
+    fetch(&server.url, &dest, &progress).await.unwrap();
 
     assert_eq!(std::fs::read(&dest).unwrap(), CONTENT);
     assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(progress.attempt(), 2, "the retry is shown");
 }
 
 #[tokio::test]
@@ -213,7 +216,8 @@ async fn upload_body_reports_progress() {
     std::fs::write(&local, &data).unwrap();
     let progress = Progress::new();
 
-    let (body, len) = file_body(&local, &progress).unwrap();
+    let source = FileSource::new(&local).unwrap();
+    let (body, len) = (source_body(&source, 0, &progress).unwrap(), source.len());
     let resp = build_http_client()
         .unwrap()
         .put(&url)

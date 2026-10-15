@@ -11,10 +11,12 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{header, Body, Client, ClientBuilder, RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
 use std::fmt::Display;
 use std::future::Future;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -40,10 +42,17 @@ pub fn client_builder() -> ClientBuilder {
         .pool_idle_timeout(Duration::from_secs(60))
 }
 
+/// The client with the base settings. It is built once and shared, so all
+/// providers reuse one connection pool and one TLS setup.
 pub fn build_http_client() -> Result<Client> {
-    client_builder()
+    static SHARED: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = SHARED.get() {
+        return Ok(client.clone());
+    }
+    let client = client_builder()
         .build()
-        .context("Failed to initialize HTTP client")
+        .context("Failed to initialize HTTP client")?;
+    Ok(SHARED.get_or_init(|| client).clone())
 }
 
 /// Upper bound for a single upload request: a generous base plus the time
@@ -125,15 +134,8 @@ pub fn source_body(source: &dyn Source, offset: u64, progress: &Progress) -> Res
     Ok(reader_body(source.open_at(offset)?, progress.clone()))
 }
 
-/// Opens a local file as a streaming request body (nothing is buffered in memory).
-/// Resets `progress` to 0 of the file size and advances it as the body is sent.
-pub fn file_body(path: &Path, progress: &Progress) -> Result<(Body, u64)> {
-    let source = FileSource::new(path)?;
-    Ok((source_body(&source, 0, progress)?, source.len()))
-}
-
 /// A streaming body that adds every chunk it yields to `progress`.
-pub fn reader_body<R>(reader: R, progress: Progress) -> Body
+fn reader_body<R>(reader: R, progress: Progress) -> Body
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -149,14 +151,15 @@ where
     Body::wrap_stream(stream)
 }
 
-/// An in-memory body sent in chunks, so that `progress` advances smoothly.
-pub fn bytes_body(data: Bytes, progress: Progress) -> Body {
+/// An in-memory body sent in chunks; `sent` gets the size of every chunk, so
+/// progress advances smoothly.
+pub fn bytes_body(data: Bytes, sent: impl Fn(u64) + Send + Sync + 'static) -> Body {
     let chunks: Vec<Bytes> = (0..data.len())
         .step_by(BODY_CHUNK)
         .map(|start| data.slice(start..data.len().min(start + BODY_CHUNK)))
         .collect();
     let stream = futures_util::stream::iter(chunks).map(move |chunk| {
-        progress.add(chunk.len() as u64);
+        sent(chunk.len() as u64);
         Ok::<_, std::io::Error>(chunk)
     });
     Body::wrap_stream(stream)
@@ -199,24 +202,13 @@ where
                 if can_retry && is_retryable_status(resp.status(), policy.retry_server_errors) =>
             {
                 let delay = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
-                warn!(
-                    "{op}: HTTP {}, retrying in {:.1}s (attempt {attempt}/{})",
-                    resp.status(),
-                    delay.as_secs_f32(),
-                    policy.max_attempts
-                );
-                tokio::time::sleep(delay).await;
+                let reason = format!("HTTP {}", resp.status());
+                pause(op, &reason, delay, attempt, policy.max_attempts).await;
             }
             Ok(resp) => return Ok(resp),
             Err(err) if can_retry && is_transient(&err) => {
                 let delay = backoff(attempt);
-                warn!(
-                    "{op}: {}, retrying in {:.1}s (attempt {attempt}/{})",
-                    describe(&err),
-                    delay.as_secs_f32(),
-                    policy.max_attempts
-                );
-                tokio::time::sleep(delay).await;
+                pause(op, &describe(&err), delay, attempt, policy.max_attempts).await;
             }
             Err(err) => {
                 return Err(anyhow::Error::new(err).context(format!("{op}: request failed")))
@@ -275,27 +267,46 @@ impl From<std::io::Error> for Failure {
 }
 
 /// Runs `f` until it succeeds, fails fatally, or runs out of attempts.
-pub async fn retry_transient<T, F, Fut>(op: &str, mut f: F) -> Result<T>
+/// `progress` shows the attempt in progress.
+pub async fn retry_transient<T, F, Fut>(op: &str, progress: &Progress, mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<T, Failure>>,
 {
+    progress.set_attempt(1);
     let mut attempt = 1;
     loop {
         match f().await {
             Ok(value) => return Ok(value),
             Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
-                let delay = backoff(attempt);
-                warn!(
-                    "{op}: {err:#}; retrying in {:.1}s (attempt {attempt}/{MAX_ATTEMPTS})",
-                    delay.as_secs_f32()
-                );
-                tokio::time::sleep(delay).await;
+                pause_before_retry(op, &err, attempt, progress).await;
             }
             Err(failure) => return Err(failure.into_inner()),
         }
         attempt += 1;
     }
+}
+
+/// Logs a transient failure and waits [`backoff`] before attempt `attempt + 1`,
+/// which `progress` shows from now on.
+pub async fn pause_before_retry(op: &str, err: &anyhow::Error, attempt: u32, progress: &Progress) {
+    progress.set_attempt(attempt + 1);
+    pause(
+        op,
+        &format!("{err:#}"),
+        backoff(attempt),
+        attempt,
+        MAX_ATTEMPTS,
+    )
+    .await;
+}
+
+async fn pause(op: &str, reason: &str, delay: Duration, attempt: u32, max_attempts: u32) {
+    warn!(
+        "{op}: {reason}; retrying in {:.1}s (attempt {attempt}/{max_attempts})",
+        delay.as_secs_f32()
+    );
+    tokio::time::sleep(delay).await;
 }
 
 pub fn is_transient(err: &reqwest::Error) -> bool {
@@ -364,6 +375,16 @@ pub async fn ensure_success(resp: Response, what: impl Display) -> Result<Respon
     } else {
         Err(http_error(resp, what).await)
     }
+}
+
+/// The JSON body of a successful response. `what` describes the request in
+/// error messages.
+pub async fn json_response<T: DeserializeOwned>(resp: Response, what: impl Display) -> Result<T> {
+    ensure_success(resp, &what)
+        .await?
+        .json()
+        .await
+        .with_context(|| format!("{what}: invalid response"))
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -527,17 +548,13 @@ where
 {
     sink.reset().await?;
     progress.set_done(0);
+    progress.set_attempt(1);
     let mut attempt = 1;
     loop {
         match download_attempt(sink, progress, request()).await {
             Ok(size) => return Ok(size),
             Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
-                let delay = backoff(attempt);
-                warn!(
-                    "{op}: {err:#}; retrying in {:.1}s (attempt {attempt}/{MAX_ATTEMPTS})",
-                    delay.as_secs_f32()
-                );
-                tokio::time::sleep(delay).await;
+                pause_before_retry(op, &err, attempt, progress).await;
             }
             Err(failure) => return Err(failure.into_inner()),
         }
@@ -555,6 +572,7 @@ async fn download_attempt(
     if offset > 0 {
         req = req.header(header::RANGE, format!("bytes={offset}-"));
     }
+    let started = std::time::Instant::now();
     let mut resp = match tokio::time::timeout(API_TIMEOUT, req.send()).await {
         Err(_) => {
             return Err(Failure::Transient(anyhow!(
@@ -566,6 +584,13 @@ async fn download_attempt(
     };
 
     let status = resp.status();
+    debug!(
+        "{} answered {status} in {:.1}s, {} bytes",
+        resp.url().host_str().unwrap_or_default(),
+        started.elapsed().as_secs_f32(),
+        resp.content_length()
+            .map_or_else(|| "unknown".to_string(), |n| n.to_string())
+    );
     let (mut pos, expected) = if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
         match parse_content_range(&resp) {
             Some((start, total)) if start == offset => (offset, total),
@@ -609,6 +634,9 @@ async fn download_attempt(
             Ok(chunk) => chunk.map_err(|err| Failure::Transient(err.into()))?,
         };
         let Some(chunk) = chunk else { break };
+        if pos == offset {
+            debug!("First data after {:.1}s", started.elapsed().as_secs_f32());
+        }
         sink.write(&chunk).await?;
         pos += chunk.len() as u64;
         progress.set_done(pos);

@@ -152,25 +152,11 @@
   }
 
   .badge {
-    flex: none;
-    display: grid;
-    place-items: center;
     width: 28px;
     height: 28px;
     border-radius: 7px;
-    color: #fff;
     font-size: 11px;
-    font-weight: 700;
-    background: #6b7280;
   }
-
-  .badge[data-kind="yandex"] { background: #e8492f; }
-  .badge[data-kind="mailru"] { background: #1a73e8; }
-  .badge[data-kind="google"] { background: #1e8e3e; }
-  .badge[data-kind="webdav"] { background: #7c4dcc; }
-  .badge[data-kind="s3"] { background: #c77700; }
-  .badge[data-kind="synology"] { background: #2f6f9f; }
-  .badge[data-kind="crypt"] { background: #455a64; }
 
   .tools {
     display: flex;

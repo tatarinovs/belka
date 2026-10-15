@@ -1,9 +1,9 @@
 //! Transfer progress shared between a running transfer and whoever displays it.
 //!
-//! Providers only update two atomic counters; the reader polls them at its own
+//! Providers only update atomic counters; the reader polls them at its own
 //! pace (a GUI timer, a CLI progress bar), so no callbacks run on the hot path.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
@@ -15,6 +15,7 @@ pub struct Progress {
 struct Counters {
     done: AtomicU64,
     total: AtomicU64,
+    attempt: AtomicU32,
 }
 
 impl Progress {
@@ -40,8 +41,27 @@ impl Progress {
         self.inner.done.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Takes back bytes counted for data that is sent again.
+    pub fn sub(&self, bytes: u64) {
+        let _ = self
+            .inner
+            .done
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |done| {
+                Some(done.saturating_sub(bytes))
+            });
+    }
+
     pub fn set_total(&self, bytes: u64) {
         self.inner.total.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The attempt in progress: 1, or more once network failures were retried.
+    pub fn attempt(&self) -> u32 {
+        self.inner.attempt.load(Ordering::Relaxed).max(1)
+    }
+
+    pub fn set_attempt(&self, attempt: u32) {
+        self.inner.attempt.store(attempt, Ordering::Relaxed);
     }
 }
 

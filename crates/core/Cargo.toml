@@ -31,5 +31,13 @@ scrypt = { version = "0.11", default-features = false }
 crypto_secretbox = "0.1"
 aes = "0.8"
 
+# Windows has its own TLS (SChannel) with the system certificate store, which
+# keeps the binaries smaller; elsewhere rustls needs no OpenSSL.
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { workspace = true, features = ["rustls-tls"] }
+
 [dev-dependencies]
 tempfile = "3"

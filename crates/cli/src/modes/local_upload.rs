@@ -1,11 +1,12 @@
 use super::Stats;
-use crate::storage::StorageProvider;
-use crate::utils::format::{format_bytes, format_rate};
-use crate::utils::hash::compute_md5_file;
-use crate::utils::path::{join_remote, normalize_remote_dir};
+use crate::format::{format_bytes, format_rate};
+use crate::hash::compute_md5_file;
+use crate::storage::{RemoteFileInfo, StorageProvider};
+use crate::utils::path::{join_remote, normalize_remote_dir, split_remote};
 use anyhow::{Context, Result};
 use belka_core::Progress;
 use futures_util::stream::{self, StreamExt};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 use tracing::{error, info, warn};
@@ -77,9 +78,15 @@ pub async fn run_local_upload(
         opts.jobs
     );
 
+    let remote = if opts.overwrite {
+        Remote::default()
+    } else {
+        Remote::list(provider, &jobs, opts.jobs.max(1)).await
+    };
+
     let started = Instant::now();
     let mut results = stream::iter(jobs)
-        .map(|job| process_file(provider, job, opts))
+        .map(|job| process_file(provider, &remote, job, opts))
         .buffer_unordered(opts.jobs.max(1));
     while let Some(outcome) = results.next().await {
         stats.processed += 1;
@@ -110,6 +117,62 @@ pub async fn run_local_upload(
         );
     }
     Ok(stats)
+}
+
+/// What is already in the target folders. Folders that several files go to
+/// are listed once, which takes far fewer requests than asking about every
+/// file; the others are asked about file by file.
+#[derive(Default)]
+struct Remote {
+    listed: HashSet<String>,
+    items: HashMap<String, RemoteFileInfo>,
+}
+
+impl Remote {
+    async fn list(provider: &dyn StorageProvider, jobs: &[FileJob], parallel: usize) -> Self {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for job in jobs {
+            *counts.entry(split_remote(&job.remote).0).or_default() += 1;
+        }
+        let dirs = counts
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .map(|(dir, _)| dir);
+        let mut listings = stream::iter(dirs)
+            .map(|dir| async move {
+                let result = provider.list_dir(&dir).await;
+                (dir, result)
+            })
+            .buffer_unordered(parallel);
+
+        let mut remote = Self::default();
+        while let Some((dir, result)) = listings.next().await {
+            match result {
+                Ok(items) => {
+                    remote
+                        .items
+                        .extend(items.into_iter().map(|item| (item.path.clone(), item)));
+                    remote.listed.insert(dir);
+                }
+                Err(err) => {
+                    warn!("  [~] Cannot list '{dir}' ({err:#}); checking its files one by one")
+                }
+            }
+        }
+        remote
+    }
+
+    async fn info(
+        &self,
+        provider: &dyn StorageProvider,
+        path: &str,
+    ) -> Result<Option<RemoteFileInfo>> {
+        if self.listed.contains(&split_remote(path).0) {
+            Ok(self.items.get(path).cloned())
+        } else {
+            provider.get_file_info(path).await
+        }
+    }
 }
 
 struct Scan {
@@ -181,11 +244,12 @@ fn scan_directory(root: &Path, remote_dir: &str) -> Scan {
 
 async fn process_file(
     provider: &dyn StorageProvider,
+    remote: &Remote,
     job: FileJob,
     opts: &UploadOptions,
 ) -> Outcome {
     if !opts.overwrite {
-        match is_up_to_date(provider, &job).await {
+        match is_up_to_date(remote.info(provider, &job.remote).await, &job).await {
             Ok(true) => {
                 info!("  [=] Unchanged: {}", job.remote);
                 return Outcome::Skipped;
@@ -238,8 +302,8 @@ async fn process_file(
 /// 2. provider has a real MD5 -> compare hashes;
 /// 3. otherwise local mtime newer than remote (2s tolerance) -> upload. This
 ///    matters for multi-volume archives whose parts all have the same size.
-async fn is_up_to_date(provider: &dyn StorageProvider, job: &FileJob) -> Result<bool> {
-    let Some(remote) = provider.get_file_info(&job.remote).await? else {
+async fn is_up_to_date(remote: Result<Option<RemoteFileInfo>>, job: &FileJob) -> Result<bool> {
+    let Some(remote) = remote? else {
         return Ok(false);
     };
     if remote.is_dir || remote.size != job.size {
@@ -273,7 +337,6 @@ async fn is_up_to_date(provider: &dyn StorageProvider, job: &FileJob) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::RemoteFileInfo;
     use async_trait::async_trait;
     use belka_core::client::{Sink, Source};
     use std::collections::HashMap;
@@ -284,11 +347,18 @@ mod tests {
         files: Mutex<HashMap<String, RemoteFileInfo>>,
         uploads: Mutex<Vec<String>>,
         dirs: Mutex<Vec<String>>,
+        listings: Mutex<usize>,
+    }
+
+    impl FakeProvider {
+        async fn is_up_to_date(&self, job: &FileJob) -> Result<bool> {
+            is_up_to_date(self.get_file_info(&job.remote).await, job).await
+        }
     }
 
     #[async_trait]
     impl StorageProvider for FakeProvider {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             "fake"
         }
         async fn ensure_dir(&self, remote_dir: &str) -> Result<()> {
@@ -325,8 +395,17 @@ mod tests {
         async fn read_text_file(&self, _remote_path: &str) -> Result<Option<String>> {
             Ok(None)
         }
-        async fn list_dir(&self, _remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
-            Ok(Vec::new())
+        async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
+            *self.listings.lock().unwrap() += 1;
+            let dir = normalize_remote_dir(remote_dir);
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|f| split_remote(&f.path).0 == dir)
+                .cloned()
+                .collect())
         }
     }
 
@@ -371,7 +450,7 @@ mod tests {
                 None,
             ),
         );
-        assert!(!is_up_to_date(&provider, &job).await.unwrap());
+        assert!(!provider.is_up_to_date(&job).await.unwrap());
     }
 
     #[tokio::test]
@@ -385,7 +464,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(job.remote.clone(), remote(&job.remote, 17, Some(md5), None));
-        assert!(is_up_to_date(&provider, &job).await.unwrap());
+        assert!(provider.is_up_to_date(&job).await.unwrap());
     }
 
     #[tokio::test]
@@ -398,7 +477,7 @@ mod tests {
             job.remote.clone(),
             remote(&job.remote, 16, None, Some(yesterday)),
         );
-        assert!(!is_up_to_date(&provider, &job).await.unwrap());
+        assert!(!provider.is_up_to_date(&job).await.unwrap());
     }
 
     #[tokio::test]
@@ -436,6 +515,32 @@ mod tests {
             *provider.dirs.lock().unwrap(),
             vec!["/Backups/sub", "/Backups/sub/deeper"]
         );
+    }
+
+    #[tokio::test]
+    async fn lists_a_shared_folder_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let md5 = compute_md5_file(&dir.path().join("a.txt")).await.unwrap();
+        let provider = FakeProvider::default();
+        for name in ["a.txt", "b.txt"] {
+            let path = format!("/B/{name}");
+            let info = remote(&path, 1, Some(md5.clone()), None);
+            provider.files.lock().unwrap().insert(path, info);
+        }
+        let opts = UploadOptions {
+            overwrite: false,
+            dry_run: false,
+            jobs: 2,
+        };
+        let stats = run_local_upload(&provider, dir.path(), "/B", &opts)
+            .await
+            .unwrap();
+        assert_eq!((stats.skipped, stats.uploaded), (2, 1));
+        assert_eq!(*provider.listings.lock().unwrap(), 1);
+        assert_eq!(*provider.uploads.lock().unwrap(), vec!["/B/c.txt"]);
     }
 
     #[tokio::test]

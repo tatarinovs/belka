@@ -6,13 +6,15 @@ pub mod synology;
 pub mod webdav;
 pub mod yandex;
 
-use crate::client::{FileSource, PartSink, Sink, Source};
+use crate::client::{FileSource, MemorySink, PartSink, Sink, Source};
 use crate::progress::Progress;
 use crate::utils::path::{join_remote, split_remote};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
+use std::future::Future;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct RemoteFileInfo {
@@ -26,11 +28,30 @@ pub struct RemoteFileInfo {
     pub modified: Option<DateTime<Utc>>,
 }
 
+impl RemoteFileInfo {
+    /// A folder known only by its path.
+    pub fn dir(path: String) -> Self {
+        Self {
+            name: base_name(&path).to_string(),
+            path,
+            is_dir: true,
+            size: 0,
+            md5: None,
+            modified: None,
+        }
+    }
+}
+
+/// The last segment of a `/`-separated path.
+pub(crate) fn base_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or_default()
+}
+
 /// A cloud storage backend. All paths are absolute, `/`-separated and
 /// normalized (see [`crate::utils::path::normalize_remote_dir`]).
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Verifies credentials and makes sure `remote_dir` is usable (may create it).
     async fn check_access(&self, remote_dir: &str) -> Result<()> {
@@ -94,8 +115,17 @@ pub trait StorageProvider: Send + Sync {
     /// Renames a file or folder within its folder. Fails if `new_name` is taken.
     async fn rename(&self, remote_path: &str, new_name: &str, is_dir: bool) -> Result<()>;
 
-    /// Returns `None` if the file does not exist.
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>>;
+    /// Returns `None` if the file does not exist. Invalid UTF-8 is replaced.
+    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
+        match self.get_file_info(remote_path).await? {
+            Some(info) if !info.is_dir => {}
+            _ => return Ok(None),
+        }
+        let mut data = MemorySink::default();
+        self.download_to(remote_path, &mut data, &Progress::new())
+            .await?;
+        Ok(Some(String::from_utf8_lossy(&data.0).into_owned()))
+    }
 
     /// Lists the direct children of `remote_dir`; empty if it does not exist.
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>>;
@@ -164,6 +194,66 @@ pub fn rename_target(remote_path: &str, new_name: &str) -> Result<String> {
     Ok(join_remote(&parent, name))
 }
 
+/// What creating a single folder ended with.
+pub(crate) enum Mkdir {
+    /// Created, or it was there already.
+    Done,
+    ParentMissing,
+}
+
+/// Creates `dir` and whatever parents are missing, with one request per
+/// folder created: `mkdir` is tried on the folder itself first and goes
+/// up only while the server reports a missing parent.
+pub(crate) async fn create_dirs<F, Fut>(dir: &str, mut mkdir: F) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Mkdir>>,
+{
+    let mut pending = vec![dir.to_string()];
+    while let Some(current) = pending.last().cloned() {
+        match mkdir(current.clone()).await? {
+            Mkdir::Done => {
+                pending.pop();
+            }
+            Mkdir::ParentMissing => {
+                let (parent, _) = split_remote(&current);
+                if parent == "/" || pending.len() > 256 {
+                    bail!(
+                        "Failed to create folder '{current}': the server reports a missing parent"
+                    );
+                }
+                pending.push(parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An access token reused until shortly before it expires.
+#[derive(Default)]
+pub(crate) struct TokenCache(tokio::sync::Mutex<Option<(String, Instant)>>);
+
+impl TokenCache {
+    /// The cached token, or a new one from `fetch`, which returns the token
+    /// and its lifetime in seconds. Concurrent callers wait for one fetch.
+    pub async fn get<F, Fut>(&self, fetch: F) -> Result<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(String, Option<u64>)>>,
+    {
+        let mut cached = self.0.lock().await;
+        if let Some((token, expires_at)) = cached.as_ref() {
+            if *expires_at > Instant::now() + Duration::from_secs(300) {
+                return Ok(token.clone());
+            }
+        }
+        let (token, lifetime) = fetch().await?;
+        let expires_at = Instant::now() + Duration::from_secs(lifetime.unwrap_or(3600));
+        *cached = Some((token.clone(), expires_at));
+        Ok(token)
+    }
+}
+
 pub(crate) fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s.trim())
         .ok()
@@ -195,6 +285,29 @@ mod tests {
             assert!(rename_target("/a/b", bad).is_err(), "{bad:?}");
         }
         assert!(rename_target("/", "x").is_err());
+    }
+
+    #[tokio::test]
+    async fn create_dirs_goes_up_only_while_parents_are_missing() {
+        let existing = std::sync::Mutex::new(vec!["/".to_string(), "/a".to_string()]);
+        let tried = std::sync::Mutex::new(Vec::new());
+        let mkdir = |path: String| {
+            tried.lock().unwrap().push(path.clone());
+            let mut existing = existing.lock().unwrap();
+            let outcome = if existing.contains(&split_remote(&path).0) {
+                existing.push(path);
+                Mkdir::Done
+            } else {
+                Mkdir::ParentMissing
+            };
+            async move { Ok(outcome) }
+        };
+        create_dirs("/a/b/c", mkdir).await.unwrap();
+        assert_eq!(*tried.lock().unwrap(), ["/a/b/c", "/a/b", "/a/b/c"]);
+
+        tried.lock().unwrap().clear();
+        create_dirs("/a/b/d", mkdir).await.unwrap();
+        assert_eq!(*tried.lock().unwrap(), ["/a/b/d"]);
     }
 
     #[test]

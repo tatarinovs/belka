@@ -7,7 +7,7 @@
 //! `BELKA_YANDEX_CLIENT_ID` / `..._SECRET` variables at compile time,
 //! or supplied by the user.
 
-use crate::client::{build_http_client, ensure_success, send, API_TIMEOUT};
+use crate::client::{build_http_client, json_response, send, API_TIMEOUT};
 use crate::storage::google::GoogleAuth;
 use crate::ProviderConfig;
 use anyhow::{anyhow, bail, Context, Result};
@@ -164,11 +164,7 @@ pub async fn sign_in(
         Ok(http.post(token_url).form(&form).timeout(API_TIMEOUT))
     })
     .await?;
-    let tokens: Tokens = ensure_success(resp, "Failed to obtain the access token")
-        .await?
-        .json()
-        .await
-        .context("Invalid token response")?;
+    let tokens: Tokens = json_response(resp, "Failed to obtain the access token").await?;
 
     match service {
         Service::Google => {

@@ -1,6 +1,9 @@
 //! Generic WebDAV (RFC 4918): Nextcloud, ownCloud, Synology, Mail.ru Cloud, etc.
 
-use super::{as_md5, parse_http_date, rename_target, RemoteFileInfo, StorageProvider};
+use super::{
+    as_md5, base_name, create_dirs, parse_http_date, rename_target, Mkdir, RemoteFileInfo,
+    StorageProvider,
+};
 use crate::client::{
     build_http_client, download_into, ensure_success, http_error, send, send_with, source_body,
     upload_timeout, RetryPolicy, Sink, Source, API_TIMEOUT,
@@ -122,6 +125,31 @@ impl WebDavProvider {
         Some(normalize_remote_dir(relative))
     }
 
+    /// Creates one folder with MKCOL.
+    async fn mkcol(&self, path: String) -> Result<Mkdir> {
+        let url = self.url_for(&path, true);
+        let mkcol = Method::from_bytes(b"MKCOL").expect("valid method");
+        let resp = send("webdav: MKCOL", || {
+            Ok(self.request(mkcol.clone(), &url).timeout(API_TIMEOUT))
+        })
+        .await?;
+        match resp.status() {
+            // 405: the collection already exists.
+            StatusCode::CREATED | StatusCode::OK | StatusCode::METHOD_NOT_ALLOWED => {
+                Ok(Mkdir::Done)
+            }
+            StatusCode::CONFLICT => Ok(Mkdir::ParentMissing),
+            status => {
+                // Some servers answer oddly for existing folders: double-check.
+                if matches!(self.get_file_info(&path).await, Ok(Some(i)) if i.is_dir) {
+                    debug!("MKCOL '{path}' returned {status}, but the folder exists");
+                    return Ok(Mkdir::Done);
+                }
+                Err(http_error(resp, format!("Failed to create folder '{path}'")).await)
+            }
+        }
+    }
+
     fn to_info(&self, entry: DavEntry, path: String) -> RemoteFileInfo {
         let md5 = if self.trust_etag_as_md5 {
             entry.etag.as_deref().and_then(as_md5)
@@ -129,7 +157,7 @@ impl WebDavProvider {
             None
         };
         RemoteFileInfo {
-            name: path.rsplit('/').next().unwrap_or_default().to_string(),
+            name: base_name(&path).to_string(),
             path,
             is_dir: entry.is_dir,
             size: entry.size.unwrap_or(0),
@@ -141,7 +169,7 @@ impl WebDavProvider {
 
 #[async_trait]
 impl StorageProvider for WebDavProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         self.display_name
     }
 
@@ -156,32 +184,7 @@ impl StorageProvider for WebDavProvider {
             None => {}
         }
 
-        let mkcol = Method::from_bytes(b"MKCOL").expect("valid method");
-        let mut current = String::new();
-        for segment in dir.split('/').filter(|s| !s.is_empty()) {
-            current.push('/');
-            current.push_str(segment);
-            let url = self.url_for(&current, true);
-            let resp = send("webdav: MKCOL", || {
-                Ok(self.request(mkcol.clone(), &url).timeout(API_TIMEOUT))
-            })
-            .await?;
-            match resp.status() {
-                // 405: the collection already exists.
-                StatusCode::CREATED | StatusCode::OK | StatusCode::METHOD_NOT_ALLOWED => {}
-                status => {
-                    // Some servers answer oddly for existing folders: double-check.
-                    if matches!(self.get_file_info(&current).await, Ok(Some(i)) if i.is_dir) {
-                        debug!("MKCOL '{current}' returned {status}, but the folder exists");
-                        continue;
-                    }
-                    return Err(
-                        http_error(resp, format!("Failed to create folder '{current}'")).await,
-                    );
-                }
-            }
-        }
-        Ok(())
+        create_dirs(&dir, |path| self.mkcol(path)).await
     }
 
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {
@@ -294,24 +297,6 @@ impl StorageProvider for WebDavProvider {
             StatusCode::PRECONDITION_FAILED => bail!("'{}' already exists", new_name.trim()),
             _ => Err(http_error(resp, format!("Failed to rename '{from}'")).await),
         }
-    }
-
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        let path = normalize_remote_dir(remote_path);
-        let url = self.url_for(&path, false);
-        let resp = send("webdav: GET", || {
-            Ok(self.request(Method::GET, &url).timeout(API_TIMEOUT))
-        })
-        .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let text = ensure_success(resp, format!("Failed to read '{path}'"))
-            .await?
-            .text()
-            .await
-            .with_context(|| format!("Failed to read '{path}'"))?;
-        Ok(Some(text))
     }
 
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {

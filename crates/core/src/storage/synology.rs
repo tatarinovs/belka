@@ -7,8 +7,8 @@
 
 use super::{rename_target, RemoteFileInfo, ShareOptions, StorageProvider};
 use crate::client::{
-    client_builder, download_into, ensure_success, retry_transient, send, source_body,
-    upload_timeout, Failure, MemorySink, Sink, Source, API_TIMEOUT,
+    client_builder, download_into, json_response, retry_transient, send, source_body,
+    upload_timeout, Failure, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::{normalize_remote_dir, split_remote};
@@ -124,11 +124,7 @@ struct ErrorBody {
 
 /// Reads a DSM response: the `data` of a successful call or an [`ApiError`].
 async fn parse<T: DeserializeOwned>(resp: Response, what: &str) -> Result<T> {
-    let envelope: Envelope = ensure_success(resp, what)
-        .await?
-        .json()
-        .await
-        .with_context(|| format!("{what}: invalid response from DSM"))?;
+    let envelope: Envelope = json_response(resp, what).await?;
     if !envelope.success {
         return Err(ApiError {
             what: what.to_string(),
@@ -547,7 +543,7 @@ impl SynologyProvider {
 
 #[async_trait]
 impl StorageProvider for SynologyProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "Synology"
     }
 
@@ -584,14 +580,7 @@ impl StorageProvider for SynologyProvider {
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {
         let path = normalize_remote_dir(remote_path);
         if path == "/" {
-            return Ok(Some(RemoteFileInfo {
-                name: String::new(),
-                path,
-                is_dir: true,
-                size: 0,
-                md5: None,
-                modified: None,
-            }));
+            return Ok(Some(RemoteFileInfo::dir(path)));
         }
         let result = self
             .call::<Files>(
@@ -627,7 +616,7 @@ impl StorageProvider for SynologyProvider {
         if depth(&path) < 2 {
             bail!("Files are stored inside shared folders, not next to them");
         }
-        retry_transient(&format!("synology: upload '{path}'"), || {
+        retry_transient(&format!("synology: upload '{path}'"), progress, || {
             self.upload_once(source, &path, progress)
         })
         .await
@@ -709,18 +698,6 @@ impl StorageProvider for SynologyProvider {
             Err(err) => Err(err),
             Ok(_) => Ok(()),
         }
-    }
-
-    async fn read_text_file(&self, remote_path: &str) -> Result<Option<String>> {
-        let path = normalize_remote_dir(remote_path);
-        if self.get_file_info(&path).await?.is_none() {
-            return Ok(None);
-        }
-        let mut sink = MemorySink::default();
-        self.download_to(&path, &mut sink, &Progress::new()).await?;
-        String::from_utf8(sink.0)
-            .map(Some)
-            .with_context(|| format!("'{path}' is not a UTF-8 text file"))
     }
 
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {

@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { ask } from "@tauri-apps/plugin-dialog";
-  import { errorText, type Account } from "$lib/api";
+  import { ask, open as openFile, save as saveFile } from "@tauri-apps/plugin-dialog";
+  import { api, errorText, type Account } from "$lib/api";
+  import { baseName, plural } from "$lib/format";
   import { providerDef } from "$lib/providers";
   import Icon from "./Icon.svelte";
+  import PasswordInput from "./PasswordInput.svelte";
 
-  let { open, accounts, onclose, onadd, onedit, onremove, onreorder }: {
+  let { open, accounts, onclose, onadd, onedit, onremove, onreorder, onimported }: {
     open: boolean;
     accounts: Account[];
     onclose: () => void;
@@ -14,11 +16,74 @@
     onremove: (account: Account) => Promise<void>;
     /** Saves a new order of the accounts by id; a rejection is shown in the dialog. */
     onreorder: (ids: string[]) => Promise<void>;
+    /** Accounts were added from an exported file. */
+    onimported: () => Promise<void>;
   } = $props();
 
   let dialog: HTMLDialogElement;
   let list = $state<HTMLUListElement>();
   let error = $state("");
+  let info = $state("");
+  /** Export or import in progress: the password form is shown. */
+  let backup = $state<{ mode: "export" } | { mode: "import"; path: string } | null>(null);
+  let password = $state("");
+  let repeat = $state("");
+  let busy = $state(false);
+
+  const BACKUP_FILTERS = [{ name: "Аккаунты Belka", extensions: ["belka"] }];
+
+  function startExport() {
+    error = info = password = repeat = "";
+    backup = { mode: "export" };
+  }
+
+  async function startImport() {
+    error = info = password = repeat = "";
+    const path = await openFile({ title: "Импорт аккаунтов", filters: BACKUP_FILTERS });
+    if (typeof path === "string") backup = { mode: "import", path };
+  }
+
+  function accountsText(n: number) {
+    return plural(n, "аккаунт", "аккаунта", "аккаунтов");
+  }
+
+  async function submitBackup(event: SubmitEvent) {
+    event.preventDefault();
+    if (!backup || busy) return;
+    error = "";
+    if (!password) {
+      error = "Введите пароль";
+      return;
+    }
+    if (backup.mode === "export" && password !== repeat) {
+      error = "Пароли не совпадают";
+      return;
+    }
+    busy = true;
+    try {
+      if (backup.mode === "export") {
+        const date = new Date().toISOString().slice(0, 10);
+        const path = await saveFile({
+          title: "Экспорт аккаунтов",
+          defaultPath: `belka-accounts-${date}.belka`,
+          filters: BACKUP_FILTERS,
+        });
+        if (!path) return;
+        const count = await api.exportAccounts(path, password);
+        info = `Сохранено: ${accountsText(count)} → ${baseName(path)}`;
+      } else {
+        const { added, skipped } = await api.importAccounts(backup.path, password);
+        if (added) await onimported();
+        info = `Добавлено: ${accountsText(added)}` + (skipped ? `, уже были: ${skipped}` : "");
+      }
+      backup = null;
+      password = repeat = "";
+    } catch (err) {
+      error = errorText(err);
+    } finally {
+      busy = false;
+    }
+  }
   /** The account being dragged and the order the list shows meanwhile. */
   let drag = $state<{ id: string; ids: string[] } | null>(null);
 
@@ -76,7 +141,8 @@
 
   $effect(() => {
     if (open && !dialog.open) {
-      error = "";
+      error = info = password = repeat = "";
+      backup = null;
       dialog.showModal();
     } else if (!open && dialog.open) {
       dialog.close();
@@ -108,11 +174,17 @@
   }
 </script>
 
-<dialog bind:this={dialog} onclose={onclose}>
+<dialog class="modal"
+  bind:this={dialog}
+  onclose={onclose}
+  oncancel={(e) => {
+    if (busy) e.preventDefault();
+  }}
+>
   <div class="body">
     <header>
       <h2>Аккаунты</h2>
-      <button class="icon-btn" title="Закрыть" onclick={() => dialog.close()}>
+      <button class="icon-btn" title="Закрыть" onclick={() => dialog.close()} disabled={busy}>
         <Icon name="close" />
       </button>
     </header>
@@ -165,11 +237,59 @@
       <p class="empty">Нет подключённых облаков.</p>
     {/if}
 
+    {#if backup}
+      <form class="backup" onsubmit={submitBackup}>
+        {#if backup.mode === "export"}
+          <h3>Экспорт аккаунтов</h3>
+          <p class="help">
+            Все аккаунты вместе с паролями и ключами доступа сохраняются в один файл, зашифрованный
+            паролем. Без пароля файл не открыть, а восстановить пароль нельзя.
+          </p>
+          <label>
+            <span>Пароль файла</span>
+            <PasswordInput bind:value={password} autocomplete="new-password" disabled={busy} />
+          </label>
+          <label>
+            <span>Пароль ещё раз</span>
+            <PasswordInput bind:value={repeat} autocomplete="new-password" disabled={busy} />
+          </label>
+        {:else}
+          <h3>Импорт аккаунтов</h3>
+          <p class="help">
+            Из файла <b>{baseName(backup.path)}</b> добавятся аккаунты, которых здесь ещё нет.
+          </p>
+          <label>
+            <span>Пароль файла</span>
+            <PasswordInput bind:value={password} autocomplete="current-password" disabled={busy} />
+          </label>
+        {/if}
+        <div class="actions">
+          <button type="button" class="btn" onclick={() => (backup = null)} disabled={busy}>Отмена</button>
+          <button type="submit" class="btn primary" disabled={busy}>
+            {#if backup.mode === "export"}
+              {busy ? "Шифрование…" : "Сохранить в файл…"}
+            {:else}
+              {busy ? "Расшифровка…" : "Импортировать"}
+            {/if}
+          </button>
+        </div>
+      </form>
+    {/if}
+
     {#if error}
       <div class="error">{error}</div>
+    {:else if info}
+      <div class="info">{info}</div>
     {/if}
 
     <footer>
+      <button class="btn" onclick={startImport} disabled={busy}>
+        <Icon name="download" size={14} /> Импорт…
+      </button>
+      <button class="btn" onclick={startExport} disabled={busy || !accounts.length}>
+        <Icon name="upload" size={14} /> Экспорт…
+      </button>
+      <span class="spacer"></span>
       <button class="btn primary" onclick={onadd}><Icon name="plus" size={14} /> Добавить аккаунт</button>
     </footer>
   </div>
@@ -179,16 +299,6 @@
   dialog {
     width: min(560px, calc(100vw - 32px));
     max-height: calc(100vh - 32px);
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--surface);
-    color: var(--text);
-    box-shadow: var(--shadow);
-  }
-
-  dialog::backdrop {
-    background: rgb(0 0 0 / 0.35);
   }
 
   .body {
@@ -202,12 +312,6 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-  }
-
-  h2 {
-    margin: 0;
-    font-size: 16px;
-    font-weight: 600;
   }
 
   ul {
@@ -278,25 +382,11 @@
   }
 
   .badge {
-    flex: none;
-    display: grid;
-    place-items: center;
     width: 28px;
     height: 28px;
     border-radius: 7px;
-    color: #fff;
     font-size: 11px;
-    font-weight: 700;
-    background: #6b7280;
   }
-
-  .badge[data-kind="yandex"] { background: #e8492f; }
-  .badge[data-kind="mailru"] { background: #1a73e8; }
-  .badge[data-kind="google"] { background: #1e8e3e; }
-  .badge[data-kind="webdav"] { background: #7c4dcc; }
-  .badge[data-kind="s3"] { background: #c77700; }
-  .badge[data-kind="synology"] { background: #2f6f9f; }
-  .badge[data-kind="crypt"] { background: #455a64; }
 
   .btn {
     display: inline-flex;
@@ -315,6 +405,44 @@
 
   footer {
     display: flex;
+    gap: 8px;
+  }
+
+  .spacer {
+    flex: 1;
+  }
+
+  .backup {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .help {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .actions {
+    display: flex;
     justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .info {
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--hover);
+    word-break: break-word;
   }
 </style>
