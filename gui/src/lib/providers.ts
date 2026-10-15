@@ -46,7 +46,7 @@ export const PROVIDERS: ProviderDef[] = [
     kind: "google",
     title: "Google Drive",
     short: "G",
-    help: "OAuth-клиент и refresh token. Вход через браузер появится позже.",
+    help: "OAuth-клиент и refresh token, например из rclone или OAuth Playground.",
     fields: [
       { key: "client_id", label: "Client ID", placeholder: "….apps.googleusercontent.com" },
       { key: "client_secret", label: "Client secret", type: "password" },

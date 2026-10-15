@@ -293,6 +293,75 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "belka"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "belka-core",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "futures-util",
+ "percent-encoding",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "walkdir",
+]
+
+[[package]]
+name = "belka-core"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "md-5",
+ "percent-encoding",
+ "quick-xml 0.37.5",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "belka-gui"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "belka-core",
+ "chrono",
+ "keyring",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "trash",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,73 +688,6 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
-
-[[package]]
-name = "cloud-uploader"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "cloud-uploader-core",
- "dotenvy",
- "futures-util",
- "percent-encoding",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "walkdir",
-]
-
-[[package]]
-name = "cloud-uploader-core"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "chrono",
- "futures-util",
- "hex",
- "hmac",
- "md-5",
- "percent-encoding",
- "quick-xml 0.37.5",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "cloud-uploader-gui"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "cloud-uploader-core",
- "keyring",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "trash",
-]
 
 [[package]]
 name = "colorchoice"

@@ -4,7 +4,7 @@ use crate::utils::format::{format_bytes, format_rate};
 use crate::utils::hash::compute_md5_file;
 use crate::utils::path::{join_remote, normalize_remote_dir};
 use anyhow::{Context, Result};
-use cloud_uploader_core::Progress;
+use belka_core::Progress;
 use futures_util::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};

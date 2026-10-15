@@ -4,14 +4,17 @@ mod transfers;
 
 use accounts::{Account, AccountStore};
 use anyhow::{bail, Context, Result};
-use cloud_uploader_core::storage::{check_name, rename_target};
-use cloud_uploader_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name};
-use cloud_uploader_core::{ProviderConfig, RemoteFileInfo, StorageProvider};
-use serde::Deserialize;
+use belka_core::oauth::{self, OAuthApp, Service};
+use belka_core::storage::{check_name, rename_target};
+use belka_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name};
+use belka_core::{ProviderConfig, RemoteFileInfo, StorageProvider};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+use tauri_plugin_opener::OpenerExt;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use transfers::{Direction, Spec, TransferView, Transfers};
 
@@ -20,6 +23,8 @@ struct AppState {
     /// Providers are built lazily and reused, so tokens and connections are kept.
     providers: Mutex<HashMap<String, Arc<dyn StorageProvider>>>,
     transfers: Arc<Transfers>,
+    /// Aborts the browser sign-in in progress.
+    sign_in_cancel: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl AppState {
@@ -83,6 +88,92 @@ async fn add_account(
     }
     .await
     .map_err(to_msg)
+}
+
+#[derive(Serialize)]
+struct OAuthApps {
+    /// This build has an OAuth app of its own for the service.
+    builtin: bool,
+    /// The user's own OAuth app, saved after the last sign-in with it.
+    custom: Option<OAuthApp>,
+}
+
+#[tauri::command]
+fn oauth_apps(service: Service) -> OAuthApps {
+    OAuthApps {
+        builtin: service.builtin_app().is_some(),
+        custom: accounts::load_oauth_app(service),
+    }
+}
+
+/// Signs in through the browser and saves the account. Without `custom_app`
+/// the built-in OAuth app is used. An empty `name` becomes the account's
+/// e-mail or login.
+#[tauri::command]
+async fn oauth_sign_in(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    service: Service,
+    custom_app: Option<OAuthApp>,
+    name: String,
+) -> CmdResult<Account> {
+    let (cancel, cancelled) = oneshot::channel();
+    // A sign-in still waiting in another browser tab is abandoned.
+    state.sign_in_cancel.lock().unwrap().replace(cancel);
+    async {
+        let oauth_app = match &custom_app {
+            Some(custom) => custom.clone(),
+            None => service
+                .builtin_app()
+                .context("This build has no built-in OAuth app; enter your own")?,
+        };
+        let open = |url: &str| {
+            app.opener()
+                .open_url(url, None::<&str>)
+                .map_err(|err| anyhow::anyhow!("{err}"))
+        };
+        let signed_in = tokio::select! {
+            result = oauth::sign_in(service, &oauth_app, open) => result?,
+            _ = cancelled => bail!("Sign-in cancelled"),
+        };
+
+        let provider: Arc<dyn StorageProvider> = signed_in.config.build()?.into();
+        provider
+            .list_dir("/")
+            .await
+            .with_context(|| format!("Cannot connect to {}", provider.name()))?;
+        let name = Some(name.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .or(signed_in.label)
+            .unwrap_or_else(|| service.title().to_string());
+        let account = state
+            .accounts
+            .lock()
+            .unwrap()
+            .add(&name, &signed_in.config)?;
+        state
+            .providers
+            .lock()
+            .unwrap()
+            .insert(account.id.clone(), provider);
+        // Only the user's own app is remembered: the built-in one always
+        // comes from the binary, so an update can replace it.
+        if let Some(custom) = &custom_app {
+            if let Err(err) = accounts::save_oauth_app(service, custom) {
+                tracing::warn!("{err:#}");
+            }
+        }
+        Ok(account)
+    }
+    .await
+    .map_err(to_msg)
+}
+
+#[tauri::command]
+fn oauth_cancel(state: State<'_, AppState>) {
+    if let Some(cancel) = state.sign_in_cancel.lock().unwrap().take() {
+        let _ = cancel.send(());
+    }
 }
 
 #[tauri::command]
@@ -445,9 +536,8 @@ fn clear_transfers(state: State<'_, AppState>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let filter = EnvFilter::try_from_env("CLOUD_UPLOADER_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("warn,cloud_uploader_core=info,cloud_uploader_gui_lib=info")
-    });
+    let filter = EnvFilter::try_from_env("BELKA_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("warn,belka_core=info,belka_gui_lib=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -462,12 +552,16 @@ pub fn run() {
                 accounts: Mutex::new(AccountStore::new(config_dir)),
                 providers: Mutex::new(HashMap::new()),
                 transfers: Transfers::new(),
+                sign_in_cancel: Mutex::new(None),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             add_account,
+            oauth_apps,
+            oauth_sign_in,
+            oauth_cancel,
             remove_account,
             list_dir,
             download,

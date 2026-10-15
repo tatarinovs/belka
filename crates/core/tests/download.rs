@@ -1,7 +1,7 @@
 //! Resumable downloads against a scripted local HTTP server.
 
-use cloud_uploader_core::client::{build_http_client, download, file_body};
-use cloud_uploader_core::Progress;
+use belka_core::client::{build_http_client, download, file_body};
+use belka_core::Progress;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

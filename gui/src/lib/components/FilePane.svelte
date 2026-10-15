@@ -119,6 +119,16 @@
     return [...entries].sort(compare);
   });
 
+  /** Row keys: Google Drive allows several items with the same name in a
+   * folder, so repeated paths get a counter to keep the keys unique. */
+  const rowKeys = $derived.by(() => {
+    const seen = new Map<string, number>();
+    return sorted.map((e) => {
+      const n = seen.get(e.path) ?? 0;
+      seen.set(e.path, n + 1);
+      return n ? `${e.path}\u0000${n}` : e.path;
+    });
+  });
   const selectedEntries = $derived(sorted.filter((e) => selected.has(e.path)));
   const dragTarget = $derived(dnd.from !== null && dnd.from !== id && dnd.over === id);
 
@@ -520,7 +530,7 @@
     </div>
 
     <div class="body" class:dim={loading} role="presentation" oncontextmenu={(e) => openMenu(e, null)}>
-      {#each sorted as entry (entry.path)}
+      {#each sorted as entry, i (rowKeys[i])}
         <!-- Keyboard navigation is handled by the grid's onkeydown. -->
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div

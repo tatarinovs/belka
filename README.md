@@ -1,4 +1,4 @@
-# Cloud Uploader
+# Belka
 
 Утилита для выгрузки бэкапов в облачные хранилища и автоматического зеркалирования релизов GitHub и файлов по ссылкам. Один самодостаточный бинарник (Windows / Linux, в том числе ARM64), рассчитанный на запуск из планировщика.
 
@@ -45,7 +45,7 @@
 | Каталог | Что внутри |
 |---|---|
 | `crates/core` | Провайдеры облаков, HTTP-ретраи, утилиты. Общая библиотека для CLI и GUI |
-| `crates/cli` | Консольная утилита `cloud-uploader` для скриптов и планировщика |
+| `crates/cli` | Консольная утилита `belka` для скриптов и планировщика |
 | `gui/` | Настольное приложение на Tauri 2 + Svelte (в разработке) |
 
 ---
@@ -78,15 +78,33 @@ npm run tauri build    # установщик в target/release/bundle/
 ```
 Аккаунты GUI хранятся в `accounts.json` в папке настроек приложения, а пароли и токены — в системном хранилище учётных данных (Windows Credential Manager, Keychain, Secret Service).
 
+#### Вход через браузер (Google Drive, Яндекс.Диск)
+
+Обычно достаточно нажать «Войти через браузер»: используется OAuth-приложение, встроенное в сборку. Своё приложение нужно, если в сборке его нет или вы хотите собственную квоту API. Для этого в диалоге «Новый аккаунт» отметьте «Своё OAuth-приложение». Введённые данные запоминаются.
+
+* **Google**: в Google Cloud Console включите Google Drive API, настройте OAuth consent screen (в режиме Testing добавьте свой адрес в тестовые пользователи) и создайте OAuth client ID типа **Desktop app**. Нужны Client ID и Client secret: для настольных приложений secret не считается секретом.
+* **Яндекс**: на [oauth.yandex.ru](https://oauth.yandex.ru/) создайте приложение с платформой «Веб-сервисы», Redirect URI `http://127.0.0.1:53682/` и доступами Яндекс.Диска: чтение, запись, информация о Диске. Достаточно Client ID: вход идёт по PKCE.
+
+Встроенное приложение задаётся при сборке GUI и CLI:
+```cmd
+set BELKA_GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+set BELKA_GOOGLE_CLIENT_SECRET=...
+set BELKA_YANDEX_CLIENT_ID=...
+npm run tauri build
+```
+Токен Яндекса действует год, после этого нужно войти заново.
+
 ---
 
 ## ⚙️ Настройка
 
 Скопируйте [.env.example](.env.example) в `.env` в текущую папку или рядом с программой либо укажите `--env-file`. Системные переменные окружения имеют приоритет над `.env`. Значения `CLOUD_PROVIDER`, `CLOUD_REMOTE_DIR`, `CLOUD_JOBS` из `.env` работают как значения по умолчанию для ключей командной строки.
 
-`cloud-uploader --list-providers` выводит переменные, нужные каждому провайдеру.
+`belka --list-providers` выводит переменные, нужные каждому провайдеру.
 
-**Google Drive.** Access token живёт около часа, поэтому для регулярных бэкапов укажите `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` и `GOOGLE_REFRESH_TOKEN` (OAuth-клиент типа Desktop, scope `https://www.googleapis.com/auth/drive`). Токены будут обновляться автоматически.
+**Google Drive и Яндекс.Диск.** Токен проще всего получить командой `belka --login google` (или `yandex`): откроется браузер, а после входа программа выведет строки для `.env`. Сообщения идут в stderr, поэтому можно сразу дописать файл: `belka --login google >> .env`. Вход нужен на компьютере с браузером, полученные строки можно перенести на сервер.
+
+Для Google выводится `GOOGLE_REFRESH_TOKEN`, по нему access token обновляется автоматически. Refresh token работает только с тем OAuth-приложением, для которого выдан. Со встроенным приложением хватает одного токена. Если заданы `GOOGLE_CLIENT_ID` и `GOOGLE_CLIENT_SECRET`, вход и работа идут через ваше приложение (тип Desktop, scope `https://www.googleapis.com/auth/drive`). Вместо refresh token можно указать `GOOGLE_DRIVE_TOKEN`, но access token живёт около часа.
 
 **S3.** Используются path-style запросы (`{endpoint}/{bucket}/{key}`). В S3 нет настоящих папок, поэтому пустые каталоги не создаются.
 
@@ -95,7 +113,7 @@ npm run tauri build    # установщик в target/release/bundle/
 ## 📖 Использование
 
 ```text
-cloud-uploader [OPTIONS] [LOCAL_PATH]
+belka [OPTIONS] [LOCAL_PATH]
 
   -p, --provider <PROVIDER>  yandex | mailru | google | webdav | s3   [env: CLOUD_PROVIDER] [default: yandex]
   -r, --remote <REMOTE>      Папка в облаке                           [env: CLOUD_REMOTE_DIR] [default: /Upload]
@@ -107,6 +125,7 @@ cloud-uploader [OPTIONS] [LOCAL_PATH]
   -j, --jobs <JOBS>          Параллельные загрузки, 1..32              [env: CLOUD_JOBS] [default: 2]
       --assets <REGEX>       Какие ассеты релизов скачивать            [default: (?i)\.(apk|exe|zip|tar\.gz)$]
       --list-providers       Список провайдеров и их переменных
+      --login <PROVIDER>     Войти в google или yandex через браузер и вывести строки для .env
   -v, --verbose / -q, --quiet
 ```
 
@@ -114,22 +133,22 @@ cloud-uploader [OPTIONS] [LOCAL_PATH]
 
 ```powershell
 # Папка бэкапа на Яндекс.Диск
-cloud-uploader.exe -p yandex -r /Backups/2026.09.17 D:\Backups\Daily
+belka.exe -p yandex -r /Backups/2026.09.17 D:\Backups\Daily
 
 # Сначала посмотреть, что изменится
-cloud-uploader.exe -p mailru -r /Backups/Latest -c -n D:\Backups\Daily
+belka.exe -p mailru -r /Backups/Latest -c -n D:\Backups\Daily
 
 # Cloudflare R2, 4 параллельные загрузки
-cloud-uploader.exe -p s3 -r /daily-snapshots -j 4 C:\Data
+belka.exe -p s3 -r /daily-snapshots -j 4 C:\Data
 
 # Зеркалирование релизов, только .apk
-cloud-uploader.exe -p google -r /Mirror --assets "(?i)\.apk$"
+belka.exe -p google -r /Mirror --assets "(?i)\.apk$"
 ```
 
 ### Запуск по расписанию (cron)
 
 ```bash
-0 3 * * * cd /opt/cloud-uploader && ./cloud-uploader -q /srv/backups >> /var/log/cloud-uploader.log 2>&1 || echo "backup failed: $?"
+0 3 * * * cd /opt/belka && ./belka -q /srv/backups >> /var/log/belka.log 2>&1 || echo "backup failed: $?"
 ```
 Ненулевой код возврата означает проблему: `3` — часть файлов не загрузилась (подробности в логе). Защитите `.env` правами `chmod 600 .env`. Секреты никогда не передаются через аргументы командной строки и не видны в списке процессов.
 

@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
+use belka_core::oauth::{OAuthApp, Service};
+use belka_core::provider::{DEFAULT_S3_REGION, MAILRU_WEBDAV_URL};
+use belka_core::storage::google::GoogleAuth;
+use belka_core::{ProviderConfig, StorageProvider};
 use clap::ValueEnum;
-use cloud_uploader_core::provider::{DEFAULT_S3_REGION, MAILRU_WEBDAV_URL};
-use cloud_uploader_core::storage::google::GoogleAuth;
-use cloud_uploader_core::{ProviderConfig, StorageProvider};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -104,6 +105,29 @@ fn flag(name: &str) -> bool {
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
+/// The OAuth app from GOOGLE_CLIENT_ID / YANDEX_CLIENT_ID and the matching
+/// secret, else the one built into this binary. A refresh token only works
+/// with the app it was issued to.
+pub fn oauth_app(service: Service) -> Result<Option<OAuthApp>> {
+    let prefix = match service {
+        Service::Google => "GOOGLE",
+        Service::Yandex => "YANDEX",
+    };
+    let id_var = format!("{prefix}_CLIENT_ID");
+    let secret_var = format!("{prefix}_CLIENT_SECRET");
+    match (var(&id_var), var(&secret_var)) {
+        (Some(_), None) if service == Service::Google => {
+            bail!("{id_var} is set without {secret_var}")
+        }
+        (Some(client_id), secret) => Ok(Some(OAuthApp {
+            client_id,
+            client_secret: secret.unwrap_or_default(),
+        })),
+        (None, Some(_)) => bail!("{secret_var} is set without {id_var}"),
+        (None, None) => Ok(service.builtin_app()),
+    }
+}
+
 pub fn init_provider(kind: ProviderKind) -> Result<Box<dyn StorageProvider>> {
     provider_config(kind)?.build()
 }
@@ -124,22 +148,22 @@ fn provider_config(kind: ProviderKind) -> Result<ProviderConfig> {
             }
         }
         ProviderKind::Google => {
-            let auth = match (
-                var("GOOGLE_CLIENT_ID"),
-                var("GOOGLE_CLIENT_SECRET"),
-                var("GOOGLE_REFRESH_TOKEN"),
-                var("GOOGLE_DRIVE_TOKEN"),
-            ) {
-                (Some(client_id), Some(client_secret), Some(refresh_token), _) => {
+            let auth = match (var("GOOGLE_REFRESH_TOKEN"), var("GOOGLE_DRIVE_TOKEN")) {
+                (Some(refresh_token), _) => {
+                    let app = oauth_app(Service::Google)?.context(
+                        "GOOGLE_REFRESH_TOKEN needs GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET: \
+                         this build has no built-in OAuth app",
+                    )?;
                     GoogleAuth::RefreshToken {
-                        client_id,
-                        client_secret,
+                        client_id: app.client_id,
+                        client_secret: app.client_secret,
                         refresh_token,
                     }
                 }
-                (_, _, _, Some(access_token)) => GoogleAuth::AccessToken { access_token },
-                _ => bail!(
-                    "Google Drive is not configured: set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and                      GOOGLE_REFRESH_TOKEN (recommended), or a short-lived GOOGLE_DRIVE_TOKEN"
+                (None, Some(access_token)) => GoogleAuth::AccessToken { access_token },
+                (None, None) => bail!(
+                    "Google Drive is not configured: run `belka --login google` to get \
+                     GOOGLE_REFRESH_TOKEN, or set a short-lived GOOGLE_DRIVE_TOKEN"
                 ),
             };
             ProviderConfig::Google(auth)
@@ -176,20 +200,28 @@ fn provider_config(kind: ProviderKind) -> Result<ProviderConfig> {
 }
 
 pub fn print_providers() {
+    let builtin = if Service::Google.builtin_app().is_some() {
+        ""
+    } else {
+        " (not in this build)"
+    };
     println!(
         "\
 Supported cloud providers (-p, --provider):
 
   yandex   Yandex Disk (REST API)
-           YANDEX_TOKEN                OAuth token with Disk REST API access
+           YANDEX_TOKEN                OAuth token with Disk REST API access,
+                                       `belka --login yandex` prints one
 
   mailru   Mail.ru Cloud (WebDAV)
            MAILRU_USER, MAILRU_PASSWORD  e-mail and an app password
            MAILRU_WEBDAV_URL           optional, default {MAILRU_WEBDAV_URL}
 
   google   Google Drive (API v3)
-           GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-                                       recommended: tokens are renewed automatically
+           GOOGLE_REFRESH_TOKEN        recommended, `belka --login google` prints one;
+                                       access tokens are renewed automatically
+           GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+                                       your own OAuth app; default: the built-in one{builtin}
            GOOGLE_DRIVE_TOKEN          alternative: access token, valid ~1 hour
 
   webdav   Any WebDAV server (Nextcloud, ownCloud, Synology, ...)

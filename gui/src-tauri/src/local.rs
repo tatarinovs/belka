@@ -2,8 +2,8 @@
 //! virtual "This PC" root: well-known folders followed by the drives.
 
 use anyhow::{bail, Context, Result};
+use belka_core::storage::check_name;
 use chrono::{DateTime, Utc};
-use cloud_uploader_core::storage::check_name;
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 

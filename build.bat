@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal
 
 echo ===================================================================
-echo             CLOUD UPLOADER - RELEASE BUILDER (ZIG)
+echo             BELKA - RELEASE BUILDER (ZIG)
 echo ===================================================================
 echo.
 
@@ -42,8 +42,8 @@ echo ===================================================================
 cargo build --release
 if errorlevel 1 goto ERR_BUILD_EXE
 
-copy /Y "target\release\cloud-uploader.exe" "dist\cloud-uploader.exe" >nul
-echo [OK] Windows binary ready: dist\cloud-uploader.exe
+copy /Y "target\release\belka.exe" "dist\belka.exe" >nul
+echo [OK] Windows binary ready: dist\belka.exe
 
 if "%TARGET_MODE%"=="exe" goto ALL_DONE
 
@@ -58,8 +58,8 @@ echo ===================================================================
 cargo zigbuild --release --target aarch64-unknown-linux-musl
 if errorlevel 1 goto ERR_BUILD_ARM64
 
-copy /Y "target\aarch64-unknown-linux-musl\release\cloud-uploader" "dist\cloud-uploader-linux-arm64" >nul
-echo [OK] Linux ARM64 binary ready: dist\cloud-uploader-linux-arm64
+copy /Y "target\aarch64-unknown-linux-musl\release\belka" "dist\belka-linux-arm64" >nul
+echo [OK] Linux ARM64 binary ready: dist\belka-linux-arm64
 
 :ALL_DONE
 echo.
@@ -68,11 +68,11 @@ echo                      BUILD SUCCEEDED!
 echo ===================================================================
 echo Artifacts saved in dist/ folder:
 echo.
-if exist "dist\cloud-uploader.exe" (
-    for %%F in ("dist\cloud-uploader.exe") do echo   [Windows x64]  dist\cloud-uploader.exe            [%%~zF bytes]
+if exist "dist\belka.exe" (
+    for %%F in ("dist\belka.exe") do echo   [Windows x64]  dist\belka.exe            [%%~zF bytes]
 )
-if exist "dist\cloud-uploader-linux-arm64" (
-    for %%F in ("dist\cloud-uploader-linux-arm64") do echo   [Linux ARM64]  dist\cloud-uploader-linux-arm64   [%%~zF bytes]
+if exist "dist\belka-linux-arm64" (
+    for %%F in ("dist\belka-linux-arm64") do echo   [Linux ARM64]  dist\belka-linux-arm64   [%%~zF bytes]
 )
 echo ===================================================================
 echo.

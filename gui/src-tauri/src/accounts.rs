@@ -3,12 +3,13 @@
 //! Credential Manager, macOS Keychain, Secret Service on Linux).
 
 use anyhow::{bail, Context, Result};
-use cloud_uploader_core::ProviderConfig;
+use belka_core::oauth::{OAuthApp, Service};
+use belka_core::ProviderConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const KEYRING_SERVICE: &str = "cloud-uploader-gui";
+const KEYRING_SERVICE: &str = "belka-gui";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
@@ -91,6 +92,25 @@ impl AccountStore {
             .get_password()
             .context("Failed to read credentials from the system keyring")?;
         serde_json::from_str(&secret).context("Stored credentials are corrupted")
+    }
+}
+
+/// The user's own OAuth app for `service`, so it is entered only once.
+pub fn load_oauth_app(service: Service) -> Option<OAuthApp> {
+    let secret = entry(&oauth_app_key(service)).ok()?.get_password().ok()?;
+    serde_json::from_str(&secret).ok()
+}
+
+pub fn save_oauth_app(service: Service, app: &OAuthApp) -> Result<()> {
+    entry(&oauth_app_key(service))?
+        .set_password(&serde_json::to_string(app)?)
+        .context("Failed to save the OAuth app to the system keyring")
+}
+
+fn oauth_app_key(service: Service) -> String {
+    match service {
+        Service::Google => "oauth-app-google".to_string(),
+        Service::Yandex => "oauth-app-yandex".to_string(),
     }
 }
 

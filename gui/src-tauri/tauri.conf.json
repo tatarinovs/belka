@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Cloud Uploader",
-  "mainBinaryName": "cloud-uploader-gui",
-  "identifier": "com.cloudexplorer.app",
+  "productName": "Belka",
+  "mainBinaryName": "belka-gui",
+  "identifier": "io.github.tatarinovs.belka",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Cloud Uploader",
+        "title": "Belka",
         "width": 1280,
         "height": 780,
         "minWidth": 900,

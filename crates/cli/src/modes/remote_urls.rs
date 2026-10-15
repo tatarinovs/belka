@@ -10,7 +10,7 @@ use crate::utils::hash::compute_md5_file;
 use crate::utils::path::{encode_component, join_remote, normalize_remote_dir, sanitize_file_name};
 use crate::utils::text::parse_list;
 use anyhow::{bail, Context, Result};
-use cloud_uploader_core::Progress;
+use belka_core::Progress;
 use percent_encoding::percent_decode_str;
 use regex::Regex;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT as USER_AGENT_HEADER};
@@ -188,7 +188,7 @@ pub async fn run_remote_urls(
         opts,
         client: build_http_client()?,
         temp_dir: tempfile::Builder::new()
-            .prefix("cloud-uploader-")
+            .prefix("belka-")
             .tempdir()
             .context("Failed to create a temporary folder")?,
         listings: HashMap::new(),

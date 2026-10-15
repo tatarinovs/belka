@@ -3,8 +3,8 @@
 //! progress counters directly, so running transfers never block on the UI.
 
 use anyhow::{Context, Result};
-use cloud_uploader_core::utils::path::split_remote;
-use cloud_uploader_core::{Progress, StorageProvider};
+use belka_core::utils::path::split_remote;
+use belka_core::{Progress, StorageProvider};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;

@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
-pub const USER_AGENT: &str = concat!("cloud-uploader/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("belka/", env!("CARGO_PKG_VERSION"));
 
 /// Timeout for metadata / API calls that carry no file payload.
 pub const API_TIMEOUT: Duration = Duration::from_secs(60);

@@ -299,7 +299,7 @@
               onremove={remove}
             />
           {:else}
-            <h1>Cloud Uploader</h1>
+            <h1>Belka</h1>
             <p>Подключите облако, чтобы работать с файлами.</p>
             <button class="btn primary" onclick={() => (adding = true)}>Добавить аккаунт</button>
           {/if}

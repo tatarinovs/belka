@@ -1,19 +1,19 @@
 //! Round trip through a real WebDAV server. Skipped unless
-//! `CLOUD_UPLOADER_TEST_WEBDAV_URL` points to a disposable server, e.g.
+//! `BELKA_TEST_WEBDAV_URL` points to a disposable server, e.g.
 //! `wsgidav --host 127.0.0.1 --port 8765 --root ./dav --auth anonymous`.
 
-use cloud_uploader_core::{Progress, ProviderConfig};
+use belka_core::{Progress, ProviderConfig};
 
 #[tokio::test]
 async fn upload_list_download_delete() {
-    let Ok(url) = std::env::var("CLOUD_UPLOADER_TEST_WEBDAV_URL") else {
-        eprintln!("CLOUD_UPLOADER_TEST_WEBDAV_URL is not set, skipping");
+    let Ok(url) = std::env::var("BELKA_TEST_WEBDAV_URL") else {
+        eprintln!("BELKA_TEST_WEBDAV_URL is not set, skipping");
         return;
     };
     let provider = ProviderConfig::Webdav {
         url,
-        user: std::env::var("CLOUD_UPLOADER_TEST_WEBDAV_USER").unwrap_or_default(),
-        password: std::env::var("CLOUD_UPLOADER_TEST_WEBDAV_PASSWORD").unwrap_or_default(),
+        user: std::env::var("BELKA_TEST_WEBDAV_USER").unwrap_or_default(),
+        password: std::env::var("BELKA_TEST_WEBDAV_PASSWORD").unwrap_or_default(),
         etag_is_md5: false,
     }
     .build()

@@ -1,5 +1,5 @@
 [package]
-name = "cloud-uploader"
+name = "belka"
 description = "Universal cloud backup and release mirror utility"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ rust-version.workspace = true
 authors.workspace = true
 
 [dependencies]
-cloud-uploader-core.workspace = true
+belka-core.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true

@@ -28,8 +28,8 @@ token*.json
 # ------------------------------------------------------------------------------
 /dist/
 *.exe
-/cloud-uploader
-/cloud-uploader-linux-*
+/belka
+/belka-linux-*
 *.zip
 *.tar.gz
 *.7z

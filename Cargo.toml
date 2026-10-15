@@ -7,10 +7,10 @@ default-members = ["crates/cli"]
 version = "1.1.0"
 edition = "2021"
 rust-version = "1.80"
-authors = ["Cloud Uploader Team"]
+authors = ["Belka Team"]
 
 [workspace.dependencies]
-cloud-uploader-core = { path = "crates/core" }
+belka-core = { path = "crates/core" }
 tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 bytes = "1"

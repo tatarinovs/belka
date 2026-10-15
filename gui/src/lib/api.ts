@@ -56,10 +56,31 @@ export interface Transfer {
   total: number;
 }
 
+export type OAuthService = "google" | "yandex";
+
+/** A registered OAuth client used for browser sign-in. */
+export interface OAuthApp {
+  client_id: string;
+  client_secret: string;
+}
+
+export interface OAuthApps {
+  /** This build has its own OAuth app for the service. */
+  builtin: boolean;
+  /** The user's own OAuth app, saved after the last sign-in with it. */
+  custom: OAuthApp | null;
+}
+
 export const api = {
   listAccounts: () => invoke<Account[]>("list_accounts"),
   addAccount: (name: string, config: ProviderConfig) =>
     invoke<Account>("add_account", { name, config }),
+  oauthApps: (service: OAuthService) => invoke<OAuthApps>("oauth_apps", { service }),
+  /** Opens the browser and resolves once the account is saved. Without
+   * `customApp` the built-in OAuth app is used. */
+  oauthSignIn: (service: OAuthService, customApp: OAuthApp | null, name: string) =>
+    invoke<Account>("oauth_sign_in", { service, customApp, name }),
+  oauthCancel: () => invoke<void>("oauth_cancel"),
   removeAccount: (id: string) => invoke<void>("remove_account", { id }),
   listDir: (accountId: string, path: string) =>
     invoke<RemoteEntry[]>("list_dir", { accountId, path }),

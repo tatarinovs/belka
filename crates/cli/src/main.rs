@@ -1,7 +1,8 @@
 mod config;
+mod login;
 mod modes;
 
-use cloud_uploader_core::{client, storage, utils};
+use belka_core::{client, storage, utils};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -22,7 +23,7 @@ const EXIT_INTERRUPTED: u8 = 130;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "cloud-uploader",
+    name = "belka",
     version,
     about = "Uploads backups to cloud storage and mirrors GitHub releases (Yandex Disk, Mail.ru, Google Drive, WebDAV, S3)",
     long_about = "Uploads a local file or directory to cloud storage, skipping files that are already \
@@ -84,6 +85,16 @@ struct Cli {
     #[arg(long)]
     list_providers: bool,
 
+    /// Sign in to google or yandex through the browser and print the .env lines
+    #[arg(
+        long,
+        value_name = "PROVIDER",
+        value_enum,
+        ignore_case = true,
+        conflicts_with = "local_path"
+    )]
+    login: Option<ProviderKind>,
+
     /// Verbose (debug) output
     #[arg(short, long, conflicts_with = "quiet")]
     verbose: bool,
@@ -108,7 +119,7 @@ async fn main() -> ExitCode {
         config::print_providers();
         return ExitCode::SUCCESS;
     }
-    init_logging(cli.verbose, cli.quiet);
+    init_logging(cli.verbose, cli.quiet, cli.login.is_some());
 
     match env_loaded {
         Ok(Some(path)) => debug!("Loaded environment from {}", path.display()),
@@ -117,6 +128,23 @@ async fn main() -> ExitCode {
             error!("{err:#}");
             return ExitCode::from(EXIT_FATAL);
         }
+    }
+
+    if let Some(kind) = cli.login {
+        let result = tokio::select! {
+            result = login::run(kind) => result,
+            _ = tokio::signal::ctrl_c() => {
+                warn!("Interrupted");
+                return ExitCode::from(EXIT_INTERRUPTED);
+            }
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                error!("{err:#}");
+                ExitCode::from(EXIT_FATAL)
+            }
+        };
     }
 
     let result = tokio::select! {
@@ -156,7 +184,7 @@ async fn run(cli: &Cli) -> Result<Stats> {
     let provider = config::init_provider(cli.provider)?;
 
     info!(
-        "cloud-uploader v{} | {} | target folder '{remote_dir}'{}",
+        "belka v{} | {} | target folder '{remote_dir}'{}",
         env!("CARGO_PKG_VERSION"),
         provider.name(),
         if cli.dry_run { " | DRY RUN" } else { "" }
@@ -223,25 +251,31 @@ async fn run(cli: &Cli) -> Result<Stats> {
     Ok(stats)
 }
 
-fn init_logging(verbose: bool, quiet: bool) {
+fn init_logging(verbose: bool, quiet: bool, to_stderr: bool) {
     let level = match (verbose, quiet) {
         (true, _) => "debug",
         (_, true) => "warn",
         _ => "info",
     };
-    // CLOUD_UPLOADER_LOG accepts tracing filter syntax, e.g. "debug,reqwest=trace".
-    let filter = EnvFilter::try_from_env("CLOUD_UPLOADER_LOG").unwrap_or_else(|_| {
-        EnvFilter::new(format!(
-            "warn,cloud_uploader={level},cloud_uploader_core={level}"
-        ))
-    });
+    // BELKA_LOG accepts tracing filter syntax, e.g. "debug,reqwest=trace".
+    let filter = EnvFilter::try_from_env("BELKA_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(format!("warn,belka={level},belka_core={level}")));
 
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_timer(LocalTimer)
-        .with_ansi(use_ansi())
-        .init();
+        .with_timer(LocalTimer);
+    // --login prints .env lines to stdout, so its log must not mix in.
+    if to_stderr {
+        builder
+            .with_ansi(use_ansi(std::io::stderr().is_terminal()))
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        builder
+            .with_ansi(use_ansi(std::io::stdout().is_terminal()))
+            .init();
+    }
 }
 
 struct LocalTimer;
@@ -253,10 +287,8 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
 }
 
 /// Colors only for interactive terminals, never in log files; honors NO_COLOR.
-fn use_ansi() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal()
-        && enable_virtual_terminal()
+fn use_ansi(terminal: bool) -> bool {
+    std::env::var_os("NO_COLOR").is_none() && terminal && enable_virtual_terminal()
 }
 
 #[cfg(windows)]

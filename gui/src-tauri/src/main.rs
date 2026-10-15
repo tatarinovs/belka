@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    cloud_uploader_gui_lib::run()
+    belka_gui_lib::run()
 }

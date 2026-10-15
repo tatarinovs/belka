@@ -1,7 +1,8 @@
 //! Cloud storage providers and the HTTP plumbing behind them. Shared by the
-//! `cloud-uploader` CLI and the desktop GUI.
+//! `belka` CLI and the desktop GUI.
 
 pub mod client;
+pub mod oauth;
 pub mod progress;
 pub mod provider;
 pub mod storage;

@@ -1,5 +1,5 @@
 [package]
-name = "cloud-uploader-gui"
+name = "belka-gui"
 description = "Desktop file manager for cloud storage"
 version.workspace = true
 edition.workspace = true
@@ -9,14 +9,14 @@ authors.workspace = true
 [lib]
 # The `_lib` suffix keeps the lib name distinct from the bin name, see
 # https://github.com/rust-lang/cargo/issues/8519
-name = "cloud_uploader_gui_lib"
+name = "belka_gui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-cloud-uploader-core.workspace = true
+belka-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
