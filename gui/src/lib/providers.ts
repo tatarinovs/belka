@@ -15,11 +15,14 @@ export interface ProviderDef {
   short: string;
   help: string;
   fields: Field[];
+  /** Items can be shared by a public link. */
+  share?: boolean;
 }
 
 export const PROVIDERS: ProviderDef[] = [
   {
     kind: "yandex",
+    share: true,
     title: "Яндекс.Диск",
     short: "Я",
     help: "OAuth-токен с доступом к REST API Диска (oauth.yandex.ru).",
@@ -27,9 +30,11 @@ export const PROVIDERS: ProviderDef[] = [
   },
   {
     kind: "mailru",
+    share: true,
     title: "Облако Mail.ru",
     short: "M",
-    help: "Пароль для внешних приложений: Настройки → Безопасность.",
+    help:
+      "Пароль для внешних приложений: Настройки → Безопасность. Для ссылок нужен пароль с полным доступом к Почте, Облаку и Календарю.",
     fields: [
       { key: "user", label: "E-mail", placeholder: "name@mail.ru" },
       { key: "password", label: "Пароль приложения", type: "password" },
@@ -44,6 +49,7 @@ export const PROVIDERS: ProviderDef[] = [
   },
   {
     kind: "google",
+    share: true,
     title: "Google Drive",
     short: "G",
     help: "OAuth-клиент и refresh token, например из rclone или OAuth Playground.",

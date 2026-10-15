@@ -110,6 +110,17 @@ export const api = {
       accountId,
       items: items.map(({ path, is_dir }) => ({ path, is_dir })),
     }),
+  /** Opens access by link; the backend also copies the links to the clipboard. */
+  cloudShare: (accountId: string, items: Entry[]) =>
+    invoke<string[]>("cloud_share", {
+      accountId,
+      items: items.map(({ path, is_dir }) => ({ path, is_dir })),
+    }),
+  cloudUnshare: (accountId: string, items: Entry[]) =>
+    invoke<void>("cloud_unshare", {
+      accountId,
+      items: items.map(({ path, is_dir }) => ({ path, is_dir })),
+    }),
   localMkdir: (parent: string, name: string) => invoke<string>("local_mkdir", { parent, name }),
   /** Resolves to the new path. */
   localRename: (path: string, newName: string) =>

@@ -658,6 +658,75 @@ impl StorageProvider for GoogleDriveProvider {
             })
             .collect())
     }
+
+    async fn share(&self, remote_path: &str, is_dir: bool) -> Result<String> {
+        let path = normalize_remote_dir(remote_path);
+        let item = self
+            .find_item(&path, Some(is_dir))
+            .await?
+            .with_context(|| format!("'{path}' does not exist"))?;
+        let token = self.access_token().await?;
+        // Creating the same "anyone" permission again does not duplicate it.
+        let permission = json!({ "type": "anyone", "role": "reader" });
+        let url = format!("{FILES_API}/{}/permissions", item.id);
+        let resp = send("google: share", || {
+            Ok(self
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .query(&[("fields", "id")])
+                .json(&permission)
+                .timeout(API_TIMEOUT))
+        })
+        .await?;
+        ensure_success(resp, format!("Failed to share '{path}'")).await?;
+
+        let url = format!("{FILES_API}/{}", item.id);
+        let resp = send("google: get link", || {
+            Ok(self
+                .client
+                .get(&url)
+                .bearer_auth(&token)
+                .query(&[("fields", "webViewLink")])
+                .timeout(API_TIMEOUT))
+        })
+        .await?;
+        #[derive(Deserialize)]
+        struct Link {
+            #[serde(rename = "webViewLink")]
+            web_view_link: Option<String>,
+        }
+        let link: Link = ensure_success(resp, format!("Failed to get the link to '{path}'"))
+            .await?
+            .json()
+            .await
+            .context("Invalid file response")?;
+        link.web_view_link
+            .context("Google Drive did not return a link")
+    }
+
+    async fn unshare(&self, remote_path: &str, is_dir: bool) -> Result<()> {
+        let path = normalize_remote_dir(remote_path);
+        let item = self
+            .find_item(&path, Some(is_dir))
+            .await?
+            .with_context(|| format!("'{path}' does not exist"))?;
+        let token = self.access_token().await?;
+        // The permission for "anyone with the link" has this fixed id.
+        let url = format!("{FILES_API}/{}/permissions/anyoneWithLink", item.id);
+        let resp = send("google: unshare", || {
+            Ok(self
+                .client
+                .delete(&url)
+                .bearer_auth(&token)
+                .timeout(API_TIMEOUT))
+        })
+        .await?;
+        if !resp.status().is_success() && resp.status() != StatusCode::NOT_FOUND {
+            return Err(http_error(resp, format!("Failed to stop sharing '{path}'")).await);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

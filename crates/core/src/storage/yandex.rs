@@ -75,6 +75,11 @@ struct Operation {
     status: String,
 }
 
+#[derive(Deserialize)]
+struct Published {
+    public_url: Option<String>,
+}
+
 impl YandexDiskProvider {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
@@ -367,5 +372,50 @@ impl StorageProvider for YandexDiskProvider {
             }
         }
         Ok(items)
+    }
+
+    async fn share(&self, remote_path: &str, _is_dir: bool) -> Result<String> {
+        let path = normalize_remote_dir(remote_path);
+        let resp = send("yandex: publish", || {
+            Ok(self
+                .api(Method::PUT, "/publish")
+                .query(&[("path", path.as_str())]))
+        })
+        .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            bail!("'{path}' does not exist");
+        }
+        ensure_success(resp, format!("Failed to share '{path}'")).await?;
+
+        let resp = send("yandex: get public link", || {
+            Ok(self
+                .api(Method::GET, "")
+                .query(&[("path", path.as_str()), ("fields", "public_url")]))
+        })
+        .await?;
+        let published: Published =
+            ensure_success(resp, format!("Failed to get the link to '{path}'"))
+                .await?
+                .json()
+                .await
+                .context("Invalid resource response from Yandex Disk")?;
+        published
+            .public_url
+            .context("Yandex Disk did not return a public link")
+    }
+
+    async fn unshare(&self, remote_path: &str, _is_dir: bool) -> Result<()> {
+        let path = normalize_remote_dir(remote_path);
+        let resp = send("yandex: unpublish", || {
+            Ok(self
+                .api(Method::PUT, "/unpublish")
+                .query(&[("path", path.as_str())]))
+        })
+        .await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            bail!("'{path}' does not exist");
+        }
+        ensure_success(resp, format!("Failed to stop sharing '{path}'")).await?;
+        Ok(())
     }
 }

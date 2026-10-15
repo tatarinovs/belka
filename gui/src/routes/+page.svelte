@@ -7,6 +7,7 @@
   import { api, errorText, type Account, type Entry, type Listing } from "$lib/api";
   import { dnd, paneAt } from "$lib/dnd.svelte";
   import { parentPath, splitPath } from "$lib/format";
+  import { providerDef } from "$lib/providers";
   import { transfers } from "$lib/transfers.svelte";
   import AccountList from "$lib/components/AccountList.svelte";
   import AccountMenu from "$lib/components/AccountMenu.svelte";
@@ -40,6 +41,15 @@
   let adding = $state(false);
   let notice = $state("");
   let busy = $state("");
+  /** A message about a finished action, hidden after a while. */
+  let info = $state("");
+  let infoTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function showInfo(text: string) {
+    info = text;
+    clearTimeout(infoTimer);
+    infoTimer = setTimeout(() => (info = ""), 10_000);
+  }
 
   let cloudPane = $state<FilePane>();
   let localPane = $state<FilePane>();
@@ -66,6 +76,20 @@
 
 Файлы удаляются безвозвратно, минуя корзину облака.`,
       deleteLabel: "Удалить",
+      ...(providerDef(account.kind).share && {
+        share: async (items) => {
+          const links = await api.cloudShare(account.id, items);
+          showInfo(
+            links.length === 1
+              ? `Ссылка скопирована: ${links[0]}`
+              : `Ссылки скопированы в буфер обмена (${links.length})`,
+          );
+        },
+        unshare: async (items) => {
+          await api.cloudUnshare(account.id, items);
+          showInfo(`Доступ по ссылке закрыт: ${describe(items)}`);
+        },
+      }),
     };
   }
 
@@ -350,11 +374,11 @@
     </div>
   </div>
 
-  {#if notice || busy}
+  {#if notice || busy || info}
     <div class="notice" class:error={!!notice}>
-      <span>{notice || busy}</span>
-      {#if notice}
-        <button class="icon-btn" title="Скрыть" onclick={() => (notice = "")}>
+      <span>{notice || busy || info}</span>
+      {#if notice || info}
+        <button class="icon-btn" title="Скрыть" onclick={() => (notice = info = "")}>
           <Icon name="close" size={14} />
         </button>
       {/if}

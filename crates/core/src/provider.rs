@@ -2,6 +2,7 @@
 //! from (environment variables for the CLI, saved accounts for the GUI).
 
 use crate::storage::google::{GoogleAuth, GoogleDriveProvider};
+use crate::storage::mailru::MailruProvider;
 use crate::storage::s3::S3Provider;
 use crate::storage::webdav::WebDavProvider;
 use crate::storage::yandex::YandexDiskProvider;
@@ -61,17 +62,7 @@ impl ProviderConfig {
                 user,
                 password,
                 url,
-            } => {
-                let url = url.unwrap_or_else(|| MAILRU_WEBDAV_URL.to_string());
-                // Mail.ru ETags are internal revision ids, not MD5 hashes.
-                Box::new(WebDavProvider::new(
-                    "Mail.ru Cloud",
-                    &url,
-                    user,
-                    password,
-                    false,
-                )?)
-            }
+            } => Box::new(MailruProvider::new(user, password, url)?),
             Self::Google(auth) => Box::new(GoogleDriveProvider::new(auth)?),
             Self::Webdav {
                 url,

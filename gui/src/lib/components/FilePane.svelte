@@ -15,6 +15,10 @@
     deleteLabel: string;
     /** Shows the item (or the open folder) in the system file manager. */
     reveal?(path: string): void;
+    /** Opens access by link and copies the links; set where the cloud supports it. */
+    share?(entries: Entry[]): Promise<void>;
+    /** Closes access by link. */
+    unshare?(entries: Entry[]): Promise<void>;
   }
 </script>
 
@@ -439,6 +443,19 @@
       });
     }
     if (items.length) items.push("separator");
+    const { share, unshare } = ops ?? {};
+    if (picked.length && share && unshare) {
+      items.push({
+        label: picked.length === 1 ? "Поделиться ссылкой" : "Поделиться ссылками",
+        icon: "link",
+        action: () => operation("Создание ссылки…", () => share(picked)),
+      });
+      items.push({
+        label: "Закрыть доступ по ссылке",
+        action: () => operation("Закрытие доступа…", () => unshare(picked)),
+      });
+      items.push("separator");
+    }
     if (ops) {
       items.push({ label: "Новая папка", icon: "plus", shortcut: "F7", disabled: !modifiable, action: newFolder });
       if (picked.length) {

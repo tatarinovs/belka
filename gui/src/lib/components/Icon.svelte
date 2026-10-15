@@ -19,6 +19,7 @@
     computer: "M3 5h18v11H3zm5 15h8m-4-4v4",
     arrowRight: "M5 12h14m-6-6 6 6-6 6",
     arrowLeft: "M19 12H5m6-6-6 6 6 6",
+    link: "M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1",
   } as const;
   export type IconName = keyof typeof PATHS;
 </script>

@@ -1,4 +1,5 @@
 pub mod google;
+pub mod mailru;
 pub mod s3;
 pub mod webdav;
 pub mod yandex;
@@ -70,6 +71,17 @@ pub trait StorageProvider: Send + Sync {
 
     /// Lists the direct children of `remote_dir`; empty if it does not exist.
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>>;
+
+    /// Opens read access for anyone with the link and returns the link.
+    /// Sharing an item that is already shared returns its link.
+    async fn share(&self, remote_path: &str, _is_dir: bool) -> Result<String> {
+        bail!("{} cannot share '{remote_path}' by link", self.name())
+    }
+
+    /// Closes access by link. Succeeds if the item was not shared.
+    async fn unshare(&self, remote_path: &str, _is_dir: bool) -> Result<()> {
+        bail!("{} cannot share '{remote_path}' by link", self.name())
+    }
 }
 
 /// Trims a user-entered file or folder name and rejects ones that are empty,

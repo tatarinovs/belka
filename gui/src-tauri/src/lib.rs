@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
@@ -242,7 +243,7 @@ async fn cloud_rename(
 }
 
 #[derive(Deserialize)]
-struct DeleteItem {
+struct CloudItem {
     path: String,
     is_dir: bool,
 }
@@ -252,7 +253,7 @@ struct DeleteItem {
 async fn cloud_delete(
     state: State<'_, AppState>,
     account_id: String,
-    items: Vec<DeleteItem>,
+    items: Vec<CloudItem>,
 ) -> CmdResult<()> {
     async {
         let provider = state.provider(&account_id)?;
@@ -261,6 +262,48 @@ async fn cloud_delete(
             if item.is_dir {
                 state.transfers.forget_dir(&account_id, &item.path).await;
             }
+        }
+        Ok(())
+    }
+    .await
+    .map_err(to_msg)
+}
+
+/// Opens access by link to cloud items and copies the links to the
+/// clipboard, one per line. Returns the links.
+#[tauri::command]
+async fn cloud_share(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    items: Vec<CloudItem>,
+) -> CmdResult<Vec<String>> {
+    async {
+        let provider = state.provider(&account_id)?;
+        let mut links = Vec::with_capacity(items.len());
+        for item in &items {
+            links.push(provider.share(&item.path, item.is_dir).await?);
+        }
+        app.clipboard()
+            .write_text(links.join("\n"))
+            .context("Failed to copy the link to the clipboard")?;
+        Ok(links)
+    }
+    .await
+    .map_err(to_msg)
+}
+
+/// Closes access by link to cloud items.
+#[tauri::command]
+async fn cloud_unshare(
+    state: State<'_, AppState>,
+    account_id: String,
+    items: Vec<CloudItem>,
+) -> CmdResult<()> {
+    async {
+        let provider = state.provider(&account_id)?;
+        for item in &items {
+            provider.unshare(&item.path, item.is_dir).await?;
         }
         Ok(())
     }
@@ -547,6 +590,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             app.manage(AppState {
@@ -582,6 +626,8 @@ pub fn run() {
             cloud_mkdir,
             cloud_rename,
             cloud_delete,
+            cloud_share,
+            cloud_unshare,
             local_mkdir,
             local_rename,
             local_delete,
