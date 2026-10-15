@@ -9,6 +9,7 @@
     type ProviderKind,
   } from "$lib/api";
   import { PROVIDERS, buildConfig, missingFields, presetFields, providerDef } from "$lib/providers";
+  import { isMobile } from "$lib/platform";
   import PasswordInput from "./PasswordInput.svelte";
 
   let { open, account = null, accounts, onclose, onsaved }: {
@@ -437,7 +438,8 @@
 
     <footer>
       <span class="note">
-        {kind === "crypt" ? "Пароль хранится" : "Данные входа хранятся"} в системном хранилище учётных данных.
+        {kind === "crypt" ? "Пароль хранится" : "Данные входа хранятся"}
+        {isMobile ? "в закрытой папке приложения." : "в системном хранилище учётных данных."}
       </span>
       {#if waiting}
         <button type="button" class="btn" onclick={() => api.oauthCancel()}>Отменить вход</button>

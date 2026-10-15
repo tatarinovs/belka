@@ -27,6 +27,12 @@
       "M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.6 6.6A17 17 0 0 0 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6M9.9 9.9a3 3 0 0 0 4.2 4.2",
     settings: "M4 6h9m4 0h3M4 12h3m4 0h9M4 18h11m4 0h1M13 4v4M7 10v4M15 16v4",
     link: "M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1",
+    more: "M12 5h.01M12 12h.01M12 19h.01",
+    check: "m5 12.5 4.5 4.5L19 7",
+    phone: "M8 3h8a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm3 15h2",
+    sort: "M7 4v16m-3-3 3 3 3-3M14 6h6M14 12h4M14 18h2",
+    checkAll: "M4 4h16v16H4zm4 8.5 3 3 5-6",
+    external: "M14 4h6v6m0-6-9 9m7 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
   } as const;
   export type IconName = keyof typeof PATHS;
 </script>
@@ -34,6 +40,7 @@
 <script lang="ts">
   let { name, size = 16 }: { name: IconName; size?: number } = $props();
   const filled = $derived(name === "folder");
+  const dots = $derived(name === "more");
 </script>
 
 <svg
@@ -42,7 +49,7 @@
   viewBox="0 0 24 24"
   fill={filled ? "currentColor" : "none"}
   stroke={filled ? "none" : "currentColor"}
-  stroke-width="1.8"
+  stroke-width={dots ? 3 : 1.8}
   stroke-linecap="round"
   stroke-linejoin="round"
   aria-hidden="true"

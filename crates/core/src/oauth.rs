@@ -280,7 +280,8 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 
 fn page(message: &str) -> String {
     format!(
-        "<!doctype html><meta charset=utf-8><title>Belka</title>\
+        "<!doctype html><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Belka</title>\
          <body style=\"font:16px system-ui,sans-serif;display:grid;place-items:center;height:90vh\">\
          <p>{message}</p></body>"
     )

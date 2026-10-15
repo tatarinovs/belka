@@ -3,6 +3,7 @@
   import { api, errorText, type Account, type Entry, type Preview } from "$lib/api";
   import { formatBytes } from "$lib/format";
   import { PREVIEW_CONFIRM_SIZE, TEXT_PREVIEW_MAX, previewKind } from "$lib/preview";
+  import { isMobile } from "$lib/platform";
   import Icon from "./Icon.svelte";
 
   let { account, files, start, onclose }: {
@@ -83,6 +84,26 @@
     if (next >= 0 && next < files.length) index = next;
   }
 
+  function openExternally() {
+    if (preview) api.previewOpen(preview.path).catch((err) => (error = errorText(err)));
+  }
+
+  // A horizontal swipe over the picture moves to the next or previous file.
+  let swipe: { x: number; y: number } | null = null;
+
+  function swipeStart(event: PointerEvent) {
+    if (!isMobile || event.target instanceof HTMLMediaElement) return;
+    swipe = { x: event.clientX, y: event.clientY };
+  }
+
+  function swipeEnd(event: PointerEvent) {
+    if (!swipe) return;
+    const dx = event.clientX - swipe.x;
+    const dy = event.clientY - swipe.y;
+    swipe = null;
+    if (Math.abs(dx) > 60 && Math.abs(dx) > 1.5 * Math.abs(dy)) go(dx < 0 ? 1 : -1);
+  }
+
   function onkeydown(event: KeyboardEvent) {
     // Media elements use the arrows for seeking.
     if (event.target instanceof HTMLMediaElement) return;
@@ -93,32 +114,49 @@
   }
 </script>
 
-<dialog class="modal" bind:this={dialog} onclose={onclose} {onkeydown}>
-  <header>
-    <span class="name" title={entry?.path}>{entry?.name}</span>
-    <span class="meta">
-      {formatBytes(entry?.size ?? 0)}{#if files.length > 1} · {index + 1} из {files.length}{/if}
-    </span>
-    <button class="icon-btn" title="Предыдущий (←)" onclick={() => go(-1)} disabled={index === 0}>
-      <Icon name="arrowLeft" />
-    </button>
-    <button class="icon-btn" title="Следующий (→)" onclick={() => go(1)} disabled={index >= files.length - 1}>
-      <Icon name="arrowRight" />
-    </button>
-    <button
-      class="btn"
-      onclick={() => preview && api.previewOpen(preview.path).catch((err) => (error = errorText(err)))}
-      disabled={!preview}
-      title="Открыть в программе, назначенной в системе"
-    >
-      Открыть в программе
-    </button>
-    <button class="icon-btn" title="Закрыть (Esc)" onclick={() => dialog.close()}>
-      <Icon name="close" />
-    </button>
-  </header>
+<dialog class="modal" class:phone={isMobile} bind:this={dialog} onclose={onclose} {onkeydown}>
+  {#if isMobile}
+    <!-- On a phone the arrows move to a bar at the bottom, within thumb reach. -->
+    <header>
+      <button class="icon-btn" aria-label="Закрыть" onclick={() => dialog.close()}>
+        <Icon name="close" size={22} />
+      </button>
+      <div class="title">
+        <span class="name">{entry?.name}</span>
+        <span class="meta">{formatBytes(entry?.size ?? 0)}</span>
+      </div>
+      <button class="icon-btn" aria-label="Открыть в другом приложении" onclick={openExternally} disabled={!preview}>
+        <Icon name="external" size={22} />
+      </button>
+    </header>
+  {:else}
+    <header>
+      <span class="name" title={entry?.path}>{entry?.name}</span>
+      <span class="meta">
+        {formatBytes(entry?.size ?? 0)}{#if files.length > 1} · {index + 1} из {files.length}{/if}
+      </span>
+      <button class="icon-btn" title="Предыдущий (←)" onclick={() => go(-1)} disabled={index === 0}>
+        <Icon name="arrowLeft" />
+      </button>
+      <button class="icon-btn" title="Следующий (→)" onclick={() => go(1)} disabled={index >= files.length - 1}>
+        <Icon name="arrowRight" />
+      </button>
+      <button class="btn" onclick={openExternally} disabled={!preview} title="Открыть в программе, назначенной в системе">
+        Открыть в программе
+      </button>
+      <button class="icon-btn" title="Закрыть (Esc)" onclick={() => dialog.close()}>
+        <Icon name="close" />
+      </button>
+    </header>
+  {/if}
 
-  <div class="stage">
+  <div
+    class="stage"
+    role="presentation"
+    onpointerdown={swipeStart}
+    onpointerup={swipeEnd}
+    onpointercancel={() => (swipe = null)}
+  >
     {#if !kind}
       <p class="message">Предпросмотр для файлов этого типа недоступен.</p>
     {:else if kind === "text" && entry.size > TEXT_PREVIEW_MAX}
@@ -147,6 +185,12 @@
       <video {src} controls autoplay></video>
     {:else if kind === "audio"}
       <audio {src} controls autoplay></audio>
+    {:else if kind === "pdf" && isMobile}
+      <!-- Android WebView cannot show PDF files. -->
+      <div class="message">
+        <p>PDF откроется в программе для чтения документов.</p>
+        <button class="btn primary" onclick={openExternally}>Открыть в другом приложении</button>
+      </div>
     {:else if kind === "pdf"}
       <iframe {src} title={entry.name}></iframe>
     {:else if kind === "text"}
@@ -158,6 +202,18 @@
       </div>
     {/if}
   </div>
+
+  {#if isMobile && files.length > 1}
+    <footer>
+      <button class="icon-btn" aria-label="Предыдущий" onclick={() => go(-1)} disabled={index === 0}>
+        <Icon name="arrowLeft" size={24} />
+      </button>
+      <span>{index + 1} из {files.length}</span>
+      <button class="icon-btn" aria-label="Следующий" onclick={() => go(1)} disabled={index >= files.length - 1}>
+        <Icon name="arrowRight" size={24} />
+      </button>
+    </footer>
+  {/if}
 </dialog>
 
 <style>
@@ -198,6 +254,48 @@
     color: var(--muted);
     font-size: 12px;
     white-space: nowrap;
+  }
+
+  /* Phone: the whole screen, a compact title and a bottom bar with the arrows. */
+  dialog.modal.phone {
+    width: 100vw;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .phone header {
+    gap: 4px;
+    padding: 4px;
+  }
+
+  .phone .title {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .phone header .icon-btn,
+  .phone footer .icon-btn {
+    width: 48px;
+    height: 48px;
+    border-radius: 24px;
+  }
+
+  .phone .stage {
+    touch-action: pan-y pinch-zoom;
+  }
+
+  dialog.modal.phone footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 12px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
   }
 
   .stage {

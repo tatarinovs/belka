@@ -39,6 +39,16 @@ export function parentPath(path: string): string {
 
 /** The last segment of a local or cloud path: `C:\a\b.txt` → `b.txt`. */
 export function baseName(path: string): string {
+  // Android file dialogs return URIs like
+  // content://…/document/raw%3A%2Fstorage%2Femulated%2F0%2FDownload%2Fa.belka
+  if (path.startsWith("content://")) {
+    const last = path.split("/").at(-1) ?? path;
+    try {
+      return decodeURIComponent(last).split(/[/:]/).at(-1) || last;
+    } catch {
+      return last;
+    }
+  }
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
 

@@ -129,11 +129,31 @@ pub fn rename(path: &str, new_name: &str) -> Result<String> {
 }
 
 /// Moves files and folders to the Recycle Bin.
+#[cfg(desktop)]
 pub fn delete(paths: &[String]) -> Result<()> {
     if paths.iter().any(|p| Path::new(p).parent().is_none()) {
         bail!("A drive cannot be deleted");
     }
     trash::delete_all(paths).context("Failed to move to the Recycle Bin")
+}
+
+/// Android has no Recycle Bin: files and folders are deleted permanently.
+#[cfg(mobile)]
+pub fn delete(paths: &[String]) -> Result<()> {
+    for path in paths.iter().map(Path::new) {
+        if path.parent().is_none() || path == Path::new(ANDROID_STORAGE) {
+            bail!("A drive cannot be deleted");
+        }
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("Cannot access '{}'", path.display()))?;
+        if meta.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+        .with_context(|| format!("Failed to delete '{}'", path.display()))?;
+    }
+    Ok(())
 }
 
 fn root_entries(places: &[Place]) -> Vec<LocalEntry> {
@@ -149,11 +169,7 @@ fn root_entries(places: &[Place]) -> Vec<LocalEntry> {
             icon: Some("place"),
         });
     let drives = drives().into_iter().map(|path| LocalEntry {
-        name: path
-            .display()
-            .to_string()
-            .trim_end_matches('\\')
-            .to_string(),
+        name: drive_name(&path),
         path: path.display().to_string(),
         is_dir: true,
         size: 0,
@@ -161,6 +177,24 @@ fn root_entries(places: &[Place]) -> Vec<LocalEntry> {
         icon: Some("drive"),
     });
     places.chain(drives).collect()
+}
+
+#[cfg(desktop)]
+fn drive_name(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .trim_end_matches('\\')
+        .to_string()
+}
+
+#[cfg(mobile)]
+fn drive_name(path: &Path) -> String {
+    if path == Path::new(ANDROID_STORAGE) {
+        "Внутренняя память".to_string()
+    } else {
+        let id = path.file_name().unwrap_or_default().to_string_lossy();
+        format!("Карта памяти ({id})")
+    }
 }
 
 #[cfg(windows)]
@@ -176,9 +210,33 @@ fn drives() -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), desktop))]
 fn drives() -> Vec<PathBuf> {
     vec![PathBuf::from("/")]
+}
+
+/// The shared storage of the device, visible with "All files access".
+#[cfg(mobile)]
+pub const ANDROID_STORAGE: &str = "/storage/emulated/0";
+
+/// The internal shared storage plus memory cards, which Android mounts
+/// as `/storage/XXXX-XXXX`.
+#[cfg(mobile)]
+fn drives() -> Vec<PathBuf> {
+    let mut drives = vec![PathBuf::from(ANDROID_STORAGE)];
+    if let Ok(entries) = std::fs::read_dir("/storage") {
+        let mut cards: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                name != "emulated" && name != "self" && p.is_dir()
+            })
+            .collect();
+        cards.sort();
+        drives.extend(cards);
+    }
+    drives
 }
 
 #[cfg(windows)]

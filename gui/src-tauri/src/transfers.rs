@@ -122,6 +122,20 @@ pub struct TransferList {
     counts: Counts,
 }
 
+#[derive(Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    /// Queued and running transfers.
+    active: usize,
+    /// Of them uploads.
+    uploads: usize,
+    /// A running file, to name in the notification.
+    name: String,
+    /// Progress of the running files.
+    done_bytes: u64,
+    total_bytes: u64,
+}
+
 pub struct Transfers {
     jobs: Mutex<Vec<Job>>,
     next_id: AtomicU64,
@@ -310,6 +324,27 @@ impl Transfers {
             .map(Job::view)
             .collect();
         TransferList { items, counts }
+    }
+
+    /// A summary of the active transfers for the Android progress notification.
+    #[cfg_attr(desktop, allow(dead_code))]
+    pub fn activity(&self) -> Activity {
+        let jobs = self.jobs.lock().unwrap();
+        let mut activity = Activity::default();
+        for job in jobs.iter().filter(|j| j.status.is_active()) {
+            activity.active += 1;
+            if job.spec.direction == Direction::Upload {
+                activity.uploads += 1;
+            }
+            if job.status == Status::Running {
+                activity.done_bytes += job.progress.done();
+                activity.total_bytes += job.progress.total();
+                if activity.name.is_empty() {
+                    activity.name = split_remote(&job.spec.remote).1;
+                }
+            }
+        }
+        activity
     }
 
     /// Stops a queued or running transfer. Dropping the task's future cancels

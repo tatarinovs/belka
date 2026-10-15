@@ -1,6 +1,8 @@
 mod accounts;
 mod local;
+mod native;
 mod preview;
+mod secrets;
 mod transfers;
 
 use accounts::{Account, AccountStore, CryptFolder, CryptLocation, CRYPT_KIND};
@@ -18,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
 use tauri_plugin_opener::OpenerExt;
-use tauri_plugin_window_state::StateFlags;
 use tokio::sync::oneshot;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::prelude::*;
@@ -351,10 +353,17 @@ fn remove_account(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     remove().map_err(to_msg)
 }
 
+/// `path` is what the file dialog returned: a path, or on Android a
+/// `content://` URI.
+fn file_path(path: &str) -> FilePath {
+    path.parse().unwrap_or_else(|never| match never {})
+}
+
 /// Saves all accounts with their credentials into file `path`, encrypted
 /// with `password`.
 #[tauri::command]
 async fn export_accounts(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
     password: String,
@@ -367,7 +376,12 @@ async fn export_accounts(
         let file =
             tauri::async_runtime::spawn_blocking(move || belka_core::crypt::seal(&password, &data))
                 .await??;
-        std::fs::write(&path, file).with_context(|| format!("Failed to write '{path}'"))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        app.fs()
+            .open(file_path(&path), options)
+            .and_then(|mut out| std::io::Write::write_all(&mut out, &file))
+            .with_context(|| format!("Failed to write '{path}'"))?;
         Ok(count)
     }
     .await
@@ -377,12 +391,16 @@ async fn export_accounts(
 /// Adds the accounts from a file made by [`export_accounts`].
 #[tauri::command]
 async fn import_accounts(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     path: String,
     password: String,
 ) -> CmdResult<accounts::Imported> {
     async {
-        let file = std::fs::read(&path).with_context(|| format!("Failed to read '{path}'"))?;
+        let file = app
+            .fs()
+            .read(file_path(&path))
+            .with_context(|| format!("Failed to read '{path}'"))?;
         let data = tauri::async_runtime::spawn_blocking(move || {
             belka_core::crypt::unseal(&password, &file)
         })
@@ -594,17 +612,13 @@ fn preview_cancel(state: State<'_, AppState>) {
 #[tauri::command]
 fn preview_open(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<()> {
     let path = state.previews.cached(&path).map_err(to_msg)?;
-    app.opener()
-        .open_path(path.to_string_lossy(), None::<&str>)
-        .map_err(|err| err.to_string())
+    native::open_file(&app, &path.to_string_lossy()).map_err(to_msg)
 }
 
 /// Opens a local file in the program the system associates with it.
 #[tauri::command]
 fn local_open(app: tauri::AppHandle, path: String) -> CmdResult<()> {
-    app.opener()
-        .open_path(path, None::<&str>)
-        .map_err(|err| err.to_string())
+    native::open_file(&app, &path).map_err(to_msg)
 }
 
 #[tauri::command]
@@ -827,8 +841,18 @@ fn local_conflicts(dir: String, names: Vec<String>) -> Vec<String> {
 
 #[tauri::command]
 async fn list_local(app: tauri::AppHandle, path: String) -> CmdResult<local::LocalListing> {
+    let places = local_places(&app);
+    // Slow or disconnected drives must not block the UI thread.
+    tauri::async_runtime::spawn_blocking(move || local::list(&path, &places))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(to_msg)
+}
+
+#[cfg(desktop)]
+fn local_places(app: &tauri::AppHandle) -> Vec<local::Place> {
     let paths = app.path();
-    let places: Vec<local::Place> = [
+    [
         ("Рабочий стол", paths.desktop_dir()),
         ("Загрузки", paths.download_dir()),
         ("Документы", paths.document_dir()),
@@ -836,12 +860,110 @@ async fn list_local(app: tauri::AppHandle, path: String) -> CmdResult<local::Loc
     ]
     .into_iter()
     .filter_map(|(name, path)| path.ok().map(|path| local::Place { name, path }))
-    .collect();
-    // Slow or disconnected drives must not block the UI thread.
-    tauri::async_runtime::spawn_blocking(move || local::list(&path, &places))
-        .await
-        .map_err(|err| err.to_string())?
-        .map_err(to_msg)
+    .collect()
+}
+
+/// The shared storage folders every Android device has.
+#[cfg(mobile)]
+fn local_places(_app: &tauri::AppHandle) -> Vec<local::Place> {
+    let root = PathBuf::from(local::ANDROID_STORAGE);
+    [
+        ("Загрузки", "Download"),
+        ("Документы", "Documents"),
+        ("Камера", "DCIM"),
+        ("Изображения", "Pictures"),
+    ]
+    .into_iter()
+    .map(|(name, dir)| local::Place {
+        name,
+        path: root.join(dir),
+    })
+    .collect()
+}
+
+/// Whether the app may browse the shared storage; always on desktops.
+#[tauri::command]
+fn storage_access(app: tauri::AppHandle) -> bool {
+    native::storage_access(&app)
+}
+
+/// Opens the system page where the user grants access to all files.
+#[tauri::command]
+fn request_storage_access(app: tauri::AppHandle) -> CmdResult<()> {
+    native::request_storage_access(&app).map_err(to_msg)
+}
+
+#[derive(Serialize)]
+struct Update {
+    version: String,
+    /// The release page.
+    page: String,
+    /// The Android package of the release, if it has one.
+    apk: Option<String>,
+}
+
+/// The latest release on GitHub if it is newer than this build.
+#[tauri::command]
+async fn check_update() -> CmdResult<Option<Update>> {
+    #[derive(Deserialize)]
+    struct Release {
+        tag_name: String,
+        html_url: String,
+        #[serde(default)]
+        draft: bool,
+        #[serde(default)]
+        prerelease: bool,
+        #[serde(default)]
+        assets: Vec<Asset>,
+    }
+    #[derive(Deserialize)]
+    struct Asset {
+        name: String,
+        browser_download_url: String,
+    }
+    async {
+        let release: Release = reqwest::Client::builder()
+            .user_agent(concat!("belka-gui/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(20))
+            .build()?
+            .get("https://api.github.com/repos/tatarinovs/belka/releases/latest")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let version = release.tag_name.trim_start_matches('v').to_string();
+        if release.draft || release.prerelease || !is_newer(&version, env!("CARGO_PKG_VERSION")) {
+            return Ok(None);
+        }
+        // A universal package or the one for 64-bit ARM phones.
+        let apk = release
+            .assets
+            .iter()
+            .filter(|a| a.name.ends_with(".apk"))
+            .min_by_key(|a| !(a.name.contains("arm64") || a.name.contains("universal")))
+            .map(|a| a.browser_download_url.clone());
+        Ok(Some(Update {
+            version,
+            page: release.html_url,
+            apk,
+        }))
+    }
+    .await
+    .map_err(|err: anyhow::Error| to_msg(err.context("Failed to check for updates")))
+}
+
+/// Compares dotted versions number by number; a suffix like "-beta" is ignored.
+fn is_newer(candidate: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|n| n.parse().unwrap_or(0))
+            .collect()
+    };
+    parse(candidate) > parse(current)
 }
 
 #[tauri::command]
@@ -893,24 +1015,34 @@ pub fn run() {
         .with(filter)
         .init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        // Position, size and maximized state survive restarts; visibility is
-        // left to the page so the window still appears only once drawn.
-        .plugin(
-            tauri_plugin_window_state::Builder::new()
-                .with_state_flags(StateFlags::all() - StateFlags::VISIBLE)
-                .build(),
-        )
+        .plugin(tauri_plugin_fs::init())
+        .plugin(native::plugin());
+    // Position, size and maximized state survive restarts; visibility is
+    // left to the page so the window still appears only once drawn.
+    #[cfg(desktop)]
+    let builder = builder.plugin(
+        tauri_plugin_window_state::Builder::new()
+            .with_state_flags(
+                tauri_plugin_window_state::StateFlags::all()
+                    - tauri_plugin_window_state::StateFlags::VISIBLE,
+            )
+            .build(),
+    );
+    builder
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let preview_dir = app.path().app_cache_dir()?.join("preview");
+            secrets::init(app.path().app_data_dir()?);
+            let transfers = Transfers::new();
+            native::watch_transfers(app.handle().clone(), transfers.clone());
             app.manage(AppState {
                 accounts: Mutex::new(AccountStore::new(config_dir)),
                 providers: Mutex::new(HashMap::new()),
-                transfers: Transfers::new(),
+                transfers,
                 sign_in_cancel: Mutex::new(None),
                 previews: preview::Previews::new(preview_dir),
             });
@@ -961,7 +1093,10 @@ pub fn run() {
             cancel_transfer,
             cancel_all_transfers,
             retry_transfer,
-            clear_transfers
+            clear_transfers,
+            storage_access,
+            request_storage_access,
+            check_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -988,6 +1123,16 @@ mod tests {
             dir.join("a (3).txt")
         );
         assert_eq!(unique_path(dir.join("b"), &mut taken), dir.join("b"));
+    }
+
+    #[test]
+    fn newer_versions() {
+        assert!(is_newer("1.2.0", "1.1.0"));
+        assert!(is_newer("1.10.0", "1.9.3"));
+        assert!(is_newer("2.0", "1.9.9"));
+        assert!(!is_newer("1.1.0", "1.1.0"));
+        assert!(!is_newer("1.0.9", "1.1.0"));
+        assert!(!is_newer("1.1.0-beta", "1.1.0"));
     }
 
     #[test]

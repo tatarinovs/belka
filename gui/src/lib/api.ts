@@ -215,7 +215,22 @@ export const api = {
   cancelAllTransfers: () => invoke<void>("cancel_all_transfers"),
   retryTransfer: (id: number) => invoke<void>("retry_transfer", { id }),
   clearTransfers: () => invoke<void>("clear_transfers"),
+
+  /** Android: the app may browse the shared storage. Always true on desktops. */
+  storageAccess: () => invoke<boolean>("storage_access"),
+  /** Android: opens the system page that grants access to all files. */
+  requestStorageAccess: () => invoke<void>("request_storage_access"),
+  /** The latest release on GitHub if it is newer than this build. */
+  checkUpdate: () => invoke<Update | null>("check_update"),
 };
+
+export interface Update {
+  version: string;
+  /** The release page. */
+  page: string;
+  /** The Android package, if the release has one. */
+  apk: string | null;
+}
 
 /** Commands reject with a plain string; anything else is unexpected. */
 export function errorText(err: unknown): string {

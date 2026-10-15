@@ -190,3 +190,59 @@ button {
 [data-kind="s3"] { --kind-color: #c77700; }
 [data-kind="synology"] { --kind-color: #2f6f9f; }
 [data-kind="crypt"] { --kind-color: #455a64; }
+
+/* The phone layout: shared components (dialogs, the transfer list) get
+   larger text and touch-sized controls. `:root.mobile` outweighs the
+   components' own scoped rules. */
+:root.mobile {
+  font-family: system-ui, sans-serif;
+  font-size: 15px;
+}
+
+:root.mobile .btn {
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 20px;
+}
+
+:root.mobile .icon-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 20px;
+}
+
+:root.mobile input:not([type="checkbox"]):not([type="radio"]),
+:root.mobile select,
+:root.mobile textarea {
+  min-height: 40px;
+  font-size: 16px;
+}
+
+:root.mobile .modal {
+  width: calc(100vw - 16px);
+  max-width: none;
+  max-height: calc(100dvh - 16px);
+  border-radius: 16px;
+}
+
+:root.mobile .modal h2 {
+  font-size: 18px;
+}
+
+/* Accounts dialog: the list is reordered by dragging the grip only on
+   desktops; on a phone each row keeps the name, settings and delete. */
+:root.mobile .modal li .order,
+:root.mobile .modal li .grip,
+:root.mobile .modal li .btn .label {
+  display: none;
+}
+
+:root.mobile .modal footer {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* A note in a dialog footer takes its own line above the buttons. */
+:root.mobile .modal footer .note {
+  flex-basis: 100%;
+}

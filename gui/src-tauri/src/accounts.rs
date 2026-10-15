@@ -1,13 +1,14 @@
 //! Saved cloud accounts. The public part (id, name, provider kind) is kept in
-//! `accounts.json`; credentials are stored in the OS keyring (Windows
-//! Credential Manager, macOS Keychain, Secret Service on Linux).
+//! `accounts.json`; credentials are kept by [`crate::secrets`]: in the OS
+//! keyring on desktops, in the app's private folder on Android.
 //!
 //! An encrypted folder is an account of kind [`CRYPT_KIND`] that refers to
-//! another account and keeps its password in the keyring.
+//! another account and keeps its password with the other credentials.
 //!
 //! All of it can be exported into one file sealed with a password
 //! ([`belka_core::crypt::seal`]) and imported on another computer.
 
+use crate::secrets;
 use anyhow::{bail, Context, Result};
 use belka_core::crypt::CryptConfig;
 use belka_core::oauth::{OAuthApp, Service};
@@ -16,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const KEYRING_SERVICE: &str = "belka-gui";
 pub const CRYPT_KIND: &str = "crypt";
 
 /// An encrypted folder in another account.
@@ -116,14 +116,10 @@ impl AccountStore {
             kind: kind.to_string(),
             crypt,
         };
-        entry(&account.id)?
-            .set_password(secret)
-            .context("Failed to save credentials to the system keyring")?;
+        secrets::set(&account.id, secret)?;
         accounts.push(account.clone());
         if let Err(err) = self.save(&accounts) {
-            if let Ok(e) = entry(&account.id) {
-                let _ = e.delete_credential();
-            }
+            let _ = secrets::delete(&account.id);
             return Err(err);
         }
         Ok(account)
@@ -144,9 +140,7 @@ impl AccountStore {
             if config.kind() != account.kind {
                 bail!("The account type cannot be changed");
             }
-            entry(id)?
-                .set_password(&serde_json::to_string(config)?)
-                .context("Failed to save credentials to the system keyring")?;
+            secrets::set(id, &serde_json::to_string(config)?)?;
         }
         account.name = name.to_string();
         let account = account.clone();
@@ -166,10 +160,7 @@ impl AccountStore {
         let mut accounts = self.list()?;
         accounts.retain(|a| a.id != id);
         self.save(&accounts)?;
-        match entry(id)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(err).context("Failed to delete credentials from the system keyring"),
-        }
+        secrets::delete(id)
     }
 
     pub fn credentials(&self, id: &str) -> Result<ProviderConfig> {
@@ -245,9 +236,7 @@ impl AccountStore {
         let added = new.len();
         let mut written = Vec::new();
         let result = new.iter().try_for_each(|(account, secret)| {
-            entry(&account.id)?
-                .set_password(secret)
-                .context("Failed to save credentials to the system keyring")?;
+            secrets::set(&account.id, secret)?;
             written.push(account.id.as_str());
             Ok(())
         });
@@ -257,9 +246,7 @@ impl AccountStore {
         });
         if let Err(err) = result {
             for id in written {
-                if let Ok(e) = entry(id) {
-                    let _ = e.delete_credential();
-                }
+                let _ = secrets::delete(id);
             }
             return Err(err);
         }
@@ -290,7 +277,7 @@ impl Backup {
 struct SavedAccount {
     #[serde(flatten)]
     account: Account,
-    /// The keyring entry as is: `ProviderConfig` or `CryptFolder` in JSON.
+    /// The stored secret as is: `ProviderConfig` or `CryptFolder` in JSON.
     secret: String,
 }
 
@@ -309,14 +296,12 @@ pub struct Imported {
 
 /// The user's own OAuth app for `service`, so it is entered only once.
 pub fn load_oauth_app(service: Service) -> Option<OAuthApp> {
-    let secret = entry(&oauth_app_key(service)).ok()?.get_password().ok()?;
+    let secret = secrets::get(&oauth_app_key(service)).ok()??;
     serde_json::from_str(&secret).ok()
 }
 
 pub fn save_oauth_app(service: Service, app: &OAuthApp) -> Result<()> {
-    entry(&oauth_app_key(service))?
-        .set_password(&serde_json::to_string(app)?)
-        .context("Failed to save the OAuth app to the system keyring")
+    secrets::set(&oauth_app_key(service), &serde_json::to_string(app)?)
 }
 
 fn oauth_app_key(service: Service) -> String {
@@ -327,13 +312,7 @@ fn oauth_app_key(service: Service) -> String {
 }
 
 fn secret(id: &str) -> Result<String> {
-    entry(id)?
-        .get_password()
-        .context("Failed to read credentials from the system keyring")
-}
-
-fn entry(id: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, id).context("System keyring is unavailable")
+    secrets::get(id)?.context("Credentials are missing; sign in again")
 }
 
 fn new_id() -> String {

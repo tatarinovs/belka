@@ -225,7 +225,7 @@
               </button>
             </span>
             <button class="btn" onclick={() => onedit(account)}>
-              <Icon name="settings" size={14} /> Настроить
+              <Icon name="settings" size={14} /> <span class="label">Настроить</span>
             </button>
             <button class="icon-btn danger" title="Удалить аккаунт" onclick={() => remove(account)}>
               <Icon name="trash" size={15} />

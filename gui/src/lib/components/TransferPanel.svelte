@@ -1,6 +1,7 @@
 <script lang="ts">
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
-  import type { Transfer } from "$lib/api";
+  import { api, type Transfer } from "$lib/api";
+  import { isMobile } from "$lib/platform";
   import { formatBytes } from "$lib/format";
   import { transfers } from "$lib/transfers.svelte";
   import Icon from "./Icon.svelte";
@@ -64,7 +65,7 @@
           <button class="btn small" onclick={() => transfers.cancelAll()}>Отменить все</button>
         {/if}
         {#if finished}
-          <button class="btn small" onclick={() => transfers.clear()}>Очистить завершённые</button>
+          <button class="btn small" onclick={() => transfers.clear()}>{isMobile ? "Очистить" : "Очистить завершённые"}</button>
         {/if}
       </div>
     </header>
@@ -92,6 +93,10 @@
               {:else if t.state === "failed" || t.state === "cancelled"}
                 <button class="icon-btn" title="Повторить" onclick={() => transfers.retry(t.id)}>
                   <Icon name="retry" size={14} />
+                </button>
+              {:else if t.direction === "download" && isMobile}
+                <button class="icon-btn" title="Открыть" onclick={() => api.localOpen(t.local_path).catch(() => {})}>
+                  <Icon name="file" size={14} />
                 </button>
               {:else if t.direction === "download"}
                 <button class="icon-btn" title="Показать в папке" onclick={() => revealItemInDir(t.local_path)}>

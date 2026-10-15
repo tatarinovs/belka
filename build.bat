@@ -6,7 +6,7 @@ echo ===================================================================
 echo             BELKA - RELEASE BUILDER
 echo ===================================================================
 echo.
-echo Usage: build.bat [all^|exe^|gui^|arm64]
+echo Usage: build.bat [all^|exe^|gui^|arm64^|android]
 echo.
 
 set TARGET_MODE=%1
@@ -20,6 +20,7 @@ if not defined BELKA_YANDEX_CLIENT_ID echo [!] BELKA_YANDEX_CLIENT_ID is not set
 
 if "%TARGET_MODE%"=="gui" goto BUILD_GUI
 if "%TARGET_MODE%"=="arm64" goto BUILD_ARM64
+if "%TARGET_MODE%"=="android" goto BUILD_ANDROID
 
 REM ---------------------------------------------------------------------
 REM Build Windows x86_64 CLI
@@ -97,6 +98,37 @@ if errorlevel 1 goto ERR_BUILD_ARM64
 
 copy /Y "target\aarch64-unknown-linux-musl\release\belka" "dist\belka-linux-arm64" >nul
 echo [OK] Linux ARM64 binary ready: dist\belka-linux-arm64
+goto ALL_DONE
+
+REM ---------------------------------------------------------------------
+REM Build Android APK (arm64), signed with the key from
+REM gui\src-tauri\gen\android\keystore.properties. Not part of "all":
+REM it needs Android Studio (JDK, SDK) and the NDK.
+REM ---------------------------------------------------------------------
+:BUILD_ANDROID
+echo.
+echo ===================================================================
+echo [ANDROID] Building signed APK for arm64...
+echo ===================================================================
+if not defined ANDROID_HOME set "ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk"
+if not defined JAVA_HOME set "JAVA_HOME=%ProgramFiles%\Android\Android Studio\jbr"
+if defined NDK_HOME goto ANDROID_NDK_OK
+for /d %%D in ("%ANDROID_HOME%\ndk\*") do set "NDK_HOME=%%D"
+:ANDROID_NDK_OK
+if not exist "%NDK_HOME%" goto ERR_NO_NDK
+if not exist "gui\src-tauri\gen\android\keystore.properties" echo [!] No keystore.properties: the APK will not be signed
+
+pushd gui
+if not exist node_modules call npm ci
+call npm run tauri -- android build --apk --split-per-abi --target aarch64
+set ANDROID_ERR=%errorlevel%
+popd
+if not "%ANDROID_ERR%"=="0" goto ERR_BUILD_ANDROID
+
+for /f "usebackq delims=" %%V in (`node -p "require('./gui/package.json').version"`) do set "APP_VERSION=%%V"
+copy /Y "gui\src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release.apk" "dist\belka-%APP_VERSION%-arm64.apk" >nul
+echo [OK] Android package ready: dist\belka-%APP_VERSION%-arm64.apk
+goto ALL_DONE
 
 :ALL_DONE
 echo.
@@ -145,6 +177,18 @@ exit /b 1
 
 :ERR_BUILD_ARM64
 echo [ERROR] Linux ARM64 build failed!
+echo.
+if "%NO_PAUSE%"=="" pause
+exit /b 1
+
+:ERR_NO_NDK
+echo [ERROR] Android NDK was not found. Install it in Android Studio: SDK Manager, SDK Tools, NDK.
+echo.
+if "%NO_PAUSE%"=="" pause
+exit /b 1
+
+:ERR_BUILD_ANDROID
+echo [ERROR] Android build failed!
 echo.
 if "%NO_PAUSE%"=="" pause
 exit /b 1
