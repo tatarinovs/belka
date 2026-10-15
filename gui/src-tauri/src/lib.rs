@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::oneshot;
@@ -554,6 +555,16 @@ pub fn run() {
                 transfers: Transfers::new(),
                 sign_in_cancel: Mutex::new(None),
             });
+            // The page shows the hidden window once it is drawn; if it fails
+            // to load, the window still appears.
+            if let Some(window) = app.get_webview_window("main") {
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if !window.is_visible().unwrap_or(true) {
+                        let _ = window.show();
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

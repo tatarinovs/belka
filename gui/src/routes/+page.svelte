@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { api, errorText, type Account, type Entry, type Listing } from "$lib/api";
@@ -208,7 +209,12 @@
         selectedId = list.find((a) => a.id === last)?.id ?? list[0]?.id ?? null;
       })
       .catch((err) => (notice = errorText(err)))
-      .finally(() => (loaded = true));
+      .finally(async () => {
+        loaded = true;
+        // The window starts hidden so the user never sees a blank webview.
+        await tick();
+        getCurrentWindow().show();
+      });
 
     const offFinished = transfers.onFinished((t) => {
       if (t.direction === "upload" && t.account_id === selectedId && t.remote_dir === cloudPath) {

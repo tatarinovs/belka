@@ -55,8 +55,9 @@
 Требуется Rust 1.80+. Команды `cargo` без `-p` собирают только CLI.
 
 ```cmd
-build.bat          # Windows .exe и Linux ARM64
-build.bat exe      # только Windows .exe
+build.bat          # всё: CLI для Windows, GUI и CLI для Linux ARM64
+build.bat exe      # только CLI для Windows
+build.bat gui      # только GUI: dist\belka-gui.exe и установщик
 build.bat arm64    # только Linux ARM64 (через zig)
 ```
 Готовые файлы складываются в `dist/`.
