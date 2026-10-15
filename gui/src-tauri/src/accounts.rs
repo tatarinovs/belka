@@ -126,6 +126,39 @@ impl AccountStore {
         Ok(account)
     }
 
+    /// Renames an account and, with `config`, replaces its credentials.
+    pub fn update(&self, id: &str, name: &str, config: Option<&ProviderConfig>) -> Result<Account> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("Account name is empty");
+        }
+        let mut accounts = self.list()?;
+        let account = accounts
+            .iter_mut()
+            .find(|a| a.id == id)
+            .context("Account not found")?;
+        if let Some(config) = config {
+            if config.kind() != account.kind {
+                bail!("The account type cannot be changed");
+            }
+            entry(id)?
+                .set_password(&serde_json::to_string(config)?)
+                .context("Failed to save credentials to the system keyring")?;
+        }
+        account.name = name.to_string();
+        let account = account.clone();
+        self.save(&accounts)?;
+        Ok(account)
+    }
+
+    /// Puts the accounts in the order of `ids`; ones not listed keep their
+    /// relative order at the end.
+    pub fn reorder(&self, ids: &[String]) -> Result<()> {
+        let mut accounts = self.list()?;
+        accounts.sort_by_key(|a| ids.iter().position(|id| *id == a.id).unwrap_or(usize::MAX));
+        self.save(&accounts)
+    }
+
     pub fn remove(&self, id: &str) -> Result<()> {
         let mut accounts = self.list()?;
         accounts.retain(|a| a.id != id);

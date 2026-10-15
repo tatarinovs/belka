@@ -15,6 +15,7 @@
 | `google` | Google Drive (API v3, resumable upload) | размер + MD5 |
 | `webdav` | Nextcloud, ownCloud, Synology и любой WebDAV | размер + дата (MD5 при `WEBDAV_ETAG_IS_MD5=true`) |
 | `s3` | AWS S3, Cloudflare R2, MinIO, Yandex Object Storage | размер + MD5 (для multipart — дата) |
+| `synology` | Synology NAS (File Station API) | размер + дата изменения |
 
 **Режим 1 — выгрузка файла или папки.** Дерево каталогов воссоздаётся в облаке, неизменённые файлы пропускаются. Если у провайдера нет MD5, сравнивается дата изменения: это важно для многотомных архивов, где все тома одного размера. Загрузки идут параллельно (`-j`).
 
@@ -132,6 +133,8 @@ npm run tauri build
 
 **S3.** Используются path-style запросы (`{endpoint}/{bucket}/{key}`). В S3 нет настоящих папок, поэтому пустые каталоги не создаются.
 
+**Synology.** Работает через API File Station, как веб-интерфейс DSM: пакет WebDAV Server не нужен. Адрес — IP или имя NAS (`192.168.1.10`) либо полный URL (`https://nas.example.com:5001`). Порт — тот, что в адресе DSM в браузере (Панель управления → Портал входа): по умолчанию 5000, а с `SYNOLOGY_HTTPS=true` — 5001, другой задаётся в `SYNOLOGY_PORT`. Для самоподписанного сертификата включите `SYNOLOGY_INSECURE=true`. Двухфакторная аутентификация не поддерживается: заведите для Belka отдельного пользователя DSM без неё. Верхний уровень — общие папки (`/home`, `/photo`, …); их создают и удаляют в DSM. В GUI ссылки создаются как кнопкой «Поделиться» в File Station, можно задать пароль и срок действия. Адрес в ссылке DSM берёт из своих настроек (Панель управления → Внешний доступ).
+
 #### Шифрование
 
 Формат полностью совпадает с rclone crypt: содержимое шифруется XSalsa20-Poly1305 блоками по 64 КБ, имена — AES-256 в режиме EME, ключи получаются из пароля через scrypt. Belka и rclone читают файлы друг друга.
@@ -167,7 +170,7 @@ npm run tauri build
 ```text
 belka [OPTIONS] [LOCAL_PATH]
 
-  -p, --provider <PROVIDER>  yandex | mailru | google | webdav | s3   [env: CLOUD_PROVIDER] [default: yandex]
+  -p, --provider <PROVIDER>  yandex | mailru | google | webdav | s3 | synology   [env: CLOUD_PROVIDER] [default: yandex]
   -r, --remote <REMOTE>      Папка в облаке                           [env: CLOUD_REMOTE_DIR] [default: /Upload]
       --env-file <FILE>      Путь к .env
       --urls-file <PATH>     Список ссылок: локальный файл или путь в облаке  [env: CLOUD_URLS_FILE]

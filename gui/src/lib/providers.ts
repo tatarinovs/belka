@@ -3,7 +3,7 @@ import type { ProviderConfig, ProviderKind } from "./api";
 export interface Field {
   key: string;
   label: string;
-  type?: "text" | "password" | "url" | "checkbox";
+  type?: "text" | "password" | "url" | "number" | "checkbox";
   placeholder?: string;
   optional?: boolean;
   hint?: string;
@@ -17,6 +17,8 @@ export interface ProviderDef {
   fields: Field[];
   /** Items can be shared by a public link. */
   share?: boolean;
+  /** Links can have a password and an expiry date. */
+  shareOptions?: boolean;
 }
 
 export const PROVIDERS: ProviderDef[] = [
@@ -100,6 +102,35 @@ export const PROVIDERS: ProviderDef[] = [
     ],
   },
   {
+    kind: "synology",
+    share: true,
+    shareOptions: true,
+    title: "Synology NAS",
+    short: "DS",
+    help:
+      "Файлы и ссылки через File Station, как в веб-интерфейсе DSM. Аккаунт DSM без двухфакторной аутентификации.",
+    fields: [
+      { key: "url", label: "Адрес NAS", placeholder: "192.168.1.10" },
+      {
+        key: "port",
+        label: "Порт",
+        type: "number",
+        optional: true,
+        placeholder: "5000, для HTTPS 5001",
+        hint: "Как в адресе DSM в браузере: Панель управления → Портал входа.",
+      },
+      { key: "https", label: "HTTPS", type: "checkbox", optional: true },
+      { key: "user", label: "Пользователь" },
+      { key: "password", label: "Пароль", type: "password" },
+      {
+        key: "insecure",
+        label: "Не проверять сертификат HTTPS (самоподписанный или на другое имя)",
+        type: "checkbox",
+        optional: true,
+      },
+    ],
+  },
+  {
     kind: "crypt",
     title: "Зашифрованная папка",
     short: "🔒",
@@ -124,7 +155,11 @@ export function buildConfig(
       config[field.key] = value === true;
     } else {
       const text = typeof value === "string" ? value.trim() : "";
-      if (text || !field.optional) config[field.key] = text;
+      if (field.type === "number") {
+        if (text) config[field.key] = Number(text);
+      } else if (text || !field.optional) {
+        config[field.key] = text;
+      }
     }
   }
   return config;

@@ -7,9 +7,10 @@ use accounts::{Account, AccountStore, CryptFolder, CryptLocation, CRYPT_KIND};
 use anyhow::{bail, Context, Result};
 use belka_core::oauth::{self, OAuthApp, Service};
 use belka_core::storage::crypt::CryptProvider;
-use belka_core::storage::{check_name, rename_target};
+use belka_core::storage::{check_name, rename_target, ShareOptions};
 use belka_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name};
 use belka_core::{ProviderConfig, RemoteFileInfo, StorageProvider};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use std::time::Duration;
 use tauri::{Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_window_state::StateFlags;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use transfers::{Direction, Spec, TransferView, Transfers};
@@ -64,6 +66,31 @@ impl AppState {
 
     fn account_name(&self, account_id: &str) -> Result<String> {
         self.account(account_id).map(|a| a.name)
+    }
+
+    /// Uses `provider` for the account from now on. Encrypted folders in it
+    /// hold the old one, so they are rebuilt on next use.
+    fn replace_provider(&self, account_id: &str, provider: Arc<dyn StorageProvider>) {
+        let dependent: Vec<String> = {
+            let store = self.accounts.lock().unwrap();
+            store
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| a.kind == CRYPT_KIND)
+                .filter(|a| {
+                    store
+                        .crypt_folder(&a.id)
+                        .is_ok_and(|f| f.base == account_id)
+                })
+                .map(|a| a.id)
+                .collect()
+        };
+        let mut providers = self.providers.lock().unwrap();
+        for id in dependent {
+            providers.remove(&id);
+        }
+        providers.insert(account_id.to_string(), provider);
     }
 }
 
@@ -131,9 +158,10 @@ fn oauth_apps(service: Service) -> OAuthApps {
     }
 }
 
-/// Signs in through the browser and saves the account. Without `custom_app`
-/// the built-in OAuth app is used. An empty `name` becomes the account's
-/// e-mail or login.
+/// Signs in through the browser and saves the account, or with `account_id`
+/// replaces the credentials of that account. Without `custom_app`
+/// the built-in OAuth app is used. An empty `name` keeps the name of the
+/// replaced account, or becomes the e-mail or login of a new one.
 #[tauri::command]
 async fn oauth_sign_in(
     app: tauri::AppHandle,
@@ -141,6 +169,7 @@ async fn oauth_sign_in(
     service: Service,
     custom_app: Option<OAuthApp>,
     name: String,
+    account_id: Option<String>,
 ) -> CmdResult<Account> {
     let (cancel, cancelled) = oneshot::channel();
     // A sign-in still waiting in another browser tab is abandoned.
@@ -167,20 +196,28 @@ async fn oauth_sign_in(
             .list_dir("/")
             .await
             .with_context(|| format!("Cannot connect to {}", provider.name()))?;
+        let current = account_id
+            .as_deref()
+            .map(|id| state.account(id))
+            .transpose()?;
         let name = Some(name.trim().to_string())
             .filter(|n| !n.is_empty())
+            .or_else(|| current.as_ref().map(|a| a.name.clone()))
             .or(signed_in.label)
             .unwrap_or_else(|| service.title().to_string());
-        let account = state
-            .accounts
-            .lock()
-            .unwrap()
-            .add(&name, &signed_in.config)?;
-        state
-            .providers
-            .lock()
-            .unwrap()
-            .insert(account.id.clone(), provider);
+        let account = match &current {
+            Some(current) => state.accounts.lock().unwrap().update(
+                &current.id,
+                &name,
+                Some(&signed_in.config),
+            )?,
+            None => state
+                .accounts
+                .lock()
+                .unwrap()
+                .add(&name, &signed_in.config)?,
+        };
+        state.replace_provider(&account.id, provider);
         // Only the user's own app is remembered: the built-in one always
         // comes from the binary, so an update can replace it.
         if let Some(custom) = &custom_app {
@@ -230,6 +267,60 @@ async fn add_crypt_folder(
     }
     .await
     .map_err(to_msg)
+}
+
+/// The stored credentials of an account for its settings form; `None` for
+/// an encrypted folder, whose password is not shown.
+#[tauri::command]
+fn account_config(state: State<'_, AppState>, id: String) -> CmdResult<Option<ProviderConfig>> {
+    let read = || {
+        if state.account(&id)?.kind == CRYPT_KIND {
+            return Ok(None);
+        }
+        state.accounts.lock().unwrap().credentials(&id).map(Some)
+    };
+    read().map_err(to_msg)
+}
+
+/// Renames an account and, with `config`, replaces its credentials once
+/// they are checked.
+#[tauri::command]
+async fn update_account(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+    config: Option<ProviderConfig>,
+) -> CmdResult<Account> {
+    async {
+        let provider = match &config {
+            Some(config) => {
+                let provider: Arc<dyn StorageProvider> = config.build()?.into();
+                provider
+                    .list_dir("/")
+                    .await
+                    .with_context(|| format!("Cannot connect to {}", provider.name()))?;
+                Some(provider)
+            }
+            None => None,
+        };
+        let account = state
+            .accounts
+            .lock()
+            .unwrap()
+            .update(&id, &name, config.as_ref())?;
+        if let Some(provider) = provider {
+            state.replace_provider(&id, provider);
+        }
+        Ok(account)
+    }
+    .await
+    .map_err(to_msg)
+}
+
+/// Saves the order in which accounts are listed.
+#[tauri::command]
+fn reorder_accounts(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<()> {
+    state.accounts.lock().unwrap().reorder(&ids).map_err(to_msg)
 }
 
 /// Refuses to remove an account that encrypted folders are stored in.
@@ -341,20 +432,54 @@ async fn cloud_delete(
     .map_err(to_msg)
 }
 
+/// Link settings as the page sends them; empty values mean "not set".
+#[derive(Deserialize)]
+struct ShareParams {
+    password: Option<String>,
+    /// `YYYY-MM-DD`
+    expires: Option<String>,
+}
+
+impl ShareParams {
+    fn parse(self) -> Result<ShareOptions> {
+        let expires = match self.expires.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(date) => Some(
+                NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                    .with_context(|| format!("Invalid date '{date}'"))?,
+            ),
+        };
+        Ok(ShareOptions {
+            password: self.password.filter(|p| !p.is_empty()),
+            expires,
+        })
+    }
+}
+
 /// Opens access by link to cloud items and copies the links to the
-/// clipboard, one per line. Returns the links.
+/// clipboard, one per line. With `options` every link gets exactly these
+/// settings, replacing an existing one. Returns the links.
 #[tauri::command]
 async fn cloud_share(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     items: Vec<CloudItem>,
+    options: Option<ShareParams>,
 ) -> CmdResult<Vec<String>> {
     async {
         let provider = state.provider(&account_id)?;
+        let options = options.map(ShareParams::parse).transpose()?;
         let mut links = Vec::with_capacity(items.len());
         for item in &items {
-            links.push(provider.share(&item.path, item.is_dir).await?);
+            links.push(match &options {
+                Some(options) => {
+                    provider
+                        .share_with(&item.path, item.is_dir, options)
+                        .await?
+                }
+                None => provider.share(&item.path, item.is_dir).await?,
+            });
         }
         app.clipboard()
             .write_text(links.join("\n"))
@@ -715,6 +840,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Position, size and maximized state survive restarts; visibility is
+        // left to the page so the window still appears only once drawn.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(StateFlags::all() - StateFlags::VISIBLE)
+                .build(),
+        )
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let preview_dir = app.path().app_cache_dir()?.join("preview");
@@ -744,6 +876,9 @@ pub fn run() {
             oauth_apps,
             oauth_sign_in,
             oauth_cancel,
+            account_config,
+            update_account,
+            reorder_accounts,
             remove_account,
             list_dir,
             download,

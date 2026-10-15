@@ -22,6 +22,8 @@ pub enum ProviderKind {
     Webdav,
     #[value(alias = "r2", alias = "minio")]
     S3,
+    #[value(alias = "nas", alias = "dsm")]
+    Synology,
 }
 
 /// Extracts `--env-file` before clap runs, so that values from the file can
@@ -232,6 +234,24 @@ fn provider_config(kind: ProviderKind) -> Result<ProviderConfig> {
                 region: var("S3_REGION"),
             }
         }
+        ProviderKind::Synology => {
+            let [url, user, password] = require(
+                "Synology",
+                ["SYNOLOGY_URL", "SYNOLOGY_USER", "SYNOLOGY_PASSWORD"],
+            )?;
+            let port = var("SYNOLOGY_PORT")
+                .map(|p| p.trim().parse::<u16>())
+                .transpose()
+                .context("SYNOLOGY_PORT must be a port number")?;
+            ProviderConfig::Synology {
+                url,
+                port,
+                https: flag("SYNOLOGY_HTTPS"),
+                user,
+                password,
+                insecure: flag("SYNOLOGY_INSECURE"),
+            }
+        }
     })
 }
 
@@ -267,6 +287,15 @@ Supported cloud providers (-p, --provider):
   s3       S3 compatible (AWS, Cloudflare R2, MinIO, Yandex Object Storage)
            S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
            S3_REGION                   optional, default {DEFAULT_S3_REGION} (R2: auto)
+
+  synology Synology NAS (DSM File Station API)
+           SYNOLOGY_URL                DSM host, e.g. 192.168.1.10, or a URL such as
+                                       https://nas.example.com:5001
+           SYNOLOGY_USER, SYNOLOGY_PASSWORD
+                                       a DSM account without two-factor authentication
+           SYNOLOGY_PORT               optional, default 5000 (HTTPS: 5001)
+           SYNOLOGY_HTTPS              optional, 'true' to connect over HTTPS
+           SYNOLOGY_INSECURE           optional, 'true' to accept a self-signed certificate
 
 Encryption (any provider, rclone crypt format):
            CRYPT_PASSWORD              enables encryption: files are encrypted before

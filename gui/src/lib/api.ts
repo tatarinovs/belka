@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type ProviderKind = "yandex" | "mailru" | "google" | "webdav" | "s3" | "crypt";
+export type ProviderKind = "yandex" | "mailru" | "google" | "webdav" | "s3" | "synology" | "crypt";
 
 export interface Account {
   id: string;
@@ -41,8 +41,15 @@ export interface Listing {
   entries: Entry[];
 }
 
+/** Settings of a shared link; empty values mean "not set". */
+export interface ShareOptions {
+  password: string;
+  /** `YYYY-MM-DD`, the last day the link works. */
+  expires: string;
+}
+
 /** Mirrors `ProviderConfig` from the core crate: `kind` plus provider fields. */
-export type ProviderConfig = { kind: ProviderKind } & Record<string, string | boolean>;
+export type ProviderConfig = { kind: ProviderKind } & Record<string, string | number | boolean>;
 
 export type TransferState = "queued" | "running" | "done" | "failed" | "cancelled";
 
@@ -106,13 +113,24 @@ export const api = {
   oauthApps: (service: OAuthService) => invoke<OAuthApps>("oauth_apps", { service }),
   /** Opens the browser and resolves once the account is saved. Without
    * `customApp` the built-in OAuth app is used. */
-  oauthSignIn: (service: OAuthService, customApp: OAuthApp | null, name: string) =>
-    invoke<Account>("oauth_sign_in", { service, customApp, name }),
+  /** With `accountId` the credentials of that account are replaced. */
+  oauthSignIn: (
+    service: OAuthService,
+    customApp: OAuthApp | null,
+    name: string,
+    accountId: string | null = null,
+  ) => invoke<Account>("oauth_sign_in", { service, customApp, name, accountId }),
+  /** Stored credentials for the settings form; null for an encrypted folder. */
+  accountConfig: (id: string) => invoke<ProviderConfig | null>("account_config", { id }),
+  /** Renames; with `config` also replaces the credentials once they work. */
+  updateAccount: (id: string, name: string, config: ProviderConfig | null) =>
+    invoke<Account>("update_account", { id, name, config }),
   oauthCancel: () => invoke<void>("oauth_cancel"),
   /** Checks the password against files already in the folder, then saves. */
   addCryptFolder: (name: string, folder: CryptFolder) =>
     invoke<Account>("add_crypt_folder", { name, folder }),
   removeAccount: (id: string) => invoke<void>("remove_account", { id }),
+  reorderAccounts: (ids: string[]) => invoke<void>("reorder_accounts", { ids }),
   listDir: (accountId: string, path: string) =>
     invoke<RemoteEntry[]>("list_dir", { accountId, path }),
 
@@ -141,11 +159,13 @@ export const api = {
       accountId,
       items: items.map(({ path, is_dir }) => ({ path, is_dir })),
     }),
-  /** Opens access by link; the backend also copies the links to the clipboard. */
-  cloudShare: (accountId: string, items: Entry[]) =>
+  /** Opens access by link; the backend also copies the links to the clipboard.
+   * With `options` the links get exactly these settings, replacing existing ones. */
+  cloudShare: (accountId: string, items: Entry[], options?: ShareOptions) =>
     invoke<string[]>("cloud_share", {
       accountId,
       items: items.map(({ path, is_dir }) => ({ path, is_dir })),
+      options: options ?? null,
     }),
   cloudUnshare: (accountId: string, items: Entry[]) =>
     invoke<void>("cloud_unshare", {

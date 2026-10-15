@@ -9,13 +9,16 @@
     type ProviderKind,
   } from "$lib/api";
   import { PROVIDERS, buildConfig, missingFields, providerDef } from "$lib/providers";
+  import PasswordInput from "./PasswordInput.svelte";
 
-  let { open, accounts, onclose, onadded }: {
+  let { open, account = null, accounts, onclose, onsaved }: {
     open: boolean;
+    /** The account whose settings are edited; a new one is added without it. */
+    account?: Account | null;
     /** Clouds an encrypted folder can be placed in. */
     accounts: Account[];
     onclose: () => void;
-    onadded: (account: Account) => void;
+    onsaved: (account: Account) => void;
   } = $props();
 
   const OAUTH_HELP: Record<OAuthService, { steps: string; secretRequired: boolean }> = {
@@ -46,6 +49,9 @@
   let waiting = $state(false);
   let crypt = $state<CryptFolder>(emptyCrypt());
   let repeat = $state("");
+  /** Settings of the edited account as loaded, to tell whether they changed. */
+  let loadedConfig = $state("");
+  let loading = $state(false);
 
   function emptyCrypt(): CryptFolder {
     return { base: "", root: "/Encrypted", password: "", salt: "", encrypt_names: true };
@@ -58,16 +64,52 @@
   const browserMode = $derived(service !== null && !manual);
   const missing = $derived(missingFields(def, values));
 
+  const editing = $derived(account !== null);
+
   $effect(() => {
     if (open && !dialog.open) {
-      name = "";
       error = "";
-      selectKind("yandex");
+      if (account) {
+        loadSettings(account);
+      } else {
+        name = "";
+        selectKind("yandex");
+      }
       dialog.showModal();
     } else if (!open && dialog.open) {
       dialog.close();
     }
   });
+
+  /** Fills the form with the stored settings of `target`. */
+  async function loadSettings(target: Account) {
+    kind = target.kind;
+    name = target.name;
+    values = {};
+    loadedConfig = "";
+    // Stored tokens are shown as fields; signing in again is one click away.
+    manual = true;
+    if (target.kind === "google" || target.kind === "yandex") loadOAuthApp(target.kind);
+    if (target.kind === "crypt") return;
+    loading = true;
+    try {
+      const config = await api.accountConfig(target.id);
+      if (account?.id !== target.id || !config) return;
+      const def = providerDef(target.kind);
+      const loaded: Record<string, string | boolean> = {};
+      for (const field of def.fields) {
+        const value = config[field.key];
+        if (typeof value === "boolean") loaded[field.key] = value;
+        else if (value !== undefined && value !== null) loaded[field.key] = String(value);
+      }
+      values = loaded;
+      loadedConfig = JSON.stringify(buildConfig(def, loaded));
+    } catch (err) {
+      error = errorText(err);
+    } finally {
+      loading = false;
+    }
+  }
 
   async function selectKind(next: ProviderKind) {
     kind = next;
@@ -78,38 +120,53 @@
       crypt = { ...emptyCrypt(), base: clouds[0]?.id ?? "" };
       repeat = "";
     }
-    if (next === "google" || next === "yandex") {
-      app = { client_id: "", client_secret: "" };
-      hasBuiltin = false;
-      useCustom = false;
-      const apps = await api.oauthApps(next).catch(() => null);
-      if (kind !== next) return;
-      if (apps?.custom) app = apps.custom;
-      hasBuiltin = apps?.builtin ?? false;
-      useCustom = !hasBuiltin || apps?.custom != null;
-    }
+    if (next === "google" || next === "yandex") await loadOAuthApp(next);
+  }
+
+  /** Which OAuth app a browser sign-in to `service` uses by default. */
+  async function loadOAuthApp(service: OAuthService) {
+    app = { client_id: "", client_secret: "" };
+    hasBuiltin = false;
+    useCustom = false;
+    const apps = await api.oauthApps(service).catch(() => null);
+    if (kind !== service) return;
+    if (apps?.custom) app = apps.custom;
+    hasBuiltin = apps?.builtin ?? false;
+    useCustom = !hasBuiltin || apps?.custom != null;
   }
 
   async function submit(event: SubmitEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (busy || loading) return;
     error = "";
     if (browserMode && service) {
       await signIn(service);
       return;
     }
-    if (kind === "crypt") {
+    if (kind === "crypt" && !account) {
       await addCrypt();
       return;
     }
-    if (missing.length) {
+    if (kind !== "crypt" && missing.length) {
       error = `Заполните: ${missing.join(", ")}`;
+      return;
+    }
+    if (account && !name.trim()) {
+      error = "Укажите название.";
       return;
     }
     busy = true;
     try {
-      const account = await api.addAccount(name.trim() || def.title, buildConfig(def, values));
-      onadded(account);
+      const config = kind === "crypt" ? null : buildConfig(def, values);
+      const saved = account
+        ? // Only changed credentials are checked against the cloud.
+          await api.updateAccount(
+            account.id,
+            name.trim(),
+            config && JSON.stringify(config) !== loadedConfig ? config : null,
+          )
+        : await api.addAccount(name.trim() || def.title, config!);
+      onsaved(saved);
     } catch (err) {
       error = errorText(err);
     } finally {
@@ -130,8 +187,8 @@
     busy = true;
     waiting = true;
     try {
-      const account = await api.oauthSignIn(service, useCustom ? app : null, name);
-      onadded(account);
+      const saved = await api.oauthSignIn(service, useCustom ? app : null, name, account?.id ?? null);
+      onsaved(saved);
     } catch (err) {
       const text = errorText(err);
       if (!text.includes("Sign-in cancelled")) error = text;
@@ -151,11 +208,11 @@
     busy = true;
     try {
       const root = crypt.root.trim();
-      const account = await api.addCryptFolder(name.trim() || `${base.name} · ${root} 🔒`, {
+      const saved = await api.addCryptFolder(name.trim() || `${base.name} · ${root} 🔒`, {
         ...crypt,
         root,
       });
-      onadded(account);
+      onsaved(saved);
     } catch (err) {
       error = errorText(err);
     } finally {
@@ -178,22 +235,24 @@
   }}
 >
   <form onsubmit={submit}>
-    <h2>Новый аккаунт</h2>
+    <h2>{editing ? "Настройки аккаунта" : "Новый аккаунт"}</h2>
 
-    <div class="kinds" role="radiogroup" aria-label="Тип облака">
-      {#each PROVIDERS as p (p.kind)}
-        <button
-          type="button"
-          role="radio"
-          aria-checked={p.kind === kind}
-          class:active={p.kind === kind}
+    {#if editing}
+      <p class="kind-fixed">{def.title}</p>
+    {:else}
+      <label>
+        <span>Тип</span>
+        <select
+          value={kind}
+          onchange={(e) => selectKind(e.currentTarget.value as ProviderKind)}
           disabled={busy}
-          onclick={() => selectKind(p.kind)}
         >
-          {p.title}
-        </button>
-      {/each}
-    </div>
+          {#each PROVIDERS as p (p.kind)}
+            <option value={p.kind}>{p.title}</option>
+          {/each}
+        </select>
+      </label>
+    {/if}
 
     {#if waiting}
       <div class="waiting">
@@ -205,19 +264,29 @@
       </div>
     {:else}
       <p class="help">
-        {browserMode ? `Вход через браузер: вы разрешите доступ на странице ${def.title}.` : def.help}
+        {#if browserMode}
+          {editing ? "Войдите заново, если доступ отозван или истёк: " : "Вход через браузер: "}вы разрешите
+          доступ на странице {def.title}.
+        {:else if editing && kind === "crypt"}
+          Можно изменить название. Пароль и папку шифрования изменить нельзя: для этого создайте новую
+          зашифрованную папку.
+        {:else}
+          {def.help}
+        {/if}
       </p>
 
       <label>
         <span>Название</span>
         <input
           bind:value={name}
-          placeholder={browserMode ? "По умолчанию — e-mail или логин" : def.title}
+          placeholder={editing ? "" : browserMode ? "По умолчанию — e-mail или логин" : def.title}
           disabled={busy}
         />
       </label>
 
-      {#if kind === "crypt"}
+      {#if kind === "crypt" && editing}
+        <!-- Only the name of an encrypted folder can be changed. -->
+      {:else if kind === "crypt"}
         {#if !clouds.length}
           <p class="error">Сначала подключите облако, в котором будет лежать папка.</p>
         {:else}
@@ -235,11 +304,11 @@
           </label>
           <label>
             <span>Пароль *</span>
-            <input type="password" bind:value={crypt.password} autocomplete="new-password" disabled={busy} />
+            <PasswordInput bind:value={crypt.password} autocomplete="new-password" disabled={busy} />
           </label>
           <label>
             <span>Пароль ещё раз *</span>
-            <input type="password" bind:value={repeat} autocomplete="new-password" disabled={busy} />
+            <PasswordInput bind:value={repeat} autocomplete="new-password" disabled={busy} />
           </label>
           <label class="check">
             <input type="checkbox" bind:checked={crypt.encrypt_names} disabled={busy} />
@@ -253,7 +322,7 @@
             </p>
             <label>
               <span>Соль (password2 в rclone), если задана</span>
-              <input type="password" bind:value={crypt.salt} autocomplete="off" disabled={busy} />
+              <PasswordInput bind:value={crypt.salt} disabled={busy} />
             </label>
           </details>
           <p class="warning">
@@ -282,13 +351,7 @@
             </label>
             <label>
               <span>Client secret{OAUTH_HELP[service].secretRequired ? " *" : " (не обязателен)"}</span>
-              <input
-                type="password"
-                bind:value={app.client_secret}
-                autocomplete="off"
-                spellcheck="false"
-                disabled={busy}
-              />
+              <PasswordInput bind:value={app.client_secret} disabled={busy} />
             </label>
           {/if}
         </div>
@@ -307,15 +370,27 @@
           {:else}
             <label>
               <span>{field.label}{field.optional ? "" : " *"}</span>
-              <input
-                type={field.type ?? "text"}
-                placeholder={field.placeholder}
-                value={(values[field.key] as string) ?? ""}
-                oninput={(e) => (values[field.key] = e.currentTarget.value)}
-                autocomplete="off"
-                spellcheck="false"
-                disabled={busy}
-              />
+              {#if field.type === "password"}
+                <PasswordInput
+                  value={(values[field.key] as string) ?? ""}
+                  placeholder={field.placeholder}
+                  oninput={(v) => (values[field.key] = v)}
+                  disabled={busy || loading}
+                />
+              {:else}
+                <input
+                  type={field.type ?? "text"}
+                  placeholder={field.placeholder}
+                  value={(values[field.key] as string) ?? ""}
+                  oninput={(e) => (values[field.key] = e.currentTarget.value)}
+                  autocomplete="off"
+                  spellcheck="false"
+                  disabled={busy || loading}
+                />
+              {/if}
+              {#if field.hint}
+                <span class="help small">{field.hint}</span>
+              {/if}
             </label>
           {/if}
         {/each}
@@ -323,7 +398,7 @@
 
       {#if service}
         <button type="button" class="link" onclick={() => ((manual = !manual), (error = ""))} disabled={busy}>
-          {manual ? "Войти через браузер" : "Ввести токен вручную"}
+          {manual ? (editing ? "Войти заново через браузер" : "Войти через браузер") : "Ввести токен вручную"}
         </button>
       {/if}
     {/if}
@@ -341,7 +416,15 @@
       {:else}
         <button type="button" class="btn" onclick={close} disabled={busy}>Отмена</button>
         <button type="submit" class="btn primary" disabled={busy}>
-          {busy ? "Проверка…" : browserMode ? "Войти через браузер" : kind === "crypt" ? "Создать" : "Подключить"}
+          {busy
+            ? "Проверка…"
+            : browserMode
+              ? "Войти через браузер"
+              : editing
+                ? "Сохранить"
+                : kind === "crypt"
+                  ? "Создать"
+                  : "Подключить"}
         </button>
       {/if}
     </footer>
@@ -377,27 +460,9 @@
     font-weight: 600;
   }
 
-  .kinds {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-
-  .kinds button {
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    background: var(--surface);
-  }
-
-  .kinds button:hover:not(:disabled) {
-    background: var(--hover);
-  }
-
-  .kinds button.active {
-    border-color: var(--accent);
-    background: var(--selected);
+  .kind-fixed {
+    margin: 0;
+    font-weight: 600;
   }
 
   .help {

@@ -11,9 +11,11 @@
   import { transfers } from "$lib/transfers.svelte";
   import AccountList from "$lib/components/AccountList.svelte";
   import AccountMenu from "$lib/components/AccountMenu.svelte";
-  import AddAccountDialog from "$lib/components/AddAccountDialog.svelte";
+  import AccountDialog from "$lib/components/AccountDialog.svelte";
+  import AccountsDialog from "$lib/components/AccountsDialog.svelte";
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
+  import ShareDialog from "$lib/components/ShareDialog.svelte";
   import Icon from "$lib/components/Icon.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
 
@@ -40,6 +42,9 @@
   let loaded = $state(false);
   let selectedId = $state<string | null>(null);
   let adding = $state(false);
+  /** The account whose settings dialog is open. */
+  let editing = $state<Account | null>(null);
+  let managing = $state(false);
   let notice = $state("");
   let busy = $state("");
   /** A message about a finished action, hidden after a while. */
@@ -59,6 +64,8 @@
   let localPath = $state(stored(KEY_LOCAL) ?? "");
   /** Files of the cloud folder being previewed and where the preview starts. */
   let previewing = $state<{ files: Entry[]; start: number } | null>(null);
+  /** Cloud items the link settings dialog is open for. */
+  let sharing = $state<Entry[] | null>(null);
   /** Pane that files dragged from Explorer are currently over. */
   let externalOver = $state<string | null>(null);
 
@@ -66,6 +73,14 @@
 
   function describe(items: Entry[]) {
     return items.length === 1 ? `«${items[0].name}»` : `выбранные объекты (${items.length})`;
+  }
+
+  function showLinks(links: string[]) {
+    showInfo(
+      links.length === 1
+        ? `Ссылка скопирована: ${links[0]}`
+        : `Ссылки скопированы в буфер обмена (${links.length})`,
+    );
   }
 
   function cloudOps(account: Account): PaneOps {
@@ -80,18 +95,14 @@
 Файлы удаляются безвозвратно, минуя корзину облака.`,
       deleteLabel: "Удалить",
       ...(providerDef(account.kind).share && {
-        share: async (items) => {
-          const links = await api.cloudShare(account.id, items);
-          showInfo(
-            links.length === 1
-              ? `Ссылка скопирована: ${links[0]}`
-              : `Ссылки скопированы в буфер обмена (${links.length})`,
-          );
-        },
+        share: async (items) => showLinks(await api.cloudShare(account.id, items)),
         unshare: async (items) => {
           await api.cloudUnshare(account.id, items);
           showInfo(`Доступ по ссылке закрыт: ${describe(items)}`);
         },
+      }),
+      ...(providerDef(account.kind).shareOptions && {
+        shareWithOptions: (items) => (sharing = items),
       }),
     };
   }
@@ -155,12 +166,41 @@
     adding = false;
   }
 
+  function saved(account: Account) {
+    if (!editing) {
+      added(account);
+      return;
+    }
+    accounts = accounts.map((a) => (a.id === account.id ? account : a));
+    editing = null;
+    // New credentials may show other files.
+    if (selectedId === account.id) cloudPane?.navigate(cloudPath);
+  }
+
+  /** Shows the new order at once and goes back to the old one if saving fails. */
+  async function reorderAccounts(ids: string[]) {
+    const before = accounts;
+    accounts = ids
+      .map((id) => before.find((a) => a.id === id))
+      .filter((a) => a !== undefined);
+    try {
+      await api.reorderAccounts(ids);
+    } catch (err) {
+      accounts = before;
+      throw err;
+    }
+  }
+
+  async function removeAccount(account: Account) {
+    await api.removeAccount(account.id);
+    accounts = accounts.filter((a) => a.id !== account.id);
+    if (selectedId === account.id && accounts[0]) selectAccount(accounts[0]);
+    else if (!accounts.length) selectedId = null;
+  }
+
   async function remove(account: Account) {
     try {
-      await api.removeAccount(account.id);
-      accounts = accounts.filter((a) => a.id !== account.id);
-      if (selectedId === account.id && accounts[0]) selectAccount(accounts[0]);
-      else if (!accounts.length) selectedId = null;
+      await removeAccount(account);
     } catch (err) {
       notice = errorText(err);
     }
@@ -338,6 +378,8 @@
                 current={selected}
                 onselect={selectAccount}
                 onadd={() => (adding = true)}
+                onedit={(a) => (editing = a)}
+                onmanage={() => (managing = true)}
                 onremove={remove}
               />
             {/snippet}
@@ -361,6 +403,8 @@
               selectedId={null}
               onselect={selectAccount}
               onadd={() => (adding = true)}
+              onedit={(a) => (editing = a)}
+              onmanage={() => (managing = true)}
               onremove={remove}
             />
           {:else}
@@ -443,7 +487,42 @@
   />
 {/if}
 
-<AddAccountDialog open={adding} {accounts} onclose={() => (adding = false)} onadded={added} />
+{#if selected}
+  {@const account = selected}
+  <ShareDialog
+    entries={sharing}
+    onclose={() => {
+      sharing = null;
+      cloudPane?.focus();
+    }}
+    onshare={async (options) => {
+      if (!sharing) return;
+      showLinks(await api.cloudShare(account.id, sharing, options));
+      sharing = null;
+    }}
+  />
+{/if}
+
+<AccountsDialog
+  open={managing}
+  {accounts}
+  onclose={() => (managing = false)}
+  onadd={() => (adding = true)}
+  onedit={(a) => (editing = a)}
+  onremove={removeAccount}
+  onreorder={reorderAccounts}
+/>
+
+<AccountDialog
+  open={adding || editing !== null}
+  account={editing}
+  {accounts}
+  onclose={() => {
+    adding = false;
+    editing = null;
+  }}
+  onsaved={saved}
+/>
 
 <style>
   main {

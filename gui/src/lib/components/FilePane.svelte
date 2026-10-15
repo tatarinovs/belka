@@ -17,6 +17,8 @@
     reveal?(path: string): void;
     /** Opens access by link and copies the links; set where the cloud supports it. */
     share?(entries: Entry[]): Promise<void>;
+    /** Asks for a password and expiry date, then shares; set where the cloud supports them. */
+    shareWithOptions?(entries: Entry[]): void;
     /** Closes access by link. */
     unshare?(entries: Entry[]): Promise<void>;
   }
@@ -471,13 +473,16 @@
       });
     }
     if (items.length) items.push("separator");
-    const { share, unshare } = ops ?? {};
+    const { share, shareWithOptions, unshare } = ops ?? {};
     if (picked.length && share && unshare) {
       items.push({
         label: picked.length === 1 ? "Поделиться ссылкой" : "Поделиться ссылками",
         icon: "link",
         action: () => operation("Создание ссылки…", () => share(picked)),
       });
+      if (shareWithOptions) {
+        items.push({ label: "Ссылка с паролем или сроком…", action: () => shareWithOptions(picked) });
+      }
       items.push({
         label: "Закрыть доступ по ссылке",
         action: () => operation("Закрытие доступа…", () => unshare(picked)),
@@ -528,7 +533,8 @@
 
 <svelte:window onpointermove={pointermove} onpointerup={pointerup} />
 
-<section data-pane={id} class:active>
+<!-- Any click or focus inside the pane makes it the active one. -->
+<section data-pane={id} class:active onpointerdowncapture={onactivate} onfocusin={onactivate}>
   <div class="toolbar">
     {@render leading?.()}
     <button class="icon-btn" title="Вверх (Backspace)" onclick={goUp} disabled={listing?.parent == null}>
@@ -565,7 +571,6 @@
     tabindex="0"
     aria-busy={loading}
     {onkeydown}
-    onfocus={onactivate}
     bind:this={grid}
   >
     <div class="head" role="row">

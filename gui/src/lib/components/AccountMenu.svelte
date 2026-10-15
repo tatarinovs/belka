@@ -9,12 +9,16 @@
     current,
     onselect,
     onadd,
+    onedit,
+    onmanage,
     onremove,
   }: {
     accounts: Account[];
     current: Account;
     onselect: (account: Account) => void;
     onadd: () => void;
+    onedit: (account: Account) => void;
+    onmanage: () => void;
     onremove: (account: Account) => void;
   } = $props();
 
@@ -47,6 +51,14 @@
         onadd={() => {
           open = false;
           onadd();
+        }}
+        onedit={(a) => {
+          open = false;
+          onedit(a);
+        }}
+        onmanage={() => {
+          open = false;
+          onmanage();
         }}
         {onremove}
       />
@@ -100,6 +112,7 @@
   .badge[data-kind="google"] { background: #1e8e3e; }
   .badge[data-kind="webdav"] { background: #7c4dcc; }
   .badge[data-kind="s3"] { background: #c77700; }
+  .badge[data-kind="synology"] { background: #2f6f9f; }
   .badge[data-kind="crypt"] { background: #455a64; }
 
   .popover {

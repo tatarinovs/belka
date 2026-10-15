@@ -8,12 +8,16 @@
     selectedId,
     onselect,
     onadd,
+    onedit,
+    onmanage,
     onremove,
   }: {
     accounts: Account[];
     selectedId: string | null;
     onselect: (account: Account) => void;
     onadd: () => void;
+    onedit: (account: Account) => void;
+    onmanage: () => void;
     onremove: (account: Account) => void;
   } = $props();
 
@@ -23,9 +27,14 @@
 <div class="accounts">
   <header>
     <span>Аккаунты</span>
-    <button class="icon-btn" title="Добавить аккаунт" onclick={onadd}>
-      <Icon name="plus" />
-    </button>
+    <span class="tools">
+      <button class="icon-btn" title="Управление аккаунтами" onclick={onmanage}>
+        <Icon name="settings" />
+      </button>
+      <button class="icon-btn" title="Добавить аккаунт" onclick={onadd}>
+        <Icon name="plus" />
+      </button>
+    </span>
   </header>
 
   <ul>
@@ -49,8 +58,11 @@
               <span class="kind">{providerDef(account.kind).title}</span>
             </span>
           </button>
+          <button class="icon-btn row-tool" title="Настройки аккаунта" onclick={() => onedit(account)}>
+            <Icon name="settings" size={14} />
+          </button>
           <button
-            class="icon-btn remove"
+            class="icon-btn row-tool remove"
             title="Удалить аккаунт"
             onclick={() => (confirmingId = account.id)}
           >
@@ -157,15 +169,24 @@
   .badge[data-kind="google"] { background: #1e8e3e; }
   .badge[data-kind="webdav"] { background: #7c4dcc; }
   .badge[data-kind="s3"] { background: #c77700; }
+  .badge[data-kind="synology"] { background: #2f6f9f; }
   .badge[data-kind="crypt"] { background: #455a64; }
 
-  .remove {
+  .tools {
+    display: flex;
+    gap: 2px;
+  }
+
+  .row-tool {
     visibility: hidden;
+  }
+
+  .remove {
     margin-right: 4px;
   }
 
-  li:hover .remove,
-  .remove:focus-visible {
+  li:hover .row-tool,
+  .row-tool:focus-visible {
     visibility: visible;
   }
 

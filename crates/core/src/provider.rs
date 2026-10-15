@@ -4,6 +4,7 @@
 use crate::storage::google::{GoogleAuth, GoogleDriveProvider};
 use crate::storage::mailru::MailruProvider;
 use crate::storage::s3::S3Provider;
+use crate::storage::synology::SynologyProvider;
 use crate::storage::webdav::WebDavProvider;
 use crate::storage::yandex::YandexDiskProvider;
 use crate::storage::StorageProvider;
@@ -41,6 +42,22 @@ pub enum ProviderConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
     },
+    /// Synology DSM through the File Station API.
+    Synology {
+        /// A host, or a URL of DSM.
+        url: String,
+        /// Overrides the port of `url`; by default DSM's 5000 or 5001.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// A bare host is reached over HTTPS.
+        #[serde(default)]
+        https: bool,
+        user: String,
+        password: String,
+        /// Accept any HTTPS certificate, such as DSM's self-signed one.
+        #[serde(default)]
+        insecure: bool,
+    },
 }
 
 impl ProviderConfig {
@@ -52,6 +69,7 @@ impl ProviderConfig {
             Self::Google(_) => "google",
             Self::Webdav { .. } => "webdav",
             Self::S3 { .. } => "s3",
+            Self::Synology { .. } => "synology",
         }
     }
 
@@ -88,6 +106,16 @@ impl ProviderConfig {
                 access_key_id,
                 secret_access_key,
                 region.unwrap_or_else(|| DEFAULT_S3_REGION.to_string()),
+            )?),
+            Self::Synology {
+                url,
+                port,
+                https,
+                user,
+                password,
+                insecure,
+            } => Box::new(SynologyProvider::new(
+                &url, port, https, insecure, user, password,
             )?),
         })
     }

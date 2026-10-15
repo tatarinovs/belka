@@ -2,6 +2,7 @@ pub mod crypt;
 pub mod google;
 pub mod mailru;
 pub mod s3;
+pub mod synology;
 pub mod webdav;
 pub mod yandex;
 
@@ -10,7 +11,7 @@ use crate::progress::Progress;
 use crate::utils::path::{join_remote, split_remote};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -105,9 +106,41 @@ pub trait StorageProvider: Send + Sync {
         bail!("{} cannot share '{remote_path}' by link", self.name())
     }
 
+    /// Shares by a link with exactly these settings, replacing an existing
+    /// link. Providers without link settings only accept empty options.
+    async fn share_with(
+        &self,
+        remote_path: &str,
+        is_dir: bool,
+        options: &ShareOptions,
+    ) -> Result<String> {
+        if !options.is_empty() {
+            bail!(
+                "{} does not support link passwords or expiry dates",
+                self.name()
+            );
+        }
+        self.share(remote_path, is_dir).await
+    }
+
     /// Closes access by link. Succeeds if the item was not shared.
     async fn unshare(&self, remote_path: &str, _is_dir: bool) -> Result<()> {
         bail!("{} cannot share '{remote_path}' by link", self.name())
+    }
+}
+
+/// Settings of a link created by [`StorageProvider::share_with`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShareOptions {
+    /// Password asked when the link is opened.
+    pub password: Option<String>,
+    /// The last day the link works.
+    pub expires: Option<NaiveDate>,
+}
+
+impl ShareOptions {
+    pub fn is_empty(&self) -> bool {
+        self.password.is_none() && self.expires.is_none()
     }
 }
 
