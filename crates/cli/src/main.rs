@@ -1,6 +1,8 @@
+mod clipboard;
 mod commands;
 mod config;
 mod login;
+mod netpath;
 mod notify;
 mod remote;
 
@@ -40,7 +42,8 @@ Examples:\n  \
 belka upload D:\\Backups yandex:/Backups --keep-last 7\n  \
 belka upload ./site \"My NAS:/www\" --delete-extra --exclude '*.tmp'\n  \
 belka restore google:/Backups/db ./restored\n  \
-belka mirror webdav:/Mirror --urls urls.txt",
+belka mirror webdav:/Mirror --urls urls.txt\n  \
+belka share Z:\\disk\\photos.7z --expires 7",
     after_help = "Exit codes: 0 success, 1 fatal error, 2 invalid arguments, 3 finished with failed files, 130 interrupted."
 )]
 struct Cli {
@@ -93,6 +96,8 @@ enum Command {
         #[arg(short = 'R', long)]
         recursive: bool,
     },
+    /// Share files or folders by public link and copy the links to the clipboard
+    Share(ShareArgs),
     /// List the accounts that SOURCE can name
     Accounts,
     /// The backup tasks of the desktop app
@@ -168,6 +173,23 @@ struct UploadArgs {
     /// runs remember
     #[arg(long)]
     no_index: bool,
+
+    /// After a successful upload, share the file (or the cloud folder) and copy the link
+    #[arg(long)]
+    share: bool,
+
+    /// With --share: the link works for N days, or until a date (YYYY-MM-DD)
+    #[arg(long, value_name = "DAYS|DATE", value_parser = commands::share::parse_expiry, requires = "share")]
+    expires: Option<chrono::NaiveDate>,
+
+    /// With --share: ask this password when the link is opened
+    // No `requires`: a password from the environment must not break uploads.
+    #[arg(long, env = "BELKA_SHARE_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+
+    /// With --share: only print the link
+    #[arg(long, requires = "share")]
+    no_clipboard: bool,
 }
 
 #[derive(Args, Debug)]
@@ -198,6 +220,33 @@ struct MirrorArgs {
     /// Regex selecting which GitHub release assets to mirror
     #[arg(long, value_name = "REGEX", env = "CLOUD_ASSET_FILTER", default_value = DEFAULT_ASSET_FILTER)]
     assets: String,
+}
+
+#[derive(Args, Debug)]
+struct ShareArgs {
+    /// SOURCE:PATH, or a file on a Synology network share (\\NAS\share\... or a mapped drive)
+    #[arg(required = true, value_name = "TARGET")]
+    targets: Vec<String>,
+
+    /// The link works for N days, or until a date (YYYY-MM-DD); replaces an existing link
+    #[arg(long, value_name = "DAYS|DATE", value_parser = commands::share::parse_expiry)]
+    expires: Option<chrono::NaiveDate>,
+
+    /// Ask this password when the link is opened; replaces an existing link
+    #[arg(long, env = "BELKA_SHARE_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+
+    /// Close access by link instead
+    #[arg(long, conflicts_with = "expires")]
+    unshare: bool,
+
+    /// The Synology account of a network share, when it cannot be found by host
+    #[arg(long, value_name = "NAME")]
+    account: Option<String>,
+
+    /// Only print the links
+    #[arg(long)]
+    no_clipboard: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -235,7 +284,10 @@ async fn main() -> ExitCode {
         config::print_providers();
         return ExitCode::SUCCESS;
     }
-    let to_stderr = matches!(cli.command, Command::Login { .. } | Command::Ls { .. } | Command::Accounts);
+    let to_stderr = matches!(
+        cli.command,
+        Command::Login { .. } | Command::Ls { .. } | Command::Accounts | Command::Share(_)
+    );
     init_logging(cli.verbose, cli.quiet, to_stderr);
     match env_loaded {
         Ok(Some(path)) => debug!("Loaded environment from {}", path.display()),
@@ -274,6 +326,23 @@ async fn dispatch(cli: Cli) -> Result<u8> {
         Command::Login { provider } => login::run(provider).await.map(|()| 0),
         Command::Providers => unreachable!("handled before logging starts"),
         Command::Accounts => commands::accounts::run(&mut accounts).map(|()| 0),
+        Command::Share(args) => {
+            let opts = commands::share::Options {
+                share: belka_core::storage::ShareOptions {
+                    password: args.password.filter(|p| !p.is_empty()),
+                    expires: args.expires,
+                },
+                unshare: args.unshare,
+                account: args.account,
+                clipboard: !args.no_clipboard,
+            };
+            let failed = commands::share::run(&mut accounts, &args.targets, &opts).await?;
+            Ok(match failed {
+                0 => 0,
+                n if n == args.targets.len() as u64 => EXIT_FATAL,
+                _ => EXIT_PARTIAL,
+            })
+        }
         Command::Ls { remote, recursive } => {
             let (provider, _) = accounts.provider(&remote.source)?;
             commands::ls::run(&*provider, &remote.path, recursive)
@@ -341,7 +410,16 @@ async fn dispatch(cli: Cli) -> Result<u8> {
                 keep_days: args.keep_days,
                 filter: Filter::new(&args.include, &args.exclude, args.skip_hidden),
                 index: !args.no_index,
+                share: args.share.then(|| belka_core::storage::ShareOptions {
+                    password: args.password.filter(|p| !p.is_empty()),
+                    expires: args.expires,
+                }),
+                clipboard: !args.no_clipboard,
             };
+            // Uploading for nothing is no way to learn the link cannot be made.
+            if let Some(share) = &opts.share {
+                provider.check_share(share)?;
+            }
             banner(&*provider, &shown, opts.dry_run);
             let work = commands::upload::run(&*provider, &name, &args.local, &target, now, &opts);
             reported(cli.notify_on, opts.dry_run, Mode::Upload, shown, work).await
@@ -593,6 +671,8 @@ mod tests {
         assert!(parse(&["upload", "d", "y:/B", "--keep-last", "0"]).is_err());
         assert!(parse(&["upload", "d", "y:/B", "--keep-days", "7", "--keep-last", "2"]).is_ok());
         assert!(parse(&["upload", "d", "y:/B", "--delete-extra", "--keep-last", "2"]).is_err());
+        assert!(parse(&["upload", "d", "y:/B", "--share", "--expires", "7"]).is_ok());
+        assert!(parse(&["upload", "d", "y:/B", "--expires", "7"]).is_err());
     }
 
     #[test]
@@ -601,6 +681,20 @@ mod tests {
         assert!(parse(&["task", "run", "--due"]).is_ok());
         assert!(parse(&["task", "run", "a", "--all"]).is_err());
         assert!(parse(&["-v", "task", "run", "Камера"]).is_ok());
+    }
+
+    #[test]
+    fn share_takes_targets_and_link_settings() {
+        let cli = parse(&["share", r"Z:\disk\a.7z", "NAS:/docs/b", "--expires", "7"]).unwrap();
+        let Command::Share(args) = cli.command else {
+            panic!("not share");
+        };
+        assert_eq!(args.targets.len(), 2);
+        assert!(args.expires.is_some());
+        assert!(parse(&["share"]).is_err());
+        assert!(parse(&["share", "x:/a", "--expires", "0"]).is_err());
+        assert!(parse(&["share", "x:/a", "--unshare", "--expires", "7"]).is_err());
+        assert!(parse(&["share", "x:/a", "--unshare", "--password", "p"]).is_ok());
     }
 
     #[test]

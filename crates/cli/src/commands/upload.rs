@@ -1,12 +1,15 @@
 //! `belka upload LOCAL SOURCE:PATH`: copies a file or a folder into a cloud
 //! folder, skipping what is already there; then optionally deletes what is
-//! no longer local (`--delete-extra`) or old dated backups (`--keep-*`).
+//! no longer local (`--delete-extra`) or old dated backups (`--keep-*`),
+//! and shares what was uploaded (`--share`).
 
 use super::rotate::{self, RotateOptions};
 use super::{log_totals, Stats};
 use crate::remote::Target;
 use anyhow::{Context, Result};
+use belka_core::storage::ShareOptions;
 use belka_core::sync::{self, Filter, Index, UploadOptions};
+use belka_core::utils::path::join_remote;
 use belka_core::StorageProvider;
 use chrono::NaiveDateTime;
 use std::collections::HashSet;
@@ -26,6 +29,9 @@ pub struct Options {
     pub filter: Filter,
     /// Remember what is uploaded, so unchanged files are not even read next time.
     pub index: bool,
+    /// After a successful upload, share what was uploaded with these settings.
+    pub share: Option<ShareOptions>,
+    pub clipboard: bool,
 }
 
 pub async fn run(
@@ -91,6 +97,18 @@ pub async fn run(
     stats.failed += tree.errors.len() as u64;
     log_totals("uploaded", &stats, started.elapsed(), opts.dry_run);
 
+    if let Some(share) = &opts.share {
+        if stats.failed > 0 {
+            warn!(
+                "Not shared: {} failure(s), the cloud copy may be incomplete",
+                stats.failed
+            );
+        } else if let Err(err) = share_uploaded(provider, local, remote_dir, share, opts).await {
+            error!("{err:#}");
+            stats.failed += 1;
+        }
+    }
+
     // A broken new backup must not cost the old good ones.
     let clean = opts.delete_extra || opts.keep_last.is_some() || opts.keep_days.is_some();
     if clean && stats.failed > 0 {
@@ -123,6 +141,33 @@ pub async fn run(
         }
     }
     Ok(stats)
+}
+
+/// Shares the uploaded file, or the cloud folder an uploaded folder went into.
+async fn share_uploaded(
+    provider: &dyn StorageProvider,
+    local: &Path,
+    remote_dir: &str,
+    share: &ShareOptions,
+    opts: &Options,
+) -> Result<()> {
+    let (path, is_dir) = match local.file_name().and_then(|n| n.to_str()) {
+        Some(name) if local.is_file() => (join_remote(remote_dir, name), false),
+        _ => (remote_dir.to_string(), true),
+    };
+    if opts.dry_run {
+        info!("Would share '{path}'");
+        return Ok(());
+    }
+    let link = super::share::link(provider, &path, is_dir, share)
+        .await
+        .with_context(|| format!("Failed to share '{path}'"))?;
+    info!("Link: {link}");
+    if opts.clipboard {
+        let name = path.rsplit('/').next().unwrap_or_default().to_string();
+        super::share::copy_links(&[(name, link)]);
+    }
+    Ok(())
 }
 
 /// The index of this source and destination, kept in the user's cache.

@@ -168,13 +168,15 @@ pub trait StorageProvider: Send + Sync {
         is_dir: bool,
         options: &ShareOptions,
     ) -> Result<String> {
-        if !options.is_empty() {
-            bail!(
-                "{} does not support link passwords or expiry dates",
-                self.name()
-            );
-        }
+        plain_links_only(self.name(), options)?;
         self.share(remote_path, is_dir).await
+    }
+
+    /// Fails if links with `options` cannot be made here at all; checked
+    /// before work done for the sake of the link, such as an upload.
+    /// Providers that share override it along with [`StorageProvider::share`].
+    fn check_share(&self, _options: &ShareOptions) -> Result<()> {
+        bail!("{} cannot share by link", self.name())
     }
 
     /// Closes access by link. Succeeds if the item was not shared.
@@ -196,6 +198,14 @@ impl ShareOptions {
     pub fn is_empty(&self) -> bool {
         self.password.is_none() && self.expires.is_none()
     }
+}
+
+/// [`StorageProvider::check_share`] of providers whose links have no settings.
+pub(crate) fn plain_links_only(provider: &str, options: &ShareOptions) -> Result<()> {
+    if !options.is_empty() {
+        bail!("{provider} does not support link passwords or expiry dates");
+    }
+    Ok(())
 }
 
 /// Trims a user-entered file or folder name and rejects ones that are empty,

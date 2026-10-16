@@ -2,7 +2,7 @@
 //! own API, which accepts the same app password.
 
 use super::webdav::WebDavProvider;
-use super::{RemoteFileInfo, StorageProvider, TokenCache};
+use super::{plain_links_only, RemoteFileInfo, ShareOptions, StorageProvider, TokenCache};
 use crate::client::{
     build_http_client, ensure_success, json_response, send, Sink, Source, API_TIMEOUT,
 };
@@ -178,6 +178,10 @@ impl StorageProvider for MailruProvider {
 
     async fn list_dir(&self, remote_dir: &str) -> Result<Vec<RemoteFileInfo>> {
         self.dav.list_dir(remote_dir).await
+    }
+
+    fn check_share(&self, options: &ShareOptions) -> Result<()> {
+        plain_links_only(self.name(), options)
     }
 
     async fn share(&self, remote_path: &str, _is_dir: bool) -> Result<String> {

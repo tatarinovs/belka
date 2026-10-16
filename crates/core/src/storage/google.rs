@@ -1,6 +1,9 @@
 //! Google Drive API v3 with resumable uploads.
 
-use super::{as_md5, parse_rfc3339, rename_target, RemoteFileInfo, StorageProvider, TokenCache};
+use super::{
+    as_md5, parse_rfc3339, plain_links_only, rename_target, RemoteFileInfo, ShareOptions,
+    StorageProvider, TokenCache,
+};
 use crate::client::{
     client_builder, download_into, ensure_success, http_error, json_response, pause_before_retry,
     send, source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT, MAX_ATTEMPTS,
@@ -643,6 +646,10 @@ impl StorageProvider for GoogleDriveProvider {
                 file.into_info(path)
             })
             .collect())
+    }
+
+    fn check_share(&self, options: &ShareOptions) -> Result<()> {
+        plain_links_only(self.name(), options)
     }
 
     async fn share(&self, remote_path: &str, is_dir: bool) -> Result<String> {

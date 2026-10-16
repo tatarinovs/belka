@@ -760,6 +760,10 @@ impl StorageProvider for SynologyProvider {
         Ok(items)
     }
 
+    fn check_share(&self, _options: &ShareOptions) -> Result<()> {
+        Ok(())
+    }
+
     async fn share(&self, remote_path: &str, _is_dir: bool) -> Result<String> {
         let path = normalize_remote_dir(remote_path);
         if let Some(link) = self.links_of(&path).await?.into_iter().next() {

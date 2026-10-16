@@ -3,6 +3,7 @@ pub mod ls;
 pub mod mirror;
 pub mod restore;
 pub mod rotate;
+pub mod share;
 pub mod task;
 pub mod upload;
 
