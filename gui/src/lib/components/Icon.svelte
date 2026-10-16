@@ -33,6 +33,9 @@
     sort: "M7 4v16m-3-3 3 3 3-3M14 6h6M14 12h4M14 18h2",
     checkAll: "M4 4h16v16H4zm4 8.5 3 3 5-6",
     external: "M14 4h6v6m0-6-9 9m7 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
+    clock: "M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+    play: "M8 5v14l11-7z",
+    stop: "M7 7h10v10H7z",
   } as const;
   export type IconName = keyof typeof PATHS;
 </script>

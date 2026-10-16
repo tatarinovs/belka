@@ -222,6 +222,10 @@ impl Source for EncryptedSource<'_> {
         encrypted_size(self.plain.len())
     }
 
+    fn modified(&self) -> Option<std::time::SystemTime> {
+        self.plain.modified()
+    }
+
     fn open_at(&self, offset: u64) -> Result<SourceReader> {
         let (block, skip, out) = match offset.checked_sub(HEADER_SIZE) {
             None => {

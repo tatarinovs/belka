@@ -6,9 +6,13 @@
 //! series (`db_*.sql.gz`), and every series is rotated on its own, so one
 //! folder can hold several kinds of backups. Volumes of a multi-volume archive
 //! (`.7z.001`, `.part01.rar`, `.z01`) make up one backup and are deleted together.
+//!
+//! Only the series this run wrote into are rotated: a dated file of some
+//! other kind in the folder (a report, a photo `IMG_20261015_…`) is never
+//! touched.
 
 use super::Stats;
-use crate::storage::{RemoteFileInfo, StorageProvider};
+use belka_core::{RemoteFileInfo, StorageProvider};
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use regex_lite::Regex;
@@ -22,7 +26,8 @@ pub struct RotateOptions {
     /// Keep backups dated within this many days, today included.
     pub keep_days: Option<u32>,
     pub dry_run: bool,
-    /// Names in the folder that must survive, such as what was just uploaded.
+    /// What this run wrote into the folder: these names survive, and only
+    /// their series are rotated.
     pub protect: HashSet<String>,
 }
 
@@ -122,7 +127,7 @@ fn group(items: Vec<RemoteFileInfo>) -> (BTreeMap<String, BTreeMap<String, Backu
     (series, undated)
 }
 
-/// The backups that no rule keeps.
+/// The backups that no rule keeps, in the series that hold a protected entry.
 fn select_expired(
     series: BTreeMap<String, BTreeMap<String, Backup>>,
     opts: &RotateOptions,
@@ -133,6 +138,14 @@ fn select_expired(
         .map(|days| today - Duration::days(i64::from(days.max(1)) - 1));
     let mut doomed = Vec::new();
     for (pattern, backups) in series {
+        let ours = backups
+            .values()
+            .flat_map(|b| &b.entries)
+            .any(|e| opts.protect.contains(&e.name));
+        if !ours {
+            debug!("Rotation: series '{pattern}' is not written by this run and is kept");
+            continue;
+        }
         let mut backups: Vec<Backup> = backups.into_values().collect();
         backups.sort_by(|a, b| b.when.cmp(&a.when).then_with(|| b.key.cmp(&a.key)));
         debug!(
@@ -284,12 +297,15 @@ mod tests {
         names
     }
 
+    /// Today's backups of the series in the tests are what the run wrote.
     fn opts(keep_last: Option<usize>, keep_days: Option<u32>) -> RotateOptions {
         RotateOptions {
             keep_last,
             keep_days,
             dry_run: false,
-            protect: HashSet::new(),
+            protect: ["db_2026-10-15.gz", "site_2026-10-08.7z.001", "2026-10-15"]
+                .map(String::from)
+                .into(),
         }
     }
 
@@ -331,5 +347,20 @@ mod tests {
         let mut o = opts(Some(1), None);
         o.protect.insert("a_2026-01-01.zip".into());
         assert!(expired(&["a_2026-01-01.zip", "a_2026-10-01.zip"], &o, "2026-10-15").is_empty());
+    }
+
+    #[test]
+    fn other_dated_files_are_never_touched() {
+        let names = [
+            "db_2026-10-14.gz",
+            "db_2026-10-15.gz",
+            "IMG_20250101_120000.jpg",
+            "IMG_20250102_120000.jpg",
+            "report_2025-01-01.pdf",
+        ];
+        assert_eq!(
+            expired(&names, &opts(Some(1), None), "2026-10-15"),
+            ["db_2026-10-14.gz"]
+        );
     }
 }

@@ -286,12 +286,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "belka-core",
+ "belka-store",
  "chrono",
  "clap",
  "dotenvy",
  "futures-util",
- "hex",
- "md-5",
  "percent-encoding",
  "regex-lite",
  "reqwest 0.12.28",
@@ -302,7 +301,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "walkdir",
 ]
 
 [[package]]
@@ -339,10 +337,13 @@ name = "belka-gui"
 version = "1.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "belka-core",
+ "belka-store",
  "chrono",
  "encoding_rs",
- "keyring",
+ "futures-util",
+ "jni",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -358,6 +359,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trash",
+]
+
+[[package]]
+name = "belka-store"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "belka-core",
+ "chrono",
+ "futures-util",
+ "keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

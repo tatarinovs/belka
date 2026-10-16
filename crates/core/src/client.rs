@@ -78,22 +78,29 @@ pub trait Source: Send + Sync {
 
     /// Reads the data from `offset` to the end.
     fn open_at(&self, offset: u64) -> Result<SourceReader>;
+
+    /// When the data was last changed, for providers that keep the date of
+    /// the original file instead of the time of the upload.
+    fn modified(&self) -> Option<SystemTime> {
+        None
+    }
 }
 
 /// A local file.
 pub struct FileSource {
     path: PathBuf,
     len: u64,
+    modified: Option<SystemTime>,
 }
 
 impl FileSource {
     pub fn new(path: &Path) -> Result<Self> {
-        let len = std::fs::metadata(path)
-            .with_context(|| format!("Failed to read metadata of '{}'", path.display()))?
-            .len();
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("Failed to read metadata of '{}'", path.display()))?;
         Ok(Self {
             path: path.to_owned(),
-            len,
+            len: meta.len(),
+            modified: meta.modified().ok(),
         })
     }
 }
@@ -109,6 +116,10 @@ impl Source for FileSource {
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("Failed to read '{}'", self.path.display()))?;
         Ok(Box::new(tokio::fs::File::from_std(file)))
+    }
+
+    fn modified(&self) -> Option<SystemTime> {
+        self.modified
     }
 }
 

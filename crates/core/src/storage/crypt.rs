@@ -143,6 +143,18 @@ impl StorageProvider for CryptProvider {
             .await
     }
 
+    async fn upload_new(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        let encrypted = EncryptedSource::new(source, self.cipher.clone())?;
+        self.inner
+            .upload_new(&encrypted, &self.inner_file(remote_path), progress)
+            .await
+    }
+
     async fn download_to(
         &self,
         remote_path: &str,

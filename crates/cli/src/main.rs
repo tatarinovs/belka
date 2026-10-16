@@ -1,26 +1,22 @@
+mod commands;
 mod config;
-mod format;
-mod hash;
 mod login;
-mod modes;
 mod notify;
+mod remote;
 
-use belka_core::{client, storage, utils};
-
-use anyhow::{bail, Context, Result};
-use chrono::NaiveDateTime;
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result};
+use belka_core::sync::{DownloadOptions, Filter};
+use clap::{Args, Parser, Subcommand};
+use commands::mirror::{MirrorOptions, DEFAULT_ASSET_FILTER};
+use commands::task::Selection;
+use commands::Stats;
 use config::ProviderKind;
-use modes::local_upload::UploadOptions;
-use modes::remote_urls::{MirrorOptions, UrlList, DEFAULT_ASSET_FILTER};
-use modes::restore::RestoreOptions;
-use modes::rotate::RotateOptions;
-use modes::Stats;
-use notify::{Notifier, NotifyOn, Report, Status};
+use notify::{Mode, Notifier, NotifyOn, Report, Status};
 use regex_lite::Regex;
-use std::collections::HashSet;
+use remote::{Accounts, Remote, Target};
+use std::future::Future;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -35,52 +31,35 @@ const EXIT_INTERRUPTED: u8 = 130;
 #[command(
     name = "belka",
     version,
-    about = "Uploads backups to cloud storage and mirrors GitHub releases (Yandex Disk, Mail.ru, Google Drive, WebDAV, S3)",
-    long_about = "Uploads a local file or directory to cloud storage, skipping files that are already \
-up to date. Without LOCAL_PATH, mirrors the URLs listed in urls.txt (GitHub repositories are resolved \
-to their latest release assets).\n\nCredentials are never passed on the command line: put them into a \
-.env file or environment variables (see --list-providers).",
+    about = "Backs up to cloud storage, restores from it and mirrors GitHub releases",
+    long_about = "Backs up to cloud storage, restores from it and mirrors GitHub releases.\n\n\
+A cloud location is SOURCE:PATH. SOURCE is a provider set up by environment variables \
+(yandex, mailru, google, webdav, s3, synology; see `belka providers`), an account of the \
+desktop app on this computer, or an account in the file given by --accounts.\n\n\
+Examples:\n  \
+belka upload D:\\Backups yandex:/Backups --keep-last 7\n  \
+belka upload ./site \"My NAS:/www\" --delete-extra --exclude '*.tmp'\n  \
+belka restore google:/Backups/db ./restored\n  \
+belka mirror webdav:/Mirror --urls urls.txt",
     after_help = "Exit codes: 0 success, 1 fatal error, 2 invalid arguments, 3 finished with failed files, 130 interrupted."
 )]
 struct Cli {
-    /// Local file or directory to upload (with --restore: folder to download into).
-    /// If omitted, mirrors URLs from urls.txt
-    #[arg(value_name = "LOCAL_PATH")]
-    local_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Command,
 
-    /// Cloud provider
-    #[arg(
-        short,
-        long,
-        env = "CLOUD_PROVIDER",
-        value_enum,
-        ignore_case = true,
-        default_value = "yandex"
-    )]
-    provider: ProviderKind,
+    /// Accounts exported from the app (a .belka file); its password is taken
+    /// from BELKA_ACCOUNTS_PASSWORD
+    #[arg(long, global = true, value_name = "FILE", env = "BELKA_ACCOUNTS")]
+    accounts: Option<PathBuf>,
 
-    /// Target folder in the cloud; {date}, {time} and {datetime} are replaced
-    /// with the current local date and time
-    #[arg(short, long, env = "CLOUD_REMOTE_DIR", default_value = "/Upload")]
-    remote: String,
+    /// Path to a .env file (default: ./.env, then .env next to the executable)
+    #[arg(long, global = true, value_name = "FILE")]
+    env_file: Option<PathBuf>,
 
-    /// Download the cloud folder (or file) given by --remote into LOCAL_PATH
-    #[arg(long, requires = "local_path", conflicts_with_all = ["clean", "keep_last", "keep_days"])]
-    restore: bool,
-
-    /// After a successful upload, keep only the N newest dated backups of every series
-    #[arg(long, value_name = "N", requires = "local_path",
-          value_parser = clap::value_parser!(u32).range(1..))]
-    keep_last: Option<u32>,
-
-    /// After a successful upload, keep dated backups of the last N days (today included)
-    #[arg(long, value_name = "N", requires = "local_path",
-          value_parser = clap::value_parser!(u32).range(1..))]
-    keep_days: Option<u32>,
-
-    /// When to send notifications to Telegram and the webhook (see --list-providers)
+    /// When to send notifications to Telegram and the webhook (see `belka providers`)
     #[arg(
         long,
+        global = true,
         value_name = "WHEN",
         env = "NOTIFY_ON",
         value_enum,
@@ -89,117 +68,175 @@ struct Cli {
     )]
     notify_on: NotifyOn,
 
-    /// Send a test message to the configured notification channels and exit
-    #[arg(long, conflicts_with_all = ["local_path", "login"])]
-    notify_test: bool,
+    /// Verbose (debug) output
+    #[arg(short, long, global = true, conflicts_with = "quiet")]
+    verbose: bool,
 
-    /// Path to a .env file (default: ./.env, then .env next to the executable)
-    #[arg(long, value_name = "FILE")]
-    env_file: Option<PathBuf>,
+    /// Only print warnings and errors
+    #[arg(short, long, global = true)]
+    quiet: bool,
+}
 
-    /// URL list: a local file or a cloud path [default: ./urls.txt, <exe dir>/urls.txt, <remote>/urls.txt, /urls.txt]
-    #[arg(long, value_name = "PATH", env = "CLOUD_URLS_FILE")]
-    urls_file: Option<PathBuf>,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Copy a local file or folder into a cloud folder, skipping what is already there
+    Upload(UploadArgs),
+    /// Download a cloud folder or file into a local folder
+    Restore(RestoreArgs),
+    /// Mirror GitHub releases and files by URL into a cloud folder
+    Mirror(MirrorArgs),
+    /// List a cloud folder (also a quick check that a source works)
+    Ls {
+        /// SOURCE:PATH
+        remote: Remote,
+        /// Also list subfolders
+        #[arg(short = 'R', long)]
+        recursive: bool,
+    },
+    /// List the accounts that SOURCE can name
+    Accounts,
+    /// The backup tasks of the desktop app
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+    /// Sign in to google or yandex through the browser and print the .env lines
+    Login {
+        #[arg(value_enum, ignore_case = true)]
+        provider: ProviderKind,
+    },
+    /// List the environment variables of every provider and notification channel
+    Providers,
+    /// Send a test message to the configured notification channels
+    NotifyTest,
+}
 
-    /// Delete everything in the target folder before uploading (keeps a cloud urls.txt)
-    #[arg(short = 'c', long = "clean", alias = "clean-remote")]
-    clean: bool,
-
-    /// Upload even if the remote file looks identical
-    #[arg(short = 'f', long)]
-    overwrite: bool,
-
-    /// Show what would be uploaded or deleted without changing anything
+#[derive(Args, Debug)]
+struct TransferArgs {
+    /// Show what would be transferred or deleted without changing anything
     #[arg(short = 'n', long)]
     dry_run: bool,
 
-    /// Number of files uploaded in parallel (local upload mode)
-    #[arg(short, long, env = "CLOUD_JOBS", default_value_t = 2,
+    /// Files transferred in parallel
+    #[arg(short, long, env = "CLOUD_JOBS", default_value_t = 3,
           value_parser = clap::value_parser!(u16).range(1..=32))]
     jobs: u16,
+}
+
+#[derive(Args, Debug)]
+struct UploadArgs {
+    /// Local file or folder
+    local: PathBuf,
+    /// SOURCE:PATH; {date}, {time} and {datetime} in PATH become the current date and time
+    remote: Remote,
+    #[command(flatten)]
+    transfer: TransferArgs,
+
+    /// Upload even what looks unchanged
+    #[arg(short = 'f', long)]
+    overwrite: bool,
+
+    /// Read every uploaded file's size (and MD5 where the cloud has it) back
+    #[arg(long)]
+    verify: bool,
+
+    /// After a successful upload, delete from the cloud folder what is not local
+    #[arg(long, conflicts_with_all = ["keep_last", "keep_days"])]
+    delete_extra: bool,
+
+    /// After a successful upload, keep only the N newest dated backups of every series written
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_last: Option<u32>,
+
+    /// After a successful upload, keep dated backups of the last N days (today included)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_days: Option<u32>,
+
+    /// Upload only files matching the pattern (*, **, ?; repeatable)
+    #[arg(long, value_name = "PATTERN")]
+    include: Vec<String>,
+
+    /// Leave out files and folders matching the pattern (repeatable)
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<String>,
+
+    /// Leave out names starting with a dot
+    #[arg(long)]
+    skip_hidden: bool,
+
+    /// Compare every file with the cloud instead of trusting what the last
+    /// runs remember
+    #[arg(long)]
+    no_index: bool,
+}
+
+#[derive(Args, Debug)]
+struct RestoreArgs {
+    /// SOURCE:PATH of a cloud folder or file
+    remote: Remote,
+    /// Local folder to download into
+    local: PathBuf,
+    #[command(flatten)]
+    transfer: TransferArgs,
+
+    /// Download even what looks unchanged locally
+    #[arg(short = 'f', long)]
+    overwrite: bool,
+}
+
+#[derive(Args, Debug)]
+struct MirrorArgs {
+    /// SOURCE:PATH of the cloud folder to mirror into
+    remote: Remote,
+    #[command(flatten)]
+    transfer: TransferArgs,
+
+    /// URL list: a local file or a cloud path [default: ./urls.txt, <exe dir>/urls.txt, PATH/urls.txt, /urls.txt]
+    #[arg(long, value_name = "FILE", env = "CLOUD_URLS_FILE")]
+    urls: Option<PathBuf>,
 
     /// Regex selecting which GitHub release assets to mirror
     #[arg(long, value_name = "REGEX", env = "CLOUD_ASSET_FILTER", default_value = DEFAULT_ASSET_FILTER)]
     assets: String,
-
-    /// List supported providers and their configuration variables
-    #[arg(long)]
-    list_providers: bool,
-
-    /// Sign in to google or yandex through the browser and print the .env lines
-    #[arg(
-        long,
-        value_name = "PROVIDER",
-        value_enum,
-        ignore_case = true,
-        conflicts_with = "local_path"
-    )]
-    login: Option<ProviderKind>,
-
-    /// Verbose (debug) output
-    #[arg(short, long, conflicts_with = "quiet")]
-    verbose: bool,
-
-    /// Only print warnings and errors
-    #[arg(short, long)]
-    quiet: bool,
 }
 
-enum Mode {
-    Upload(PathBuf),
-    Restore(PathBuf),
-    Mirror(UrlList),
+#[derive(Subcommand, Debug)]
+enum TaskAction {
+    /// List the tasks with their last results
+    List,
+    /// Run tasks now: by name, all of them, or the ones whose time has come
+    Run {
+        /// Task names
+        #[arg(required_unless_present_any = ["all", "due"])]
+        names: Vec<String>,
+        /// Every enabled task
+        #[arg(long, conflicts_with_all = ["names", "due"])]
+        all: bool,
+        /// Enabled tasks whose interval has passed; for a scheduler running this every hour
+        #[arg(long, conflicts_with = "names")]
+        due: bool,
+    },
 }
 
-/// The target folder with placeholders expanded, and the folder rotation
-/// works in: the parent of the first templated segment, else the target.
-struct Target {
-    remote_dir: String,
-    rotate_dir: String,
-}
-
-impl Target {
-    fn expand(template: &str, now: NaiveDateTime) -> Result<Self> {
-        let template = utils::path::normalize_remote_dir(template);
-        let segments: Vec<&str> = template.split('/').filter(|s| !s.is_empty()).collect();
-        let templated = segments.iter().position(|s| s.contains('{'));
-        let expanded = template
-            .replace("{datetime}", &now.format("%Y-%m-%d_%H-%M-%S").to_string())
-            .replace("{date}", &now.format("%Y-%m-%d").to_string())
-            .replace("{time}", &now.format("%H-%M-%S").to_string());
-        if let Some(start) = expanded.find('{') {
-            let end = expanded[start..]
-                .find('}')
-                .map_or(expanded.len(), |i| start + i + 1);
-            bail!(
-                "Unknown placeholder '{}' in --remote; use {{date}}, {{time}} or {{datetime}}",
-                &expanded[start..end]
-            );
-        }
-        let remote_dir = utils::path::normalize_remote_dir(&expanded);
-        let rotate_dir = match templated {
-            Some(i) => format!("/{}", segments[..i].join("/")),
-            None => remote_dir.clone(),
-        };
-        Ok(Self {
-            remote_dir,
-            rotate_dir,
-        })
-    }
+/// What a finished command reports to the exit code and the notifications.
+struct Outcome {
+    status: Status,
+    stats: Stats,
+    error: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Load .env before parsing so it can provide defaults (CLOUD_PROVIDER, ...).
+    // Load .env before parsing so it can provide defaults (CLOUD_JOBS, ...).
     let env_loaded = config::load_environment(config::env_file_from_args().as_deref());
     let cli = Cli::parse();
 
-    if cli.list_providers {
+    if let Command::Providers = cli.command {
         config::print_providers();
         return ExitCode::SUCCESS;
     }
-    init_logging(cli.verbose, cli.quiet, cli.login.is_some());
-
+    let to_stderr = matches!(cli.command, Command::Login { .. } | Command::Ls { .. } | Command::Accounts);
+    init_logging(cli.verbose, cli.quiet, to_stderr);
     match env_loaded {
         Ok(Some(path)) => debug!("Loaded environment from {}", path.display()),
         Ok(None) => debug!("No .env file found, using environment variables only"),
@@ -209,271 +246,229 @@ async fn main() -> ExitCode {
         }
     }
 
-    if let Some(kind) = cli.login {
-        let result = tokio::select! {
-            result = login::run(kind) => result,
-            _ = tokio::signal::ctrl_c() => {
-                warn!("Interrupted");
-                return ExitCode::from(EXIT_INTERRUPTED);
-            }
-        };
-        return match result {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                error!("{err:#}");
-                ExitCode::from(EXIT_FATAL)
-            }
-        };
-    }
-
-    let notifier = match Notifier::from_env(cli.notify_on) {
-        Ok(notifier) => notifier,
-        Err(err) => {
+    match interruptible(dispatch(cli)).await {
+        Some(Ok(code)) => ExitCode::from(code),
+        Some(Err(err)) => {
             error!("{err:#}");
-            return ExitCode::from(EXIT_FATAL);
+            ExitCode::from(EXIT_FATAL)
         }
-    };
-    if cli.notify_test {
-        let Some(notifier) = notifier else {
-            error!("No notification channel is configured (see --list-providers)");
-            return ExitCode::from(EXIT_FATAL);
-        };
-        info!("Sending a test notification...");
-        return match notifier.test().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                error!("{err:#}");
-                ExitCode::from(EXIT_FATAL)
-            }
-        };
+        None => {
+            warn!("Interrupted");
+            ExitCode::from(EXIT_INTERRUPTED)
+        }
     }
-    // A dry run must not tell the monitoring that a backup was made.
-    if cli.dry_run && notifier.is_some() {
-        debug!("Notifications are not sent in a dry run");
-    }
-    let notifier = notifier.filter(|_| !cli.dry_run);
+}
 
-    let started = Instant::now();
-    let now = chrono::Local::now().naive_local();
+async fn interruptible<T>(work: impl Future<Output = T>) -> Option<T> {
+    tokio::select! {
+        result = work => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
+    }
+}
+
+/// Runs the command; returns the exit code. Errors before any work starts
+/// (bad settings) are not reported to the notification channels.
+async fn dispatch(cli: Cli) -> Result<u8> {
+    let mut accounts = Accounts::new(cli.accounts.clone());
+    match cli.command {
+        Command::Login { provider } => login::run(provider).await.map(|()| 0),
+        Command::Providers => unreachable!("handled before logging starts"),
+        Command::Accounts => commands::accounts::run(&mut accounts).map(|()| 0),
+        Command::Ls { remote, recursive } => {
+            let (provider, _) = accounts.provider(&remote.source)?;
+            commands::ls::run(&*provider, &remote.path, recursive)
+                .await
+                .map(|()| 0)
+        }
+        Command::NotifyTest => {
+            let notifier = Notifier::from_env(cli.notify_on)?
+                .context("No notification channel is configured (see `belka providers`)")?;
+            info!("Sending a test notification...");
+            notifier.test().await.map(|()| 0)
+        }
+        Command::Task { action: TaskAction::List } => commands::task::list(&mut accounts).map(|()| 0),
+        Command::Task {
+            action: TaskAction::Run { names, all, due },
+        } => {
+            let selection = if all {
+                Selection::All
+            } else if due {
+                Selection::Due
+            } else {
+                Selection::Named(names)
+            };
+            let notifier = Notifier::from_env(cli.notify_on)?;
+            let done = commands::task::run(&mut accounts, selection).await?;
+            let mut code = 0;
+            for (task, stats, error) in done {
+                let outcome = Outcome {
+                    status: status_of(&stats, error.is_some()),
+                    stats,
+                    error,
+                };
+                code = code.max(exit_code(&outcome));
+                if let Some(notifier) = &notifier {
+                    let report = Report {
+                        status: outcome.status,
+                        mode: Mode::Task,
+                        target: format!("«{}» {} -> {}", task.name, task.local, task.remote),
+                        stats: outcome.stats,
+                        elapsed: task
+                            .last()
+                            .and_then(|r| (r.finished? - r.started?).to_std().ok())
+                            .unwrap_or_default(),
+                        error: outcome.error.clone(),
+                    };
+                    notifier.finished(&report).await;
+                }
+            }
+            Ok(code)
+        }
+        Command::Upload(args) => {
+            let now = chrono::Local::now().naive_local();
+            let target = Target::expand(&args.remote.path, now)?;
+            let shown = format!("{}:{}", args.remote.source, target.remote_dir);
+            std::fs::metadata(&args.local)
+                .with_context(|| format!("Local path '{}' is not accessible", args.local.display()))?;
+            let (provider, name) = accounts.provider(&args.remote.source)?;
+            let opts = commands::upload::Options {
+                jobs: usize::from(args.transfer.jobs),
+                dry_run: args.transfer.dry_run,
+                overwrite: args.overwrite,
+                verify: args.verify,
+                delete_extra: args.delete_extra,
+                keep_last: args.keep_last,
+                keep_days: args.keep_days,
+                filter: Filter::new(&args.include, &args.exclude, args.skip_hidden),
+                index: !args.no_index,
+            };
+            banner(&*provider, &shown, opts.dry_run);
+            let work = commands::upload::run(&*provider, &name, &args.local, &target, now, &opts);
+            reported(cli.notify_on, opts.dry_run, Mode::Upload, shown, work).await
+        }
+        Command::Restore(args) => {
+            let (provider, _) = accounts.provider(&args.remote.source)?;
+            let shown = args.remote.to_string();
+            let opts = DownloadOptions {
+                parallel: usize::from(args.transfer.jobs),
+                overwrite: args.overwrite,
+                dry_run: args.transfer.dry_run,
+            };
+            banner(&*provider, &shown, opts.dry_run);
+            let work = commands::restore::run(&*provider, &args.remote.path, &args.local, &opts);
+            reported(cli.notify_on, opts.dry_run, Mode::Restore, shown, work).await
+        }
+        Command::Mirror(args) => {
+            let asset_filter =
+                Regex::new(&args.assets).context("Invalid --assets regular expression")?;
+            let (provider, _) = accounts.provider(&args.remote.source)?;
+            let remote_dir = belka_core::utils::path::normalize_remote_dir(&args.remote.path);
+            let shown = format!("{}:{remote_dir}", args.remote.source);
+            let opts = MirrorOptions {
+                dry_run: args.transfer.dry_run,
+                jobs: usize::from(args.transfer.jobs),
+                asset_filter,
+            };
+            banner(&*provider, &shown, opts.dry_run);
+            let provider = &*provider;
+            let work = async {
+                // The list is checked before anything is downloaded.
+                let list = commands::mirror::load_url_list(provider, &remote_dir, args.urls.as_deref()).await?;
+                if !opts.dry_run {
+                    provider.check_access(&remote_dir).await.with_context(|| {
+                        format!("Cannot access '{remote_dir}' on {}", provider.name())
+                    })?;
+                }
+                commands::mirror::run(provider, &remote_dir, &list, &opts).await
+            };
+            reported(cli.notify_on, opts.dry_run, Mode::Mirror, shown, work).await
+        }
+    }
+}
+
+fn banner(provider: &dyn belka_core::StorageProvider, shown: &str, dry_run: bool) {
+    info!(
+        "belka v{} | {} | {shown}{}",
+        env!("CARGO_PKG_VERSION"),
+        provider.name(),
+        if dry_run { " | DRY RUN" } else { "" }
+    );
+}
+
+/// Runs a transfer with notifications around it and turns the result into
+/// an exit code. A dry run must not tell the monitoring that a backup was made.
+async fn reported(
+    notify_on: NotifyOn,
+    dry_run: bool,
+    mode: Mode,
+    target: String,
+    work: impl Future<Output = Result<Stats>>,
+) -> Result<u8> {
+    let notifier = Notifier::from_env(notify_on)?.filter(|_| !dry_run);
     if let Some(notifier) = &notifier {
         notifier.started().await;
     }
-    let target = Target::expand(&cli.remote, now);
-    let remote_shown = target
-        .as_ref()
-        .map_or_else(|_| cli.remote.clone(), |t| t.remote_dir.clone());
-
-    let result = tokio::select! {
-        result = async { run(&cli, &target?, now).await } => Some(result),
-        _ = tokio::signal::ctrl_c() => None,
-    };
-
-    let (code, status, stats, error_text) = match result {
+    let started = Instant::now();
+    let outcome = match interruptible(work).await {
         None => {
             warn!("Interrupted");
-            (
-                EXIT_INTERRUPTED,
-                Status::Interrupted,
-                Stats::default(),
-                None,
-            )
+            Outcome {
+                status: Status::Interrupted,
+                stats: Stats::default(),
+                error: None,
+            }
         }
-        Some(Ok(stats)) if stats.failed == 0 => {
-            info!(
-                "Done{}",
-                if cli.dry_run {
-                    " (dry run, nothing was changed)"
-                } else {
-                    ""
-                }
-            );
-            (0, Status::Success, stats, None)
-        }
-        Some(Ok(stats)) => {
-            error!("Finished with {} failure(s)", stats.failed);
-            (EXIT_PARTIAL, Status::Partial, stats, None)
-        }
+        Some(Ok(stats)) => Outcome {
+            status: status_of(&stats, false),
+            stats,
+            error: None,
+        },
         Some(Err(err)) => {
             error!("{err:#}");
-            let text = format!("{err:#}");
-            (EXIT_FATAL, Status::Failure, Stats::default(), Some(text))
+            Outcome {
+                status: Status::Failure,
+                stats: Stats::default(),
+                error: Some(format!("{err:#}")),
+            }
         }
     };
-
+    match outcome.status {
+        Status::Success => info!("Done{}", if dry_run { " (dry run, nothing was changed)" } else { "" }),
+        Status::Partial => error!("Finished with {} failure(s)", outcome.stats.failed),
+        _ => {}
+    }
     if let Some(notifier) = &notifier {
-        let mode = match (&cli.local_path, cli.restore) {
-            (Some(_), true) => "restore",
-            (Some(_), false) => "upload",
-            (None, _) => "mirror",
-        };
         notifier
             .finished(&Report {
-                status,
+                status: outcome.status,
                 mode,
-                provider: provider_label(cli.provider),
-                remote: remote_shown,
-                stats,
+                target,
+                stats: outcome.stats,
                 elapsed: started.elapsed(),
-                error: error_text,
+                error: outcome.error.clone(),
             })
             .await;
     }
-    ExitCode::from(code)
+    Ok(exit_code(&outcome))
 }
 
-fn provider_label(kind: ProviderKind) -> String {
-    kind.to_possible_value()
-        .map(|v| v.get_name().to_string())
-        .unwrap_or_default()
-}
-
-async fn run(cli: &Cli, target: &Target, now: NaiveDateTime) -> Result<Stats> {
-    let remote_dir = target.remote_dir.clone();
-    let asset_filter = Regex::new(&cli.assets).context("Invalid --assets regular expression")?;
-    let provider = config::init_provider(cli.provider)?;
-
-    info!(
-        "belka v{} | {} | target folder '{remote_dir}'{}",
-        env!("CARGO_PKG_VERSION"),
-        provider.name(),
-        if cli.dry_run { " | DRY RUN" } else { "" }
-    );
-
-    // Everything that can fail is validated before anything is deleted.
-    let mode = match &cli.local_path {
-        Some(path) if cli.restore => Mode::Restore(path.clone()),
-        Some(path) => {
-            std::fs::metadata(path)
-                .with_context(|| format!("Local path '{}' is not accessible", path.display()))?;
-            Mode::Upload(path.clone())
-        }
-        None => Mode::Mirror(
-            modes::remote_urls::load_url_list(&*provider, &remote_dir, cli.urls_file.as_deref())
-                .await?,
-        ),
-    };
-
-    if let Mode::Restore(local) = &mode {
-        let opts = RestoreOptions {
-            overwrite: cli.overwrite,
-            dry_run: cli.dry_run,
-            jobs: usize::from(cli.jobs),
-        };
-        return modes::restore::run_restore(&*provider, &remote_dir, local, &opts).await;
-    }
-
-    let access = if cli.dry_run {
-        provider.list_dir(&remote_dir).await.map(drop)
+fn status_of(stats: &Stats, error: bool) -> Status {
+    if error {
+        Status::Failure
+    } else if stats.failed > 0 {
+        Status::Partial
     } else {
-        provider.check_access(&remote_dir).await
-    };
-    access.with_context(|| {
-        format!(
-            "Cannot access '{remote_dir}' on {}; check credentials and network",
-            provider.name()
-        )
-    })?;
-
-    let mut stats = Stats::default();
-    if cli.clean {
-        let keep: Vec<String> = match &mode {
-            Mode::Mirror(list) => list.remote_path().map(str::to_string).into_iter().collect(),
-            Mode::Upload(_) | Mode::Restore(_) => Vec::new(),
-        };
-        stats.merge(
-            modes::clean::clean_remote_dir(&*provider, &remote_dir, &keep, cli.dry_run).await?,
-        );
-    }
-
-    match mode {
-        Mode::Upload(path) => {
-            let opts = UploadOptions {
-                overwrite: cli.overwrite || cli.clean,
-                dry_run: cli.dry_run,
-                jobs: usize::from(cli.jobs),
-            };
-            stats.merge(
-                modes::local_upload::run_local_upload(&*provider, &path, &remote_dir, &opts)
-                    .await?,
-            );
-            if cli.keep_last.is_some() || cli.keep_days.is_some() {
-                stats.merge(rotate(cli, &*provider, &path, target, now, stats.failed).await);
-            }
-        }
-        Mode::Restore(_) => unreachable!("handled above"),
-        Mode::Mirror(list) => {
-            let opts = MirrorOptions {
-                dry_run: cli.dry_run,
-                asset_filter,
-            };
-            stats.merge(
-                modes::remote_urls::run_remote_urls(&*provider, &remote_dir, &list, &opts).await?,
-            );
-        }
-    }
-    Ok(stats)
-}
-
-/// Deletes old backups unless something failed: a broken new backup must
-/// not cost an old good one.
-async fn rotate(
-    cli: &Cli,
-    provider: &dyn storage::StorageProvider,
-    local: &Path,
-    target: &Target,
-    now: NaiveDateTime,
-    failed: u64,
-) -> Stats {
-    if failed > 0 {
-        warn!("Rotation skipped: {failed} failure(s), old backups are kept");
-        return Stats::default();
-    }
-    let opts = RotateOptions {
-        keep_last: cli.keep_last.map(|n| n as usize),
-        keep_days: cli.keep_days,
-        dry_run: cli.dry_run,
-        protect: protected_names(local, target),
-    };
-    info!("Rotating backups in '{}'...", target.rotate_dir);
-    match modes::rotate::rotate(provider, &target.rotate_dir, &opts, now).await {
-        Ok(stats) => stats,
-        Err(err) => {
-            error!("{err:#}");
-            Stats {
-                failed: 1,
-                ..Stats::default()
-            }
-        }
+        Status::Success
     }
 }
 
-/// What this run wrote into the rotation folder, which rotation never deletes.
-fn protected_names(local: &Path, target: &Target) -> HashSet<String> {
-    if target.remote_dir != target.rotate_dir {
-        let rest = target.remote_dir[target.rotate_dir.len()..].trim_start_matches('/');
-        return rest
-            .split('/')
-            .next()
-            .map(str::to_string)
-            .into_iter()
-            .collect();
+fn exit_code(outcome: &Outcome) -> u8 {
+    match outcome.status {
+        Status::Success => 0,
+        Status::Partial => EXIT_PARTIAL,
+        Status::Failure => EXIT_FATAL,
+        Status::Interrupted => EXIT_INTERRUPTED,
     }
-    if local.is_file() {
-        return local
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-            .into_iter()
-            .collect();
-    }
-    std::fs::read_dir(local)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.file_name().to_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn init_logging(verbose: bool, quiet: bool, to_stderr: bool) {
@@ -488,13 +483,14 @@ fn init_logging(verbose: bool, quiet: bool, to_stderr: bool) {
             .with_default(LevelFilter::WARN)
             .with_target("belka", level)
             .with_target("belka_core", level)
+            .with_target("belka_store", level)
     });
 
     let builder = tracing_subscriber::fmt()
         .with_max_level(LevelFilter::TRACE)
         .with_target(false)
         .with_timer(LocalTimer);
-    // --login prints .env lines to stdout, so its log must not mix in.
+    // Commands that print results to stdout keep their log out of it.
     if to_stderr {
         builder
             .with_ansi(use_ansi(std::io::stderr().is_terminal()))
@@ -579,63 +575,38 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    fn at(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("belka").chain(args.iter().copied()))
     }
 
     #[test]
-    fn expands_remote_placeholders() {
-        let now = at("2026-10-15 03:04:05");
-        let t = Target::expand("/Backups/db_{date}/x", now).unwrap();
-        assert_eq!(t.remote_dir, "/Backups/db_2026-10-15/x");
-        assert_eq!(t.rotate_dir, "/Backups");
-        let t = Target::expand("{datetime}", now).unwrap();
-        assert_eq!(t.remote_dir, "/2026-10-15_03-04-05");
-        assert_eq!(t.rotate_dir, "/");
-        let t = Target::expand("/Backups/", now).unwrap();
-        assert_eq!(
-            (t.remote_dir.as_str(), t.rotate_dir.as_str()),
-            ("/Backups", "/Backups")
-        );
-        assert!(Target::expand("/B/{year}", now).is_err());
-    }
-
-    #[test]
-    fn protects_what_this_run_wrote() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("db_2026-01-01.gz"), b"x").unwrap();
-        let templated = Target {
-            remote_dir: "/B/2026-10-15/sub".into(),
-            rotate_dir: "/B".into(),
+    fn upload_takes_a_path_and_a_location() {
+        let cli = parse(&["upload", "d", "GDrive:/B", "-j", "4", "--exclude", "*.tmp"]).unwrap();
+        let Command::Upload(args) = cli.command else {
+            panic!("not upload");
         };
-        assert_eq!(
-            protected_names(dir.path(), &templated),
-            HashSet::from(["2026-10-15".to_string()])
-        );
-        let plain = Target {
-            remote_dir: "/B".into(),
-            rotate_dir: "/B".into(),
-        };
-        assert_eq!(
-            protected_names(dir.path(), &plain),
-            HashSet::from(["db_2026-01-01.gz".to_string()])
-        );
+        assert_eq!(args.remote.source, "GDrive");
+        assert_eq!(args.transfer.jobs, 4);
+        assert_eq!(args.exclude, ["*.tmp"]);
+        assert!(parse(&["upload", "d", "/no-source"]).is_err());
+        assert!(parse(&["upload", "d", "y:/B", "-j", "0"]).is_err());
+        assert!(parse(&["upload", "d", "y:/B", "--keep-last", "0"]).is_err());
+        assert!(parse(&["upload", "d", "y:/B", "--keep-days", "7", "--keep-last", "2"]).is_ok());
+        assert!(parse(&["upload", "d", "y:/B", "--delete-extra", "--keep-last", "2"]).is_err());
     }
 
     #[test]
-    fn restore_and_rotation_need_a_local_path() {
-        assert!(Cli::try_parse_from(["x", "--restore"]).is_err());
-        assert!(Cli::try_parse_from(["x", "--keep-last", "3"]).is_err());
-        assert!(Cli::try_parse_from(["x", "--restore", "--keep-last", "3", "d"]).is_err());
-        assert!(Cli::try_parse_from(["x", "--keep-last", "0", "d"]).is_err());
-        assert!(Cli::try_parse_from(["x", "--keep-days", "7", "--keep-last", "2", "d"]).is_ok());
+    fn task_run_needs_a_selection() {
+        assert!(parse(&["task", "run"]).is_err());
+        assert!(parse(&["task", "run", "--due"]).is_ok());
+        assert!(parse(&["task", "run", "a", "--all"]).is_err());
+        assert!(parse(&["-v", "task", "run", "Камера"]).is_ok());
     }
 
     #[test]
-    fn provider_aliases_are_accepted() {
-        let cli = Cli::try_parse_from(["x", "-p", "GDrive", "-j", "4", "dir"]).unwrap();
-        assert_eq!(cli.provider, ProviderKind::Google);
-        assert_eq!(cli.jobs, 4);
-        assert!(Cli::try_parse_from(["x", "-j", "0"]).is_err());
+    fn global_options_go_anywhere() {
+        let cli = parse(&["ls", "yandex:/", "--accounts", "a.belka", "-q"]).unwrap();
+        assert_eq!(cli.accounts, Some(PathBuf::from("a.belka")));
+        assert!(cli.quiet);
     }
 }

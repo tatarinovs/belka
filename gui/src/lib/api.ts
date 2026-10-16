@@ -112,6 +112,79 @@ export interface OAuthApps {
   custom: OAuthApp | null;
 }
 
+/** Mirrors `tasks::RunResult` of the store crate. */
+export interface BackupRun {
+  started: string | null;
+  finished: string | null;
+  uploaded: number;
+  bytes: number;
+  /** Files that were in the cloud already. */
+  unchanged: number;
+  failed: number;
+  /** The first failed files: [file, reason]. */
+  failures: [string, string][];
+  /** Local files deleted to free space, and their size. */
+  freed: number;
+  freed_bytes: number;
+  /** Why the run failed as a whole. */
+  error: string | null;
+  cancelled: boolean;
+}
+
+/** Mirrors `tasks::LiveView`: a run in progress. */
+export interface BackupProgress {
+  scanning: boolean;
+  files_total: number;
+  files_done: number;
+  bytes_total: number;
+  bytes_done: number;
+  current: string;
+}
+
+/** Mirrors `tasks::Task`: a local folder copied into a cloud folder on a schedule. */
+export interface BackupTask {
+  /** Empty for a task that is not saved yet. */
+  id: string;
+  name: string;
+  local: string;
+  account_id: string;
+  remote: string;
+  interval_hours: number;
+  /** Android: wait for Wi‑Fi. */
+  wifi_only: boolean;
+  /** Android: wait for the charger. */
+  charging_only: boolean;
+  enabled: boolean;
+  /** Patterns of files to take; empty takes all. */
+  include: string[];
+  /** Patterns of files and folders to leave out. */
+  exclude: string[];
+  /** Delete local files older than this many days once they are in the cloud. */
+  free_after_days: number | null;
+  /** The latest runs, newest first. */
+  history: BackupRun[];
+  running?: BackupProgress | null;
+}
+
+/** A task to fill in: by default daily, over Wi‑Fi. */
+export function newBackupTask(local: string, accountId: string, remote = ""): BackupTask {
+  return {
+    id: "",
+    name: "",
+    local,
+    account_id: accountId,
+    remote,
+    interval_hours: 24,
+    wifi_only: true,
+    charging_only: false,
+    enabled: true,
+    include: [],
+    exclude: [],
+    free_after_days: null,
+    history: [],
+  };
+}
+
 export const api = {
   listAccounts: () => invoke<Account[]>("list_accounts"),
   addAccount: (name: string, config: ProviderConfig) =>
@@ -222,6 +295,15 @@ export const api = {
   requestStorageAccess: () => invoke<void>("request_storage_access"),
   /** The latest release on GitHub if it is newer than this build. */
   checkUpdate: () => invoke<Update | null>("check_update"),
+
+  /** Backup tasks with the progress of running ones. */
+  backupTasks: () => invoke<BackupTask[]>("backup_tasks"),
+  /** Adds a task (an empty id) or changes one; resolves to the saved task. */
+  backupSave: (task: BackupTask) => invoke<BackupTask>("backup_save", { task }),
+  backupRemove: (id: string) => invoke<void>("backup_remove", { id }),
+  /** Starts a task now; on Android it runs in the background under a notification. */
+  backupRun: (id: string) => invoke<void>("backup_run", { id }),
+  backupCancel: (id: string) => invoke<void>("backup_cancel", { id }),
 };
 
 export interface Update {

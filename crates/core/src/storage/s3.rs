@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -353,10 +353,11 @@ impl S3Provider {
     }
 
     async fn put_single(&self, source: &dyn Source, key: &str, progress: &Progress) -> Result<()> {
+        let meta = mtime_header(source);
         let resp = send(&format!("s3: upload '{key}'"), || {
             let (body, len) = (source_body(source, 0, progress)?, source.len());
             Ok(self
-                .request(Method::PUT, Some(key), &[], UNSIGNED_PAYLOAD)
+                .request_with(Method::PUT, Some(key), &[], UNSIGNED_PAYLOAD, &meta)
                 .header(CONTENT_LENGTH, len)
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .timeout(upload_timeout(len))
@@ -374,9 +375,10 @@ impl S3Provider {
         size: u64,
         progress: &Progress,
     ) -> Result<()> {
+        let meta = mtime_header(source);
         let resp = send("s3: create multipart upload", || {
             Ok(self
-                .request(Method::POST, Some(key), &[("uploads", "")], EMPTY_SHA256)
+                .request_with(Method::POST, Some(key), &[("uploads", "")], EMPTY_SHA256, &meta)
                 .timeout(API_TIMEOUT))
         })
         .await?;
@@ -635,7 +637,10 @@ impl StorageProvider for S3Provider {
                 .unwrap_or(0),
             // Multipart ETags ("...-N") are not MD5 hashes; as_md5 rejects them.
             md5: header(ETAG).and_then(as_md5),
-            modified: header(LAST_MODIFIED).and_then(parse_http_date),
+            // The original file's date, if the uploader kept it (rclone does too).
+            modified: resp.headers().get(MTIME_META).and_then(|v| v.to_str().ok())
+                .and_then(parse_mtime)
+                .or_else(|| header(LAST_MODIFIED).and_then(parse_http_date)),
         }))
     }
 
@@ -775,6 +780,23 @@ fn canonical_query(params: &[(&str, &str)]) -> String {
 
 /// Computes the AWS Signature V4 `Authorization` header value.
 /// `uri` and `query` must already be in canonical (encoded) form.
+/// Metadata with the original file's date, in rclone's format: seconds
+/// since the epoch with a fraction.
+const MTIME_META: &str = "x-amz-meta-mtime";
+
+fn mtime_header(source: &dyn Source) -> Vec<(&'static str, String)> {
+    source
+        .modified()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| vec![(MTIME_META, format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))])
+        .unwrap_or_default()
+}
+
+fn parse_mtime(value: &str) -> Option<DateTime<Utc>> {
+    let secs: f64 = value.trim().parse().ok()?;
+    DateTime::from_timestamp(secs.trunc() as i64, (secs.fract() * 1e9) as u32)
+}
+
 fn sign(
     creds: &Credentials,
     method: &str,

@@ -84,6 +84,30 @@ pub trait StorageProvider: Send + Sync {
             .await
     }
 
+    /// Uploads data the caller knows is not in the cloud yet. Providers that
+    /// look the file up before writing (Google Drive, which allows equal
+    /// names) skip the lookup; the others just upload.
+    async fn upload_new(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        self.upload(source, remote_path, progress).await
+    }
+
+    /// Uploads a local file that is not in the cloud yet; see
+    /// [`StorageProvider::upload_new`].
+    async fn upload_new_file(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        self.upload_new(&FileSource::new(local_path)?, remote_path, progress)
+            .await
+    }
+
     /// Downloads a file into `sink`, resuming after network failures where
     /// the server allows it. Returns the number of bytes written to the sink.
     async fn download_to(

@@ -13,7 +13,9 @@ use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE};
 use reqwest::{redirect, Client, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::collections::HashMap;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -304,25 +306,52 @@ impl GoogleDriveProvider {
             .retain(|cached, _| cached != dir && !cached.starts_with(&prefix));
     }
 
+    /// Uploads `source` as `name` in folder `parent_id`, replacing the
+    /// content of file `existing` if given.
+    async fn upload_into(
+        &self,
+        parent_id: &str,
+        name: &str,
+        existing: Option<String>,
+        source: &dyn Source,
+        progress: &Progress,
+    ) -> Result<()> {
+        let size = source.len();
+        let session = self
+            .start_session(existing.as_deref(), parent_id, name, size, source.modified())
+            .await?;
+        self.upload_resumable(&session, source, size, progress)
+            .await
+    }
+
     async fn start_session(
         &self,
         existing_id: Option<&str>,
         parent_id: &str,
         name: &str,
         size: u64,
+        modified: Option<SystemTime>,
     ) -> Result<String> {
         let token = self.access_token().await?;
+        // The file keeps the date of the original, as other clients do.
+        let mut metadata = serde_json::Map::new();
+        if let Some(modified) = modified {
+            let modified: DateTime<Utc> = modified.into();
+            metadata.insert(
+                "modifiedTime".into(),
+                json!(modified.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            );
+        }
+        if existing_id.is_none() {
+            metadata.insert("name".into(), json!(name));
+            metadata.insert("parents".into(), json!([parent_id]));
+        }
         let resp = send("google: start upload session", || {
             let req = match existing_id {
-                Some(id) => self
-                    .client
-                    .patch(format!("{UPLOAD_API}/{id}"))
-                    .json(&json!({})),
-                None => self
-                    .client
-                    .post(UPLOAD_API)
-                    .json(&json!({ "name": name, "parents": [parent_id] })),
-            };
+                Some(id) => self.client.patch(format!("{UPLOAD_API}/{id}")),
+                None => self.client.post(UPLOAD_API),
+            }
+            .json(&metadata);
             Ok(req
                 .bearer_auth(&token)
                 .query(&[("uploadType", "resumable")])
@@ -476,17 +505,25 @@ impl StorageProvider for GoogleDriveProvider {
             .await?
             .with_context(|| format!("Failed to resolve folder '{parent}'"))?;
         let existing = self.find_child(&parent_id, &name, Some(false)).await?;
-        let size = source.len();
+        self.upload_into(&parent_id, &name, existing.map(|f| f.id), source, progress)
+            .await
+    }
 
-        let session = self
-            .start_session(
-                existing.as_ref().map(|f| f.id.as_str()),
-                &parent_id,
-                &name,
-                size,
-            )
-            .await?;
-        self.upload_resumable(&session, source, size, progress)
+    async fn upload_new(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        let (parent, name) = split_remote(remote_path);
+        if name.is_empty() {
+            bail!("Invalid remote file path '{remote_path}'");
+        }
+        let parent_id = self
+            .folder_id(&parent, true)
+            .await?
+            .with_context(|| format!("Failed to resolve folder '{parent}'"))?;
+        self.upload_into(&parent_id, &name, None, source, progress)
             .await
     }
 

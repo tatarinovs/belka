@@ -4,15 +4,19 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
-  import { api, errorText, type Account, type Entry, type Listing } from "$lib/api";
+  import { api, errorText, type Account, type BackupTask, type Entry } from "$lib/api";
+  import { accounts as accountStore } from "$lib/accounts.svelte";
+  import { cloudListing, describe } from "$lib/cloud";
+  import { remember, stored } from "$lib/storage";
   import { dnd, paneAt } from "$lib/dnd.svelte";
-  import { baseName, parentPath, splitPath } from "$lib/format";
+  import { baseName } from "$lib/format";
   import { providerDef } from "$lib/providers";
   import { transfers } from "$lib/transfers.svelte";
   import AccountList from "$lib/components/AccountList.svelte";
   import AccountMenu from "$lib/components/AccountMenu.svelte";
   import AccountDialog from "$lib/components/AccountDialog.svelte";
   import AccountsDialog from "$lib/components/AccountsDialog.svelte";
+  import BackupScreen from "$lib/components/BackupScreen.svelte";
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
   import ShareDialog from "$lib/components/ShareDialog.svelte";
@@ -33,24 +37,8 @@
     return crypto.randomUUID();
   }
 
-  function stored(key: string): string | null {
-    try {
-      return localStorage.getItem(key);
-    } catch {
-      return null;
-    }
-  }
-
-  function remember(key: string, value: string) {
-    try {
-      localStorage.setItem(key, value);
-    } catch {
-      // Remembering is a convenience only.
-    }
-  }
-
-  let accounts = $state<Account[]>([]);
-  let loaded = $state(false);
+  const accounts = $derived(accountStore.list);
+  const loaded = $derived(accountStore.loaded);
   let cloudTabs = $state<CloudTab[]>([]);
   let cloudTabId = $state<string | null>(null);
   let localTabs = $state<LocalTab[]>([]);
@@ -59,6 +47,9 @@
   /** The account whose settings dialog is open. */
   let editing = $state<Account | null>(null);
   let managing = $state(false);
+  /** The backup tasks dialog is open; `backupDraft` is the task being edited. */
+  let backups = $state(false);
+  let backupDraft = $state<BackupTask | null>(null);
   let notice = $state("");
   let busy = $state("");
   /** A message about a finished action, hidden after a while. */
@@ -87,10 +78,6 @@
   let externalOver = $state<string | null>(null);
 
   const selected = $derived(accounts.find((a) => a.id === selectedId) ?? null);
-
-  function describe(items: Entry[]) {
-    return items.length === 1 ? `«${items[0].name}»` : `выбранные объекты (${items.length})`;
-  }
 
   function showLinks(links: string[]) {
     showInfo(
@@ -133,43 +120,6 @@
     deleteLabel: "Удалить",
     reveal: (path) => revealItemInDir(path),
   };
-
-  async function cloudListing(account: Account, path: string): Promise<Listing> {
-    const entries = markEncrypted(account, await api.listDir(account.id, path));
-    return {
-      path,
-      parent: path === "/" ? null : parentPath(path),
-      crumbs: splitPath(path),
-      entries,
-    };
-  }
-
-  /** Marks what is stored encrypted: everything in an encrypted folder, and
-   * in a regular cloud the encrypted folders and what is inside them. */
-  function markEncrypted(account: Account, entries: Entry[]): Entry[] {
-    if (account.kind === "crypt") {
-      return entries.map((e) => ({ ...e, locked: "Хранится в облаке зашифрованным" }));
-    }
-    const folders = accounts
-      .filter((a) => a.crypt?.base === account.id)
-      .map((a) => ({ account: a, root: "/" + a.crypt!.root.replace(/^\/+|\/+$/g, "") }));
-    if (!folders.length) return entries;
-    return entries.map((e) => {
-      for (const { account: folder, root } of folders) {
-        if (e.path === root) {
-          return {
-            ...e,
-            locked: `Зашифрованная папка «${folder.name}»: откройте, чтобы увидеть файлы`,
-            opensAccount: folder.id,
-          };
-        }
-        if (root === "/" || e.path.startsWith(root + "/")) {
-          return { ...e, locked: `Зашифрованные данные папки «${folder.name}»` };
-        }
-      }
-      return e;
-    });
-  }
 
   /** Opens `account` in the active cloud tab, as choosing a drive does in Total Commander. */
   function selectAccount(account: Account) {
@@ -288,7 +238,7 @@
   });
 
   function added(account: Account) {
-    accounts = [...accounts, account];
+    accountStore.added(account);
     openCloudTab(account.id, "/");
     adding = false;
   }
@@ -298,29 +248,15 @@
       added(account);
       return;
     }
-    accounts = accounts.map((a) => (a.id === account.id ? account : a));
+    accountStore.saved(account);
     editing = null;
     // New credentials may show other files.
     if (selectedId === account.id) cloudPane?.navigate(cloudPath);
   }
 
-  /** Shows the new order at once and goes back to the old one if saving fails. */
-  async function reorderAccounts(ids: string[]) {
-    const before = accounts;
-    accounts = ids
-      .map((id) => before.find((a) => a.id === id))
-      .filter((a) => a !== undefined);
-    try {
-      await api.reorderAccounts(ids);
-    } catch (err) {
-      accounts = before;
-      throw err;
-    }
-  }
 
   async function removeAccount(account: Account) {
-    await api.removeAccount(account.id);
-    accounts = accounts.filter((a) => a.id !== account.id);
+    await accountStore.remove(account);
     // Tabs of the removed account close; if none are left, another account opens.
     const left = cloudTabs.filter((t) => t.account !== account.id);
     if (!left.length && accounts[0]) {
@@ -332,7 +268,7 @@
 
   /** Shows accounts added from an exported file; with none before, opens the first. */
   async function importedAccounts() {
-    accounts = await api.listAccounts();
+    await accountStore.load();
     if (!cloudTabs.length && accounts[0]) openCloudTab(accounts[0].id, "/");
   }
 
@@ -433,18 +369,14 @@
 
   onMount(() => {
     transfers.kick();
-    api
-      .listAccounts()
-      .then((list) => {
-        accounts = list;
-        restoreTabs(list);
-      })
+    accountStore
+      .load()
+      .then((list) => restoreTabs(list))
       .catch((err) => {
         notice = errorText(err);
         restoreTabs([]);
       })
       .finally(async () => {
-        loaded = true;
         // The window starts hidden so the user never sees a blank webview.
         await tick();
         getCurrentWindow().show();
@@ -503,7 +435,7 @@
           <FilePane
             bind:this={cloudPane}
             id="cloud"
-            load={(path) => cloudListing(selected, path)}
+            load={(path) => cloudListing(accounts, selected, path)}
             initialPath={cloudTab.path}
             rootPath="/"
             rootLabel={selected.name}
@@ -542,6 +474,9 @@
                 onmanage={() => (managing = true)}
                 onremove={remove}
               />
+              <button class="icon-btn" title="Автобэкап" aria-label="Автобэкап" onclick={() => (backups = true)}>
+                <Icon name="clock" />
+              </button>
             {/snippet}
             {#snippet actions()}
               <button
@@ -681,6 +616,22 @@
   />
 {/if}
 
+{#if backups}
+  <BackupScreen
+    {accounts}
+    storageOk={true}
+    bind:draft={backupDraft}
+    desktop
+    currentCloud={selected ? { accountId: selected.id, path: cloudPath } : null}
+    onclose={() => {
+      backups = false;
+      backupDraft = null;
+    }}
+    onstorage={() => {}}
+    ontoast={(text, error) => (error ? (notice = text) : showInfo(text))}
+  />
+{/if}
+
 <AccountsDialog
   open={managing}
   {accounts}
@@ -688,7 +639,7 @@
   onadd={() => (adding = true)}
   onedit={(a) => (editing = a)}
   onremove={removeAccount}
-  onreorder={reorderAccounts}
+  onreorder={(ids) => accountStore.reorder(ids)}
   onimported={importedAccounts}
 />
 

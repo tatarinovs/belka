@@ -422,12 +422,19 @@ impl SynologyProvider {
             .file_name(name)
             .mime_str("application/octet-stream")
             .map_err(anyhow::Error::from)?;
-        let form = Form::new()
+        let mut form = Form::new()
             .percent_encode_noop()
             .text("path", dir)
             .text("create_parents", "true")
-            .text("overwrite", "true")
-            .part("file", part);
+            .text("overwrite", "true");
+        // The file keeps the date of the original; DSM takes milliseconds.
+        if let Some(ms) = source
+            .modified()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        {
+            form = form.text("mtime", ms.as_millis().to_string());
+        }
+        let form = form.part("file", part);
         let resp = self
             .client
             .post(self.entry())

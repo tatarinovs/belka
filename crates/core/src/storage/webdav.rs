@@ -227,14 +227,23 @@ impl StorageProvider for WebDavProvider {
     ) -> Result<()> {
         let path = normalize_remote_dir(remote_path);
         let url = self.url_for(&path, false);
+        // Nextcloud and ownCloud keep the original file's date from this
+        // header; other servers ignore it.
+        let mtime = source
+            .modified()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string());
         let resp = send(&format!("webdav: upload '{path}'"), || {
             let (body, len) = (source_body(source, 0, progress)?, source.len());
-            Ok(self
+            let mut req = self
                 .request(Method::PUT, &url)
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .header(CONTENT_LENGTH, len)
-                .timeout(upload_timeout(len))
-                .body(body))
+                .timeout(upload_timeout(len));
+            if let Some(mtime) = &mtime {
+                req = req.header("X-OC-Mtime", mtime);
+            }
+            Ok(req.body(body))
         })
         .await?;
         match resp.status() {

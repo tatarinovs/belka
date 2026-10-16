@@ -9,13 +9,26 @@
   import { getVersion } from "@tauri-apps/api/app";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { api, errorText, type Account, type Entry, type Listing, type Update } from "$lib/api";
-  import { baseName, formatBytes, formatDate, parentPath, plural, splitPath } from "$lib/format";
+  import {
+    api,
+    errorText,
+    newBackupTask,
+    type Account,
+    type BackupTask,
+    type Entry,
+    type Listing,
+    type Update,
+  } from "$lib/api";
+  import { baseName, formatBytes, formatDate, plural } from "$lib/format";
   import { ANDROID_DOWNLOADS } from "$lib/platform";
+  import { accounts as accountStore } from "$lib/accounts.svelte";
+  import { cloudListing as listCloud, describe } from "$lib/cloud";
+  import { remember as rememberKey, stored as storedKey } from "$lib/storage";
   import { providerDef } from "$lib/providers";
   import { transfers } from "$lib/transfers.svelte";
   import AccountDialog from "$lib/components/AccountDialog.svelte";
   import AccountsDialog from "$lib/components/AccountsDialog.svelte";
+  import BackupScreen from "$lib/components/BackupScreen.svelte";
   import Icon, { type IconName } from "$lib/components/Icon.svelte";
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
   import ShareDialog from "$lib/components/ShareDialog.svelte";
@@ -23,10 +36,12 @@
 
   type Mode = "cloud" | "local";
   type SortKey = "name" | "modified" | "size";
-  /** Choosing the folder that the selected items go to. */
+  /** Choosing the folder that the selected items go to, or a folder of a backup task. */
   type Pick =
     | { kind: "download"; account: Account; items: Entry[] }
-    | { kind: "upload"; paths: string[] };
+    | { kind: "upload"; paths: string[] }
+    | { kind: "backupLocal" }
+    | { kind: "backupRemote" };
   type SheetItem =
     | {
         label: string;
@@ -41,24 +56,12 @@
 
   const UPDATE_CHECK_MS = 24 * 60 * 60 * 1000;
 
-  function stored(key: string): string | null {
-    try {
-      return localStorage.getItem(`m.${key}`);
-    } catch {
-      return null;
-    }
-  }
+  // The phone layout keeps its own settings apart from the desktop one.
+  const stored = (key: string) => storedKey(`m.${key}`);
+  const remember = (key: string, value: string) => rememberKey(`m.${key}`, value);
 
-  function remember(key: string, value: string) {
-    try {
-      localStorage.setItem(`m.${key}`, value);
-    } catch {
-      // Remembering is a convenience only.
-    }
-  }
-
-  let accounts = $state<Account[]>([]);
-  let loaded = $state(false);
+  const accounts = $derived(accountStore.list);
+  const loaded = $derived(accountStore.loaded);
   let mode = $state<Mode>(stored("mode") === "local" ? "local" : "cloud");
   let accountId = $state<string | null>(stored("account"));
   /** The last folder of every account. */
@@ -92,6 +95,8 @@
   let toast = $state<{ text: string; error: boolean } | null>(null);
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
   let storageOk = $state(true);
+  let backups = $state(false);
+  let backupDraft = $state<BackupTask | null>(null);
   let update = $state<Update | null>(null);
   let version = $state("");
 
@@ -135,32 +140,7 @@
     showToast(errorText(err), true);
   }
 
-  function describe(items: Entry[]) {
-    return items.length === 1 ? `«${items[0].name}»` : `выбранные объекты (${items.length})`;
-  }
-
   // ---- listings ----
-
-  async function cloudListing(acc: Account, target: string): Promise<Listing> {
-    const list = markEncrypted(acc, await api.listDir(acc.id, target));
-    return { path: target, parent: target === "/" ? null : parentPath(target), crumbs: splitPath(target), entries: list };
-  }
-
-  /** Marks what is stored encrypted, as the desktop layout does. */
-  function markEncrypted(acc: Account, list: Entry[]): Entry[] {
-    if (acc.kind === "crypt") return list.map((e) => ({ ...e, locked: "Хранится зашифрованным" }));
-    const folders = accounts
-      .filter((a) => a.crypt?.base === acc.id)
-      .map((a) => ({ account: a, root: "/" + a.crypt!.root.replace(/^\/+|\/+$/g, "") }));
-    if (!folders.length) return list;
-    return list.map((e) => {
-      for (const { account: folder, root } of folders) {
-        if (e.path === root) return { ...e, locked: `Зашифрованная папка «${folder.name}»`, opensAccount: folder.id };
-        if (root === "/" || e.path.startsWith(root + "/")) return { ...e, locked: "Зашифрованные данные" };
-      }
-      return e;
-    });
-  }
 
   let requestSeq = 0;
 
@@ -172,7 +152,7 @@
     error = "";
     try {
       if (forMode === "cloud" && !acc) return;
-      const result = forMode === "cloud" ? await cloudListing(acc!, target) : await api.listLocal(target);
+      const result = forMode === "cloud" ? await listCloud(accounts, acc!, target) : await api.listLocal(target);
       if (seq !== requestSeq) return;
       if (result.path !== listing?.path) selected.clear();
       listing = result;
@@ -294,6 +274,10 @@
 
   function cancelPick() {
     if (!pick) return;
+    if (pick.kind === "backupLocal" || pick.kind === "backupRemote") {
+      pick = null;
+      return;
+    }
     const back: Mode = pick.kind === "download" ? "cloud" : "local";
     if (pick.kind === "download") accountId = pick.account.id;
     pick = null;
@@ -304,6 +288,17 @@
     if (!pick || !path || busy) return;
     const current = pick;
     const dir = path;
+    if (current.kind === "backupLocal" || current.kind === "backupRemote") {
+      if (backupDraft) {
+        if (current.kind === "backupLocal") backupDraft.local = dir;
+        else if (account) {
+          backupDraft.account_id = account.id;
+          backupDraft.remote = dir;
+        }
+      }
+      pick = null;
+      return;
+    }
     busy = current.kind === "download" ? "Подготовка скачивания…" : "Подготовка загрузки…";
     try {
       if (current.kind === "download") {
@@ -326,6 +321,30 @@
     } finally {
       busy = "";
     }
+  }
+
+  // ---- backups ----
+
+  const BACKUP_DEFAULT_LOCAL = "/storage/emulated/0/DCIM";
+
+  /** Opens the folder of the task being edited in the pane, to choose another. */
+  function pickBackupFolder(side: "local" | "remote") {
+    if (!backupDraft) return;
+    if (side === "local") {
+      pick = { kind: "backupLocal" };
+      show("local", backupDraft.local || BACKUP_DEFAULT_LOCAL);
+    } else {
+      pick = { kind: "backupRemote" };
+      const acc = accounts.find((a) => a.id === backupDraft!.account_id) ?? account ?? accounts[0];
+      if (acc) accountId = acc.id;
+      show("cloud", backupDraft.remote || undefined);
+    }
+  }
+
+  function backupFolder(entry: Entry) {
+    backupDraft = newBackupTask(entry.path, accountId ?? accounts[0]?.id ?? "");
+    selected.clear();
+    backups = true;
   }
 
   // ---- file operations ----
@@ -413,6 +432,7 @@
       { label: "Сначала новые", checked: sortKey === "modified", action: () => setSort("modified") },
       { label: "Сначала большие", checked: sortKey === "size", action: () => setSort("size") },
       "separator",
+      { label: "Автобэкап", icon: "clock", action: () => (backups = true) },
       { label: "Аккаунты", icon: "settings", action: () => (managing = true) },
     ];
     if (!storageOk) {
@@ -450,6 +470,9 @@
     }
     if (single && !single.is_dir && mode === "local") {
       list.push({ label: "Открыть", icon: "file", action: () => api.localOpen(single.path).catch(fail) });
+    }
+    if (single?.is_dir && mode === "local" && accounts.length) {
+      list.push({ label: "Автобэкап этой папки", icon: "clock", action: () => backupFolder(single) });
     }
     list.push({ label: "Переименовать", disabled: !single, action: () => single && rename(single) });
     if (mode === "cloud" && def?.share) {
@@ -506,7 +529,7 @@
   // ---- account changes ----
 
   function added(acc: Account) {
-    accounts = [...accounts, acc];
+    accountStore.added(acc);
     adding = false;
     editing = null;
     if (pick?.kind === "upload") {
@@ -522,14 +545,13 @@
       added(acc);
       return;
     }
-    accounts = accounts.map((a) => (a.id === acc.id ? acc : a));
+    accountStore.saved(acc);
     editing = null;
     if (mode === "cloud" && accountId === acc.id) reload();
   }
 
   async function removeAccount(acc: Account) {
-    await api.removeAccount(acc.id);
-    accounts = accounts.filter((a) => a.id !== acc.id);
+    await accountStore.remove(acc);
     delete cloudPaths[acc.id];
     if (accountId === acc.id) {
       accountId = accounts[0]?.id ?? null;
@@ -537,19 +559,8 @@
     }
   }
 
-  async function reorderAccounts(ids: string[]) {
-    const before = accounts;
-    accounts = ids.map((id) => before.find((a) => a.id === id)).filter((a) => a !== undefined);
-    try {
-      await api.reorderAccounts(ids);
-    } catch (err) {
-      accounts = before;
-      throw err;
-    }
-  }
-
   async function importedAccounts() {
-    accounts = await api.listAccounts();
+    await accountStore.load();
     if (!account && accounts[0]) selectAccount(accounts[0]);
   }
 
@@ -567,6 +578,8 @@
     } else if (managing) managing = false;
     else if (selecting) selected.clear();
     else if (pick) cancelPick();
+    else if (backupDraft) backupDraft = null;
+    else if (backups) backups = false;
     else if (!atRoot) goUp();
     else return false;
     return true;
@@ -598,15 +611,13 @@
     const last = Number(stored("updateChecked") ?? 0);
     if (Date.now() - last > UPDATE_CHECK_MS) checkUpdate();
 
-    api
-      .listAccounts()
+    accountStore
+      .load()
       .then((list) => {
-        accounts = list;
         if (!list.some((a) => a.id === accountId)) accountId = list[0]?.id ?? null;
       })
       .catch(fail)
       .finally(async () => {
-        loaded = true;
         await tick();
         show(mode);
       });
@@ -690,7 +701,7 @@
     {/if}
   </header>
 
-  {#if !pick || pick.kind === "upload"}
+  {#if !pick || pick.kind === "upload" || pick.kind === "backupRemote"}
     <nav class="tabs">
       <button
         class:active={mode === "cloud"}
@@ -714,10 +725,14 @@
 
   {#if pick}
     <div class="pick">
-      <Icon name={pick.kind === "download" ? "download" : "upload"} size={18} />
+      <Icon name={pick.kind === "download" ? "download" : pick.kind === "upload" ? "upload" : "clock"} size={18} />
       <span>
         {#if pick.kind === "download"}
           Откройте папку на телефоне, куда скачать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
+        {:else if pick.kind === "backupLocal"}
+          Откройте папку на телефоне, которую нужно копировать в облако
+        {:else if pick.kind === "backupRemote"}
+          Откройте папку в облаке, куда складывать копии
         {:else}
           Откройте папку в облаке, куда загрузить {pick.paths.length === 1 ? `«${baseName(pick.paths[0])}»` : `объекты (${pick.paths.length})`}
         {/if}
@@ -790,7 +805,7 @@
   </div>
 
   {#if toast}
-    <div class="toast" class:error={toast.error} role="status">
+    <div class="toast" class:error={toast.error} class:floating={backups && !pick} role="status">
       <span>{toast.text}</span>
       <button class="tool small" aria-label="Скрыть" onclick={() => (toast = null)}>
         <Icon name="close" size={16} />
@@ -806,8 +821,13 @@
         onclick={confirmPick}
         disabled={!!busy || loading || !path || (mode === "local" && !storageOk) || (mode === "cloud" && !account)}
       >
-        <Icon name={pick.kind === "download" ? "download" : "upload"} size={18} />
-        {pick.kind === "download" ? "Скачать сюда" : "Загрузить сюда"}
+        {#if pick.kind === "download" || pick.kind === "upload"}
+          <Icon name={pick.kind === "download" ? "download" : "upload"} size={18} />
+          {pick.kind === "download" ? "Скачать сюда" : "Загрузить сюда"}
+        {:else}
+          <Icon name="check" size={18} />
+          Выбрать эту папку
+        {/if}
       </button>
     </footer>
   {:else if selecting}
@@ -896,6 +916,18 @@
   </div>
 {/if}
 
+{#if backups && !pick}
+  <BackupScreen
+    {accounts}
+    {storageOk}
+    bind:draft={backupDraft}
+    onclose={() => (backups = false)}
+    onpick={pickBackupFolder}
+    onstorage={requestStorage}
+    ontoast={showToast}
+  />
+{/if}
+
 {#if previewing && account}
   <PreviewDialog account={account} files={previewing.files} start={previewing.start} onclose={() => (previewing = null)} />
 {/if}
@@ -922,7 +954,7 @@
   onadd={() => (adding = true)}
   onedit={(a) => (editing = a)}
   onremove={removeAccount}
-  onreorder={reorderAccounts}
+  onreorder={(ids) => accountStore.reorder(ids)}
   onimported={importedAccounts}
 />
 
@@ -1279,6 +1311,15 @@
 
   .toast .tool {
     color: inherit;
+  }
+
+  /* Above the backup screen. */
+  .toast.floating {
+    position: fixed;
+    right: 0;
+    bottom: 8px;
+    left: 0;
+    z-index: 35;
   }
 
   .toast.error {

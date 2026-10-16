@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 belka-core.workspace = true
+belka-store.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
@@ -22,9 +23,10 @@ futures-util.workspace = true
 # Without colors and "did you mean" suggestions, which add a lot of code.
 clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context", "derive", "env"] }
 dotenvy = "0.15"
-hex = "0.4"
-md-5 = "0.10"
-walkdir = "2.5"
 regex-lite = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "tracing-log"] }
 tempfile = "3"
+
+# The desktop app's accounts: their credentials are in the system keyring.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+belka-store = { workspace = true, features = ["keyring"] }

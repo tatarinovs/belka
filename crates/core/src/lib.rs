@@ -7,6 +7,7 @@ pub mod oauth;
 pub mod progress;
 pub mod provider;
 pub mod storage;
+pub mod sync;
 pub mod utils;
 
 pub use progress::Progress;

@@ -1,0 +1,36 @@
+[package]
+name = "belka-store"
+description = "Saved accounts, credentials and backup tasks shared by the GUI and the CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[features]
+# Credentials in the OS keyring (Windows Credential Manager, Keychain,
+# Secret Service); without it only file and in-memory storage exist.
+keyring = ["dep:keyring"]
+
+[dependencies]
+belka-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+tokio = { workspace = true, features = ["sync", "rt-multi-thread"] }
+futures-util.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6", optional = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", optional = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", optional = true, features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"
+async-trait.workspace = true
+tokio = { workspace = true, features = ["macros"] }

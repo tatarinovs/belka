@@ -34,7 +34,27 @@ class TransfersArgs {
     var totalBytes: Long = 0
 }
 
-/** What the Rust side needs from Android: storage access and the transfer service. */
+@InvokeArg
+class ScheduledBackup {
+    var id: String = ""
+    var name: String = ""
+    var intervalHours: Int = 24
+    var wifiOnly: Boolean = true
+    var chargingOnly: Boolean = false
+}
+
+@InvokeArg
+class ScheduleArgs {
+    var tasks: Array<ScheduledBackup> = arrayOf()
+}
+
+@InvokeArg
+class RunBackupArgs {
+    var id: String = ""
+    var name: String = ""
+}
+
+/** What the Rust side needs from Android: storage access, the transfer service and backups. */
 @TauriPlugin
 class BelkaPlugin(private val activity: Activity) : Plugin(activity) {
     private var askedNotifications = false
@@ -104,6 +124,23 @@ class BelkaPlugin(private val activity: Activity) : Plugin(activity) {
         val args = invoke.parseArgs(TransfersArgs::class.java)
         if (args.active > 0) askNotifications()
         TransferService.update(activity.applicationContext, args)
+        invoke.resolve()
+    }
+
+    /** Replaces the WorkManager schedule of backups with the enabled tasks. */
+    @Command
+    fun scheduleBackups(invoke: Invoke) {
+        val args = invoke.parseArgs(ScheduleArgs::class.java)
+        if (args.tasks.isNotEmpty()) askNotifications()
+        BackupWorker.schedule(activity.applicationContext, args.tasks)
+        invoke.resolve()
+    }
+
+    @Command
+    fun runBackup(invoke: Invoke) {
+        val args = invoke.parseArgs(RunBackupArgs::class.java)
+        askNotifications()
+        BackupWorker.runNow(activity.applicationContext, args.id, args.name)
         invoke.resolve()
     }
 

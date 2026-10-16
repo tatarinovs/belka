@@ -19,3 +19,14 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Rust finds the native methods of backups by class and method names.
+-keep class io.github.tatarinovs.belka.BackupNative {
+    native <methods>;
+}
+
+# WorkManager's Room database is created by reflection; full R8 optimization
+# strips its constructor otherwise.
+-keep class * extends androidx.room.RoomDatabase {
+    <init>();
+}

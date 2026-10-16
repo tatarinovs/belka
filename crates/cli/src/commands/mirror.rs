@@ -1,22 +1,25 @@
 //! Mirrors files from a list of URLs (typically GitHub releases) into the cloud.
 
-use super::Stats;
-use crate::client::{
+use super::{log_totals, Stats};
+use anyhow::{bail, Context, Result};
+use belka_core::client::{
     build_http_client, download_to_file, http_error, send, API_TIMEOUT, USER_AGENT,
 };
-use crate::format::format_bytes;
-use crate::hash::compute_md5_file;
-use crate::storage::{RemoteFileInfo, StorageProvider};
-use crate::utils::path::{encode_component, join_remote, normalize_remote_dir, sanitize_file_name};
-use anyhow::{bail, Context, Result};
-use belka_core::Progress;
+use belka_core::utils::format_bytes;
+use belka_core::utils::hash::compute_md5_file;
+use belka_core::utils::path::{encode_component, join_remote, normalize_remote_dir, sanitize_file_name};
+use belka_core::{Progress, RemoteFileInfo, StorageProvider};
+use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt};
 use percent_encoding::percent_decode_str;
 use regex_lite::Regex;
-use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT as USER_AGENT_HEADER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, LAST_MODIFIED, USER_AGENT as USER_AGENT_HEADER};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use url::Url;
 
@@ -33,6 +36,7 @@ fn versioned_name(name: &str) -> Option<(&str, &str)> {
 
 pub struct MirrorOptions {
     pub dry_run: bool,
+    pub jobs: usize,
     pub asset_filter: Regex,
 }
 
@@ -47,14 +51,6 @@ pub struct UrlList {
 }
 
 impl UrlList {
-    /// The cloud path of the list file, so that `--clean` can keep it.
-    pub fn remote_path(&self) -> Option<&str> {
-        match &self.source {
-            UrlSource::Remote(path) => Some(path),
-            UrlSource::Local(_) => None,
-        }
-    }
-
     fn describe(&self) -> String {
         match &self.source {
             UrlSource::Local(path) => format!("local file '{}'", path.display()),
@@ -102,7 +98,7 @@ struct GithubRelease {
     tag: Option<String>,
 }
 
-/// Finds the URL list: `--urls-file` (local, then cloud), otherwise
+/// Finds the URL list: `--urls` (local, then cloud), otherwise
 /// `./urls.txt`, `<exe dir>/urls.txt`, `<remote dir>/urls.txt`, `/urls.txt`.
 pub async fn load_url_list(
     provider: &dyn StorageProvider,
@@ -153,7 +149,7 @@ pub async fn load_url_list(
 
     bail!(
         "urls.txt not found. Looked in the current folder, next to the executable and in the cloud ({}). \
-         Create it or pass --urls-file",
+         Create it or pass --urls",
         remote_candidates.join(", ")
     )
 }
@@ -178,7 +174,7 @@ fn read_local_list(path: &Path) -> Result<UrlList> {
     })
 }
 
-pub async fn run_remote_urls(
+pub async fn run(
     provider: &dyn StorageProvider,
     remote_dir: &str,
     list: &UrlList,
@@ -190,60 +186,65 @@ pub async fn run_remote_urls(
         return Ok(stats);
     }
     info!(
-        "Mirroring {} URL(s) from {}",
+        "Mirroring {} URL(s) from {} with {} parallel job(s)",
         list.urls.len(),
-        list.describe()
+        list.describe(),
+        opts.jobs
     );
+    let started = Instant::now();
+    let client = build_http_client()?;
 
-    let mut mirror = Mirror {
-        provider,
-        base_dir: normalize_remote_dir(remote_dir),
-        opts,
-        client: build_http_client()?,
-        temp_dir: tempfile::Builder::new()
-            .prefix("belka-")
-            .tempdir()
-            .context("Failed to create a temporary folder")?,
-        listings: HashMap::new(),
-        ensured_dirs: HashSet::new(),
-    };
-
+    // Release lookups are few and cheap; the downloads run in parallel.
+    let mut tasks = Vec::new();
     for url in &list.urls {
         info!("Processing {url}");
-        let tasks = match resolve_tasks(&mirror.client, url, &opts.asset_filter).await {
-            Ok(tasks) => tasks,
+        match resolve_tasks(&client, url, &opts.asset_filter).await {
+            Ok(found) => tasks.extend(found),
             Err(err) => {
                 error!("  [!] {err:#}");
                 stats.failed += 1;
-                continue;
-            }
-        };
-        for task in tasks {
-            stats.processed += 1;
-            match mirror.mirror(&task, &mut stats).await {
-                Ok(Some(bytes)) => {
-                    stats.uploaded += 1;
-                    stats.bytes_uploaded += bytes;
-                }
-                Ok(None) => stats.skipped += 1,
-                Err(err) => {
-                    error!("  [!] {}: {err:#}", task.remote_name());
-                    stats.failed += 1;
-                }
             }
         }
     }
 
-    info!("--------------------------------------------------");
-    info!(
-        "Files: {} processed, {} uploaded ({}), {} up to date, {} old versions removed, {} failed",
-        stats.processed,
-        stats.uploaded,
-        format_bytes(stats.bytes_uploaded),
-        stats.skipped,
-        stats.deleted,
-        stats.failed
-    );
+    let mirror = Mirror {
+        provider,
+        base_dir: normalize_remote_dir(remote_dir),
+        opts,
+        client,
+        temp_dir: tempfile::Builder::new()
+            .prefix("belka-")
+            .tempdir()
+            .context("Failed to create a temporary folder")?,
+        listings: Mutex::new(HashMap::new()),
+        ensured_dirs: Mutex::new(HashSet::new()),
+    };
+    let mut results = stream::iter(tasks)
+        .map(|task| {
+            let mirror = &mirror;
+            async move {
+                let mut deleted = 0;
+                let result = mirror.mirror(&task, &mut deleted).await;
+                (task, result, deleted)
+            }
+        })
+        .buffer_unordered(opts.jobs.max(1));
+    while let Some((task, result, deleted)) = results.next().await {
+        stats.processed += 1;
+        stats.deleted += deleted;
+        match result {
+            Ok(Some(bytes)) => {
+                stats.transferred += 1;
+                stats.bytes += bytes;
+            }
+            Ok(None) => stats.unchanged += 1,
+            Err(err) => {
+                error!("  [!] {}: {err:#}", task.remote_name());
+                stats.failed += 1;
+            }
+        }
+    }
+    log_totals("uploaded", &stats, started.elapsed(), opts.dry_run);
     Ok(stats)
 }
 
@@ -254,13 +255,22 @@ struct Mirror<'a> {
     client: Client,
     temp_dir: tempfile::TempDir,
     /// Cached folder listings, kept in sync with our own changes.
-    listings: HashMap<String, Vec<RemoteFileInfo>>,
-    ensured_dirs: HashSet<String>,
+    listings: Mutex<HashMap<String, Vec<RemoteFileInfo>>>,
+    /// Folder creation is serialized: Google Drive would make duplicates.
+    ensured_dirs: Mutex<HashSet<String>>,
+}
+
+/// What a HEAD request tells about a direct link.
+#[derive(Default)]
+struct Head {
+    size: Option<u64>,
+    modified: Option<DateTime<Utc>>,
 }
 
 impl Mirror<'_> {
-    /// Returns `Some(bytes)` if a file was uploaded, `None` if it was up to date.
-    async fn mirror(&mut self, task: &DownloadTask, stats: &mut Stats) -> Result<Option<u64>> {
+    /// Returns `Some(bytes)` if a file was uploaded, `None` if it was up to
+    /// date; counts deleted old versions in `deleted`.
+    async fn mirror(&self, task: &DownloadTask, deleted: &mut u64) -> Result<Option<u64>> {
         let target_dir = if task.subfolder.is_empty() {
             self.base_dir.clone()
         } else {
@@ -269,6 +279,7 @@ impl Mirror<'_> {
         let file_name = task.remote_name();
         let remote_path = join_remote(&target_dir, &file_name);
 
+        let mut head = Head::default();
         if let Some(tag) = &task.tag {
             let exists = self
                 .listing(&target_dir)
@@ -277,24 +288,49 @@ impl Mirror<'_> {
                 .any(|item| !item.is_dir && item.name == file_name);
             if exists {
                 info!("  [=] Up to date: {remote_path}");
-                self.remove_old_versions(&target_dir, tag, &task.asset, stats)
-                    .await;
+                *deleted += self.remove_old_versions(&target_dir, tag, &task.asset).await;
                 return Ok(None);
+            }
+        } else {
+            // A direct link: the server's size and date usually tell whether
+            // the file changed, without downloading it.
+            head = self.head(&task.url).await;
+            if let Some(remote) = self.provider.get_file_info(&remote_path).await? {
+                let same_size = head.size == Some(remote.size);
+                let not_newer = matches!(
+                    (head.modified, remote.modified),
+                    (Some(server), Some(cloud)) if server <= cloud + chrono::Duration::seconds(2)
+                );
+                if same_size && not_newer {
+                    info!("  [=] Unchanged (same size and date): {remote_path}");
+                    return Ok(None);
+                }
             }
         }
 
         if self.opts.dry_run {
             info!("  [dry-run] Would download {} -> {remote_path}", task.url);
             if let Some(tag) = &task.tag {
-                self.remove_old_versions(&target_dir, tag, &task.asset, stats)
-                    .await;
+                *deleted += self.remove_old_versions(&target_dir, tag, &task.asset).await;
             }
             return Ok(Some(0));
         }
 
-        let local = self.temp_dir.path().join(&file_name);
+        // Parallel downloads of equal names (two repositories with one asset
+        // name) must not share a temporary file.
+        let local = self
+            .temp_dir
+            .path()
+            .join(format!("{}-{file_name}", task.subfolder));
         info!("  [v] Downloading {}", task.url);
         let size = download_to_file(&self.client, &task.url, &local).await?;
+        if let Some(modified) = head.modified {
+            // The cloud keeps the server's date where the provider can.
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(&local)
+                .and_then(|f| f.set_modified(modified.into()));
+        }
         let result = self
             .upload(task, &local, size, &target_dir, &remote_path)
             .await;
@@ -303,14 +339,36 @@ impl Mirror<'_> {
 
         // Old versions are removed only after the new one is safely stored.
         if let (Some(tag), true) = (&task.tag, uploaded) {
-            self.remove_old_versions(&target_dir, tag, &task.asset, stats)
-                .await;
+            *deleted += self.remove_old_versions(&target_dir, tag, &task.asset).await;
         }
         Ok(uploaded.then_some(size))
     }
 
+    async fn head(&self, url: &str) -> Head {
+        let resp = send("head", || {
+            Ok(self
+                .client
+                .head(url)
+                .header(USER_AGENT_HEADER, USER_AGENT)
+                .timeout(API_TIMEOUT))
+        })
+        .await;
+        match resp {
+            Ok(resp) if resp.status().is_success() => Head {
+                size: resp.content_length().filter(|n| *n > 0),
+                modified: resp
+                    .headers()
+                    .get(LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| DateTime::parse_from_rfc2822(v.trim()).ok())
+                    .map(|d| d.with_timezone(&Utc)),
+            },
+            _ => Head::default(),
+        }
+    }
+
     async fn upload(
-        &mut self,
+        &self,
         task: &DownloadTask,
         local: &Path,
         size: u64,
@@ -331,10 +389,14 @@ impl Mirror<'_> {
             }
         }
 
-        if self.ensured_dirs.insert(target_dir.to_string()) {
-            if let Err(err) = self.provider.ensure_dir(target_dir).await {
-                self.ensured_dirs.remove(target_dir);
-                return Err(err.context(format!("Failed to create folder '{target_dir}'")));
+        {
+            let mut ensured = self.ensured_dirs.lock().await;
+            if !ensured.contains(target_dir) {
+                self.provider
+                    .ensure_dir(target_dir)
+                    .await
+                    .with_context(|| format!("Failed to create folder '{target_dir}'"))?;
+                ensured.insert(target_dir.to_string());
             }
         }
 
@@ -344,7 +406,7 @@ impl Mirror<'_> {
             .await?;
         info!("  [+] Uploaded {remote_path}");
 
-        if let Some(items) = self.listings.get_mut(target_dir) {
+        if let Some(items) = self.listings.lock().await.get_mut(target_dir) {
             let name = remote_path
                 .rsplit('/')
                 .next()
@@ -363,44 +425,43 @@ impl Mirror<'_> {
         Ok(true)
     }
 
-    async fn listing(&mut self, dir: &str) -> Result<&mut Vec<RemoteFileInfo>> {
-        if !self.listings.contains_key(dir) {
+    async fn listing(&self, dir: &str) -> Result<Vec<RemoteFileInfo>> {
+        let mut listings = self.listings.lock().await;
+        if !listings.contains_key(dir) {
             let items = self
                 .provider
                 .list_dir(dir)
                 .await
                 .with_context(|| format!("Failed to list '{dir}'"))?;
-            self.listings.insert(dir.to_string(), items);
+            listings.insert(dir.to_string(), items);
         }
-        Ok(self.listings.get_mut(dir).expect("inserted above"))
+        Ok(listings[dir].clone())
     }
 
-    /// Deletes `[other-tag] asset` files. Failures are logged, not fatal.
-    async fn remove_old_versions(&mut self, dir: &str, tag: &str, asset: &str, stats: &mut Stats) {
-        let provider = self.provider;
-        let dry_run = self.opts.dry_run;
+    /// Deletes `[other-tag] asset` files; returns how many. Failures are
+    /// logged, not fatal.
+    async fn remove_old_versions(&self, dir: &str, tag: &str, asset: &str) -> u64 {
         let items = match self.listing(dir).await {
             Ok(items) => items,
             Err(err) => {
                 warn!("  [~] Cannot look for old versions: {err:#}");
-                return;
+                return 0;
             }
         };
-        let stale: Vec<RemoteFileInfo> = old_versions(items, tag, asset)
-            .into_iter()
-            .cloned()
-            .collect();
-        for item in stale {
-            if dry_run {
+        let mut deleted = 0;
+        for item in old_versions(&items, tag, asset) {
+            if self.opts.dry_run {
                 info!("  [dry-run] Would delete old version {}", item.path);
-                stats.deleted += 1;
+                deleted += 1;
                 continue;
             }
-            match provider.delete(&item.path, false).await {
+            match self.provider.delete(&item.path, false).await {
                 Ok(()) => {
                     info!("  [-] Deleted old version {}", item.path);
-                    items.retain(|i| i.path != item.path);
-                    stats.deleted += 1;
+                    if let Some(items) = self.listings.lock().await.get_mut(dir) {
+                        items.retain(|i| i.path != item.path);
+                    }
+                    deleted += 1;
                 }
                 Err(err) => warn!(
                     "  [~] Failed to delete old version '{}': {err:#}",
@@ -408,6 +469,7 @@ impl Mirror<'_> {
                 ),
             }
         }
+        deleted
     }
 }
 

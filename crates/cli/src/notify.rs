@@ -2,10 +2,10 @@
 //! healthchecks.io-style ping URL. A failed notification is logged and
 //! never changes the exit code.
 
-use crate::format::format_bytes;
-use crate::modes::Stats;
+use crate::commands::Stats;
 use anyhow::{bail, Result};
 use belka_core::client::{build_http_client, ensure_success, send_with, RetryPolicy};
+use belka_core::utils::format_bytes;
 use clap::ValueEnum;
 use reqwest::Client;
 use serde::Serialize;
@@ -41,12 +41,43 @@ impl Status {
         self == Self::Success
     }
 
-    fn title(self) -> &'static str {
+    fn title(self, mode: Mode) -> String {
+        let what = mode.noun();
         match self {
-            Self::Success => "✅ Backup succeeded",
-            Self::Partial => "⚠️ Backup finished with errors",
-            Self::Failure => "❌ Backup failed",
-            Self::Interrupted => "⏹ Backup interrupted",
+            Self::Success => format!("✅ {what} succeeded"),
+            Self::Partial => format!("⚠️ {what} finished with errors"),
+            Self::Failure => format!("❌ {what} failed"),
+            Self::Interrupted => format!("⏹ {what} interrupted"),
+        }
+    }
+}
+
+/// What kind of run is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Upload,
+    Restore,
+    Mirror,
+    /// A backup task of the app.
+    Task,
+    Test,
+}
+
+impl Mode {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Upload | Self::Task => "Backup",
+            Self::Restore => "Restore",
+            Self::Mirror => "Mirror",
+            Self::Test => "Test",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Restore => "downloaded",
+            _ => "uploaded",
         }
     }
 }
@@ -54,10 +85,9 @@ impl Status {
 /// What a run ended with.
 pub struct Report {
     pub status: Status,
-    /// `upload`, `mirror` or `restore`.
-    pub mode: &'static str,
-    pub provider: String,
-    pub remote: String,
+    pub mode: Mode,
+    /// What was copied where, e.g. `yandex:/Backups`.
+    pub target: String,
     pub stats: Stats,
     pub elapsed: Duration,
     pub error: Option<String>,
@@ -88,12 +118,11 @@ struct WebhookPayload<'a> {
     status: Status,
     name: Option<&'a str>,
     host: &'a str,
-    mode: &'a str,
-    provider: &'a str,
-    remote: &'a str,
+    mode: Mode,
+    target: &'a str,
     processed: u64,
-    uploaded: u64,
-    skipped: u64,
+    transferred: u64,
+    unchanged: u64,
     deleted: u64,
     failed: u64,
     bytes: u64,
@@ -194,9 +223,8 @@ impl Notifier {
     pub async fn test(&self) -> Result<()> {
         let report = Report {
             status: Status::Success,
-            mode: "test",
-            provider: "-".into(),
-            remote: "-".into(),
+            mode: Mode::Test,
+            target: "-".into(),
             stats: Stats::default(),
             elapsed: Duration::ZERO,
             error: None,
@@ -240,24 +268,21 @@ impl Notifier {
     }
 
     fn message(&self, r: &Report) -> String {
+        let title = r.status.title(r.mode);
         let mut lines = vec![match &self.name {
-            Some(name) => format!("{} — {name}", r.status.title()),
-            None => r.status.title().to_string(),
+            Some(name) => format!("{title} — {name}"),
+            None => title,
         }];
         lines.push(format!("Host: {}", self.host));
-        lines.push(format!("Target: {} {} ({})", r.provider, r.remote, r.mode));
+        lines.push(format!("Target: {}", r.target));
         let s = &r.stats;
-        let moved = if r.mode == "restore" {
-            "downloaded"
-        } else {
-            "uploaded"
-        };
-        if s.processed > 0 || s.failed > 0 {
+        if s.transferred + s.unchanged + s.failed > 0 {
             lines.push(format!(
-                "Files: {} {moved} ({}), {} unchanged, {} failed",
-                s.uploaded,
-                format_bytes(s.bytes_uploaded),
-                s.skipped,
+                "Files: {} {} ({}), {} unchanged, {} failed",
+                s.transferred,
+                r.mode.verb(),
+                format_bytes(s.bytes),
+                s.unchanged,
                 s.failed
             ));
         }
@@ -301,14 +326,13 @@ impl Notifier {
             name: self.name.as_deref(),
             host: &self.host,
             mode: r.mode,
-            provider: &r.provider,
-            remote: &r.remote,
+            target: &r.target,
             processed: r.stats.processed,
-            uploaded: r.stats.uploaded,
-            skipped: r.stats.skipped,
+            transferred: r.stats.transferred,
+            unchanged: r.stats.unchanged,
             deleted: r.stats.deleted,
             failed: r.stats.failed,
-            bytes: r.stats.bytes_uploaded,
+            bytes: r.stats.bytes,
             duration_secs: r.elapsed.as_secs(),
             error: r.error.as_deref(),
             version: env!("CARGO_PKG_VERSION"),
@@ -392,16 +416,15 @@ mod tests {
     fn message_lists_what_happened() {
         let report = Report {
             status: Status::Partial,
-            mode: "upload",
-            provider: "yandex".into(),
-            remote: "/Backups".into(),
+            mode: Mode::Upload,
+            target: "yandex:/Backups".into(),
             stats: Stats {
                 processed: 5,
-                uploaded: 3,
-                skipped: 1,
+                transferred: 3,
+                unchanged: 1,
                 deleted: 2,
                 failed: 1,
-                bytes_uploaded: 2048,
+                bytes: 2048,
             },
             elapsed: Duration::from_secs(125),
             error: None,
@@ -409,7 +432,7 @@ mod tests {
         let text = notifier(Some("nightly")).message(&report);
         assert_eq!(
             text,
-            "⚠️ Backup finished with errors — nightly\nHost: srv\nTarget: yandex /Backups (upload)\n\
+            "⚠️ Backup finished with errors — nightly\nHost: srv\nTarget: yandex:/Backups\n\
              Files: 3 uploaded (2.0 KB), 1 unchanged, 1 failed\nDeleted: 2\nTime: 2m 5s"
         );
     }

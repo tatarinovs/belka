@@ -1,4 +1,4 @@
-//! `belka --login`: signs in through the browser and prints the .env lines,
+//! `belka login`: signs in through the browser and prints the .env lines,
 //! like `rclone authorize`. Run it on a desktop, then copy the lines to the
 //! server's .env.
 
@@ -13,7 +13,7 @@ pub async fn run(kind: ProviderKind) -> Result<()> {
     let service = match kind {
         ProviderKind::Google => Service::Google,
         ProviderKind::Yandex => Service::Yandex,
-        _ => bail!("--login supports google and yandex; other providers use passwords or keys"),
+        _ => bail!("login supports google and yandex; other providers use passwords or keys"),
     };
     let Some(app) = config::oauth_app(service)? else {
         let prefix = if service == Service::Google {
@@ -25,7 +25,7 @@ pub async fn run(kind: ProviderKind) -> Result<()> {
     };
     let builtin = service.builtin_app().as_ref() == Some(&app);
 
-    // Messages go to stderr, so `belka --login google >> .env` writes only the variables.
+    // Messages go to stderr, so `belka login google >> .env` writes only the variables.
     let signed_in = oauth::sign_in(service, &app, |url| {
         eprintln!(
             "Opening the browser to sign in to {}. If it does not open, visit:\n\n{url}\n",

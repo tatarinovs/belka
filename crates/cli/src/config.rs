@@ -27,7 +27,7 @@ pub enum ProviderKind {
 }
 
 /// Extracts `--env-file` before clap runs, so that values from the file can
-/// serve as defaults for `env = "..."` arguments such as CLOUD_PROVIDER.
+/// serve as defaults for `env = "..."` arguments such as CLOUD_JOBS.
 pub fn env_file_from_args() -> Option<PathBuf> {
     find_env_file_arg(env::args_os().skip(1))
 }
@@ -97,7 +97,7 @@ fn require<const N: usize>(provider: &str, names: [&str; N]) -> Result<[String; 
         .collect();
     if !missing.is_empty() {
         bail!(
-            "{provider} is not configured: set {} in .env or the environment (see --list-providers)",
+            "{provider} is not configured: set {} in .env or the environment (see `belka providers`)",
             missing.join(", ")
         );
     }
@@ -200,7 +200,7 @@ fn provider_config(kind: ProviderKind) -> Result<ProviderConfig> {
                 }
                 (None, Some(access_token)) => GoogleAuth::AccessToken { access_token },
                 (None, None) => bail!(
-                    "Google Drive is not configured: run `belka --login google` to get \
+                    "Google Drive is not configured: run `belka login google` to get \
                      GOOGLE_REFRESH_TOKEN, or set a short-lived GOOGLE_DRIVE_TOKEN"
                 ),
             };
@@ -263,18 +263,23 @@ pub fn print_providers() {
     };
     println!(
         "\
-Supported cloud providers (-p, --provider):
+Cloud locations are SOURCE:PATH. SOURCE is one of the providers below, set up
+by environment variables, an account of the desktop app on this computer, or an
+account in a file exported from the app (--accounts FILE, password in
+BELKA_ACCOUNTS_PASSWORD). `belka accounts` lists the accounts.
+
+Providers:
 
   yandex   Yandex Disk (REST API)
            YANDEX_TOKEN                OAuth token with Disk REST API access,
-                                       `belka --login yandex` prints one
+                                       `belka login yandex` prints one
 
   mailru   Mail.ru Cloud (WebDAV)
            MAILRU_USER, MAILRU_PASSWORD  e-mail and an app password
            MAILRU_WEBDAV_URL           optional, default {MAILRU_WEBDAV_URL}
 
   google   Google Drive (API v3)
-           GOOGLE_REFRESH_TOKEN        recommended, `belka --login google` prints one;
+           GOOGLE_REFRESH_TOKEN        recommended, `belka login google` prints one;
                                        access tokens are renewed automatically
            GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
                                        your own OAuth app; default: the built-in one{builtin}
@@ -300,6 +305,7 @@ Supported cloud providers (-p, --provider):
            SYNOLOGY_INSECURE           optional, 'true' to accept a self-signed certificate
 
 Encryption (any provider, rclone crypt format):
+           (for providers set up here; app accounts have encrypted folders of their own)
            CRYPT_PASSWORD              enables encryption: files are encrypted before
                                        upload and decrypted on download
            CRYPT_PASSWORD2             optional salt, rclone's password2
@@ -307,7 +313,7 @@ Encryption (any provider, rclone crypt format):
            CRYPT_FILENAMES             standard (default, names encrypted) or off
            Plain passwords, not the obscured values from rclone.conf (see `rclone reveal`).
 
-Notifications (any combination; `belka --notify-test` checks them):
+Notifications (any combination; `belka notify-test` checks them):
            NOTIFY_TELEGRAM_TOKEN, NOTIFY_TELEGRAM_CHAT
                                        bot token from @BotFather and the chat ID
            NOTIFY_TELEGRAM_API         optional, Bot API server, default https://api.telegram.org
@@ -318,6 +324,7 @@ Notifications (any combination; `belka --notify-test` checks them):
            NOTIFY_NAME                 optional job name shown in messages
 
 Optional for URL mirroring: GITHUB_TOKEN (raises the GitHub API rate limit).
+Other: CLOUD_JOBS (parallel transfers), BELKA_CONFIG_DIR (the app's settings folder).
 
 Variables are read from the environment and from a .env file (current folder,
 next to the executable, or --env-file). Real environment variables take precedence."
