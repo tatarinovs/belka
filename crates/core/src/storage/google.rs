@@ -12,11 +12,11 @@ use crate::progress::Progress;
 use crate::utils::path::{join_remote, normalize_remote_dir, split_remote};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE};
 use reqwest::{redirect, Client, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use chrono::{DateTime, SecondsFormat, Utc};
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
@@ -321,7 +321,13 @@ impl GoogleDriveProvider {
     ) -> Result<()> {
         let size = source.len();
         let session = self
-            .start_session(existing.as_deref(), parent_id, name, size, source.modified())
+            .start_session(
+                existing.as_deref(),
+                parent_id,
+                name,
+                size,
+                source.modified(),
+            )
             .await?;
         self.upload_resumable(&session, source, size, progress)
             .await

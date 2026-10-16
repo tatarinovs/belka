@@ -14,6 +14,17 @@ pub(crate) struct FakeCloud {
     pub uploads: Mutex<Vec<(String, bool)>>,
     pub deleted: Mutex<Vec<String>>,
     pub with_md5: bool,
+    /// MD5 not in listings but given by `content_md5`, like Synology.
+    pub md5_on_request: bool,
+    pub md5_requests: Mutex<usize>,
+    /// Files someone else writes while `upload_new` is on its way there:
+    /// it then fails with `AlreadyExists`, like on Synology.
+    pub sneak_in: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    hex::encode(Md5::digest(data))
 }
 
 impl FakeCloud {
@@ -31,16 +42,19 @@ impl FakeCloud {
                 path: path.to_string(),
                 is_dir: false,
                 size: data.len() as u64,
-                md5: self.with_md5.then(|| {
-                    use md5::{Digest, Md5};
-                    hex::encode(Md5::digest(data))
-                }),
+                md5: self.with_md5.then(|| md5_hex(data)),
                 modified: Some(Utc::now()),
             });
         }
         let prefix = format!("{path}/");
-        let implied = self.files.lock().unwrap().keys().any(|p| p.starts_with(&prefix));
-        (implied || self.dirs.lock().unwrap().contains(path)).then(|| RemoteFileInfo::dir(path.into()))
+        let implied = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|p| p.starts_with(&prefix));
+        (implied || self.dirs.lock().unwrap().contains(path))
+            .then(|| RemoteFileInfo::dir(path.into()))
     }
 
     fn store(&self, source: &dyn Source, path: &str, new: bool) {
@@ -64,11 +78,27 @@ impl StorageProvider for FakeCloud {
     async fn get_file_info(&self, path: &str) -> Result<Option<RemoteFileInfo>> {
         Ok(self.info(path))
     }
+    async fn content_md5(&self, path: &str) -> Result<Option<String>> {
+        if !self.md5_on_request {
+            return Ok(None);
+        }
+        *self.md5_requests.lock().unwrap() += 1;
+        Ok(self
+            .files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|data| md5_hex(data)))
+    }
     async fn upload(&self, source: &dyn Source, path: &str, _: &Progress) -> Result<()> {
         self.store(source, path, false);
         Ok(())
     }
     async fn upload_new(&self, source: &dyn Source, path: &str, _: &Progress) -> Result<()> {
+        if let Some(data) = self.sneak_in.lock().unwrap().remove(path) {
+            self.put(path, &data);
+            return Err(crate::storage::AlreadyExists(path.to_string()).into());
+        }
         self.store(source, path, true);
         Ok(())
     }
@@ -141,11 +171,7 @@ fn scan_applies_the_filter() {
     assert_eq!(tree.files.len(), 6);
     assert_eq!(tree.dirs, [".thumbnails", "Camera", "cache", "empty"]);
 
-    let filter = Filter::new(
-        &["*.jpg".into(), "*.mp4".into()],
-        &["cache".into()],
-        true,
-    );
+    let filter = Filter::new(&["*.jpg".into(), "*.mp4".into()], &["cache".into()], true);
     let tree = scan(root, &filter).unwrap();
     assert_eq!(relatives(&tree), ["Camera/a.JPG", "v.mp4"]);
     assert_eq!(tree.dirs, ["Camera", "empty"]);
@@ -173,9 +199,15 @@ async fn upload_skips_what_the_cloud_has_and_what_the_index_knows() {
     let summary = upload(&cloud, &tree, "/B", Some(&index), &opts, &())
         .await
         .unwrap();
-    assert_eq!((summary.transferred, summary.unchanged, summary.failed), (1, 1, 0));
+    assert_eq!(
+        (summary.transferred, summary.unchanged, summary.failed),
+        (1, 1, 0)
+    );
     // Not in the cloud: uploaded without looking the file up again.
-    assert_eq!(*cloud.uploads.lock().unwrap(), [("/B/sub/b.txt".to_string(), true)]);
+    assert_eq!(
+        *cloud.uploads.lock().unwrap(),
+        [("/B/sub/b.txt".to_string(), true)]
+    );
     assert_eq!(index.lock().unwrap().len(), 2);
     index.lock().unwrap().save().unwrap();
 
@@ -190,6 +222,147 @@ async fn upload_skips_what_the_cloud_has_and_what_the_index_knows() {
     // An index made for another target is not trusted.
     let other = Index::load(dir.path().join("index.json"), "src->C");
     assert!(other.is_empty());
+}
+
+fn keep_both() -> UploadOptions {
+    UploadOptions {
+        keep_both: true,
+        ..UploadOptions::default()
+    }
+}
+
+fn age(root: &Path, relative: &str) {
+    let hour_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(root.join(relative))
+        .unwrap()
+        .set_modified(hour_ago)
+        .unwrap();
+}
+
+fn cloud_data(cloud: &FakeCloud, path: &str) -> Vec<u8> {
+    cloud.files.lock().unwrap()[path].clone()
+}
+
+#[tokio::test]
+async fn keep_both_puts_a_file_next_to_another_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("phone");
+    write(&root, "Camera/IMG_1.jpg", &[0; 5]);
+    write(&root, "Camera/IMG_2.jpg", &[0; 3]);
+    // Another date than the cloud's, so equal sizes are told apart by MD5.
+    age(&root, "Camera/IMG_1.jpg");
+    let cloud = FakeCloud {
+        md5_on_request: true,
+        ..FakeCloud::default()
+    };
+    // Another phone's photos: the same size, and a different one.
+    cloud.put("/B/Camera/IMG_1.jpg", b"other");
+    cloud.put("/B/Camera/IMG_2.jpg", b"longer one");
+
+    let index_file = dir.path().join("index.json");
+    let index = Mutex::new(Index::load(&index_file, "phone->B"));
+    let tree = scan(&root, &Filter::all()).unwrap();
+    let summary = upload(&cloud, &tree, "/B", Some(&index), &keep_both(), &())
+        .await
+        .unwrap();
+    assert_eq!((summary.transferred, summary.failed), (2, 0));
+    assert_eq!(cloud_data(&cloud, "/B/Camera/IMG_1.jpg"), b"other");
+    assert_eq!(cloud_data(&cloud, "/B/Camera/IMG_2.jpg"), b"longer one");
+    assert_eq!(cloud_data(&cloud, "/B/Camera/IMG_1 (1).jpg"), [0; 5]);
+    assert_eq!(cloud_data(&cloud, "/B/Camera/IMG_2 (1).jpg"), [0; 3]);
+    {
+        let index = index.lock().unwrap();
+        assert_eq!(index.cloud_path("Camera/IMG_1.jpg"), "Camera/IMG_1 (1).jpg");
+        index.save().unwrap();
+    }
+
+    // Without the index, the copies are found again rather than uploaded.
+    let uploads = cloud.uploads.lock().unwrap().len();
+    let fresh = Mutex::new(Index::load(dir.path().join("other.json"), "phone->B"));
+    let summary = upload(&cloud, &tree, "/B", Some(&fresh), &keep_both(), &())
+        .await
+        .unwrap();
+    assert_eq!((summary.transferred, summary.unchanged), (0, 2));
+    assert_eq!(cloud.uploads.lock().unwrap().len(), uploads);
+    assert_eq!(
+        fresh.lock().unwrap().cloud_path("Camera/IMG_2.jpg"),
+        "Camera/IMG_2 (1).jpg"
+    );
+
+    // A file changed on the phone replaces its own copy.
+    write(&root, "Camera/IMG_2.jpg", &[0; 4]);
+    let tree = scan(&root, &Filter::all()).unwrap();
+    let index = Mutex::new(Index::load(&index_file, "phone->B"));
+    let summary = upload(&cloud, &tree, "/B", Some(&index), &keep_both(), &())
+        .await
+        .unwrap();
+    assert_eq!(summary.transferred, 1);
+    assert_eq!(
+        cloud.uploads.lock().unwrap().last().unwrap(),
+        &("/B/Camera/IMG_2 (1).jpg".to_string(), false)
+    );
+    assert_eq!(cloud_data(&cloud, "/B/Camera/IMG_2.jpg"), b"longer one");
+}
+
+#[tokio::test]
+async fn keep_both_never_takes_a_name_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("phone");
+    write(&root, "a.jpg", &[0; 2]);
+    write(&root, "a (1).jpg", &[0; 3]);
+    write(&root, "b.jpg", &[0; 4]);
+    let cloud = FakeCloud::default();
+    cloud.put("/B/a.jpg", b"other");
+    // Another phone uploads its b.jpg while this one does.
+    cloud
+        .sneak_in
+        .lock()
+        .unwrap()
+        .insert("/B/b.jpg".into(), b"theirs".to_vec());
+
+    let index = Mutex::new(Index::load(dir.path().join("index.json"), "phone->B"));
+    let tree = scan(&root, &Filter::all()).unwrap();
+    let summary = upload(&cloud, &tree, "/B", Some(&index), &keep_both(), &())
+        .await
+        .unwrap();
+    assert_eq!((summary.transferred, summary.failed), (3, 0));
+    // `a (1).jpg` belongs to the local file of that name.
+    assert_eq!(cloud_data(&cloud, "/B/a (1).jpg"), [0; 3]);
+    assert_eq!(cloud_data(&cloud, "/B/a (2).jpg"), [0; 2]);
+    assert_eq!(cloud_data(&cloud, "/B/b.jpg"), b"theirs");
+    assert_eq!(cloud_data(&cloud, "/B/b (1).jpg"), [0; 4]);
+}
+
+#[tokio::test]
+async fn cloud_has_asks_for_the_md5_only_when_it_must() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "f.jpg", &[0; 3]);
+    let tree = scan(dir.path(), &Filter::all()).unwrap();
+    let local = &tree.files[0];
+    let cloud = FakeCloud {
+        md5_on_request: true,
+        ..FakeCloud::default()
+    };
+    let requests = || *cloud.md5_requests.lock().unwrap();
+
+    cloud.put("/f.jpg", &[0; 3]);
+    let same = cloud.info("/f.jpg").unwrap();
+    // The same size and date are enough, unless the local file is to go.
+    assert!(cloud_has(&cloud, &same, local, false).await.unwrap());
+    assert_eq!(requests(), 0);
+    assert!(cloud_has(&cloud, &same, local, true).await.unwrap());
+    assert_eq!(requests(), 1);
+
+    cloud.put("/f.jpg", b"abc");
+    let other = cloud.info("/f.jpg").unwrap();
+    assert!(!cloud_has(&cloud, &other, local, true).await.unwrap());
+    age(dir.path(), "f.jpg");
+    let tree = scan(dir.path(), &Filter::all()).unwrap();
+    assert!(!cloud_has(&cloud, &other, &tree.files[0], false)
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
@@ -238,7 +411,9 @@ async fn delete_extra_removes_only_what_is_gone_locally() {
     let filter = Filter::new(&[], &["*.tmp".into()], false);
     let tree = scan(dir.path(), &filter).unwrap();
 
-    let dry = delete_extra(&cloud, &tree, "/B", &filter, true).await.unwrap();
+    let dry = delete_extra(&cloud, &tree, "/B", &filter, true)
+        .await
+        .unwrap();
     assert_eq!(dry.transferred, 3);
     assert!(cloud.deleted.lock().unwrap().is_empty());
 
@@ -250,9 +425,13 @@ async fn delete_extra_removes_only_what_is_gone_locally() {
     left.sort();
     assert_eq!(left, ["/B/keep.txt", "/B/notes.tmp", "/B/sub/keep.txt"]);
 
-    assert!(delete_extra(&cloud, &tree, "/", &filter, false).await.is_err());
+    assert!(delete_extra(&cloud, &tree, "/", &filter, false)
+        .await
+        .is_err());
     let single = scan(&dir.path().join("keep.txt"), &filter).unwrap();
-    assert!(delete_extra(&cloud, &single, "/B", &filter, false).await.is_err());
+    assert!(delete_extra(&cloud, &single, "/B", &filter, false)
+        .await
+        .is_err());
 }
 
 #[tokio::test]

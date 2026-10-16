@@ -382,7 +382,8 @@ impl Backup {
             if account.kind == CRYPT_KIND {
                 serde_json::from_str::<CryptFolder>(secret).with_context(corrupted)?;
             } else {
-                let config: ProviderConfig = serde_json::from_str(secret).with_context(corrupted)?;
+                let config: ProviderConfig =
+                    serde_json::from_str(secret).with_context(corrupted)?;
                 if config.kind() != account.kind {
                     bail!(corrupted());
                 }
@@ -463,7 +464,11 @@ mod tests {
         store.add("NAS", &webdav("https://b")).unwrap();
         assert_eq!(store.find("яндекс").unwrap().id, a.id);
         assert_eq!(store.find(&a.id).unwrap().name, "Яндекс");
-        assert!(store.find("nope").unwrap_err().to_string().contains("'NAS'"));
+        assert!(store
+            .find("nope")
+            .unwrap_err()
+            .to_string()
+            .contains("'NAS'"));
 
         let sealed = store.export().unwrap().seal("pw").unwrap();
         let backup = Backup::open(&sealed, "pw").unwrap();

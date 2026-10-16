@@ -38,11 +38,19 @@ pub fn translate(msg: &str) -> String {
     if let Some(text) = known(msg) {
         return text;
     }
-    let reason = if has_any(&lower, &["dns error", "failed to lookup address", "no such host"]) {
+    let reason = if has_any(
+        &lower,
+        &["dns error", "failed to lookup address", "no such host"],
+    ) {
         Some("Сервер не найден: проверьте адрес и подключение к интернету")
     } else if has_any(
         &lower,
-        &["connection refused", "tcp connect error", "error sending request", "network is unreachable"],
+        &[
+            "connection refused",
+            "tcp connect error",
+            "error sending request",
+            "network is unreachable",
+        ],
     ) {
         Some("Нет связи с сервером: проверьте подключение к интернету")
     } else if has_any(&lower, &["timed out", "no response within", "stalled"]) {
@@ -55,13 +63,29 @@ pub fn translate(msg: &str) -> String {
         Some("Доступ запрещён")
     } else if lower.contains("http 404") {
         Some("Не найдено")
-    } else if has_any(&lower, &["http 507", "insufficient storage", "quota", "storagequotaexceeded"]) {
+    } else if has_any(
+        &lower,
+        &[
+            "http 507",
+            "insufficient storage",
+            "quota",
+            "storagequotaexceeded",
+        ],
+    ) {
         Some("В облаке не хватает места")
     } else if lower.contains("http 429") {
         Some("Слишком много запросов: облако просит подождать")
     } else if has_any(&lower, &["http 500", "http 502", "http 503", "http 504"]) {
         Some("Ошибка на стороне облака, попробуйте позже")
-    } else if has_any(&lower, &["access is denied", "permission denied", "os error 13", "os error 5)"]) {
+    } else if has_any(
+        &lower,
+        &[
+            "access is denied",
+            "permission denied",
+            "os error 13",
+            "os error 5)",
+        ],
+    ) {
         Some("Нет доступа к файлу или папке")
     } else if has_any(&lower, &["no space left", "os error 28", "os error 112"]) {
         Some("На диске не хватает места")
@@ -79,23 +103,53 @@ pub fn translate(msg: &str) -> String {
 const EXACT: &[(&str, &str)] = &[
     ("Account name is empty", "Не указано название аккаунта"),
     ("Account not found", "Аккаунт не найден"),
-    ("Credentials are missing; sign in again", "Нет данных для входа: подключите аккаунт заново"),
-    ("The account type cannot be changed", "Тип аккаунта изменить нельзя"),
+    (
+        "Credentials are missing; sign in again",
+        "Нет данных для входа: подключите аккаунт заново",
+    ),
+    (
+        "The account type cannot be changed",
+        "Тип аккаунта изменить нельзя",
+    ),
     ("Sign-in cancelled", "Вход отменён"),
-    ("Choose the folder to back up", "Выберите папку, которую нужно копировать"),
-    ("Choose the cloud to back up to", "Выберите облако, куда копировать"),
+    (
+        "Choose the folder to back up",
+        "Выберите папку, которую нужно копировать",
+    ),
+    (
+        "Choose the cloud to back up to",
+        "Выберите облако, куда копировать",
+    ),
     ("Backup task not found", "Задача автобэкапа не найдена"),
-    ("The cloud account of the task was removed", "Облачный аккаунт задачи удалён"),
+    (
+        "The cloud account of the task was removed",
+        "Облачный аккаунт задачи удалён",
+    ),
     ("Nothing to upload", "Нечего загружать"),
     ("The file is damaged", "Файл повреждён"),
-    ("Wrong password, or the encrypted file is damaged", "Неверный пароль, или зашифрованный файл повреждён"),
-    ("An encrypted folder cannot be placed inside another one", "Зашифрованную папку нельзя положить в другую зашифрованную"),
-    ("The root folder cannot be renamed", "Корневую папку нельзя переименовать"),
-    ("Refusing to delete the root folder", "Корневую папку удалить нельзя"),
+    (
+        "Wrong password, or the encrypted file is damaged",
+        "Неверный пароль, или зашифрованный файл повреждён",
+    ),
+    (
+        "An encrypted folder cannot be placed inside another one",
+        "Зашифрованную папку нельзя положить в другую зашифрованную",
+    ),
+    (
+        "The root folder cannot be renamed",
+        "Корневую папку нельзя переименовать",
+    ),
+    (
+        "Refusing to delete the root folder",
+        "Корневую папку удалить нельзя",
+    ),
     ("Cannot access ", "Нет доступа к "),
     ("Cannot open folder ", "Не удаётся открыть папку "),
     ("Invalid name ", "Недопустимое имя "),
-    ("This build has no built-in OAuth app; enter your own", "В этой сборке нет встроенного приложения OAuth: укажите своё"),
+    (
+        "This build has no built-in OAuth app; enter your own",
+        "В этой сборке нет встроенного приложения OAuth: укажите своё",
+    ),
 ];
 
 /// Messages with a name in the middle.
@@ -111,7 +165,11 @@ fn known(msg: &str) -> Option<String> {
             "В этот аккаунт копируют задачи автобэкапа {names}: сначала удалите их"
         ));
     }
-    if let Some(names) = between(msg, "Encrypted folders ", " are stored in this account; remove them first") {
+    if let Some(names) = between(
+        msg,
+        "Encrypted folders ",
+        " are stored in this account; remove them first",
+    ) {
         return Some(format!(
             "В этом аккаунте хранятся зашифрованные папки {names}: сначала удалите их"
         ));
@@ -155,7 +213,10 @@ mod tests {
     fn known_messages_are_translated() {
         assert_eq!(translate("Account not found"), "Аккаунт не найден");
         assert_eq!(translate("Invalid name 'a/b'"), "Недопустимое имя «a/b»");
-        assert_eq!(translate("'Отчёт' already exists"), "«Отчёт» уже существует");
+        assert_eq!(
+            translate("'Отчёт' already exists"),
+            "«Отчёт» уже существует"
+        );
         assert_eq!(
             translate("The backup «Камера» is running already"),
             "Бэкап «Камера» уже выполняется"

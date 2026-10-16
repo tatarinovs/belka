@@ -64,6 +64,13 @@ pub trait StorageProvider: Send + Sync {
     /// Returns `None` if nothing exists at `remote_path`.
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>>;
 
+    /// The MD5 of a file's content for providers whose listings lack it but
+    /// that can compute it on request (Synology), which may read the whole
+    /// file on the server; `None` where it is not known.
+    async fn content_md5(&self, _remote_path: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Uploads or overwrites a file with the data of `source`. The parent
     /// directory must already exist. Dropping the future cancels the upload.
     async fn upload(
@@ -86,7 +93,9 @@ pub trait StorageProvider: Send + Sync {
 
     /// Uploads data the caller knows is not in the cloud yet. Providers that
     /// look the file up before writing (Google Drive, which allows equal
-    /// names) skip the lookup; the others just upload.
+    /// names) skip the lookup; those that can write only a new file
+    /// (Synology) fail with [`AlreadyExists`] if it appeared meanwhile; the
+    /// others just upload.
     async fn upload_new(
         &self,
         source: &dyn Source,
@@ -184,6 +193,19 @@ pub trait StorageProvider: Send + Sync {
         bail!("{} cannot share '{remote_path}' by link", self.name())
     }
 }
+
+/// [`StorageProvider::upload_new`] found the name taken: someone else wrote
+/// a file there after the caller looked.
+#[derive(Debug)]
+pub struct AlreadyExists(pub String);
+
+impl std::fmt::Display for AlreadyExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' already exists", self.0)
+    }
+}
+
+impl std::error::Error for AlreadyExists {}
 
 /// Settings of a link created by [`StorageProvider::share_with`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

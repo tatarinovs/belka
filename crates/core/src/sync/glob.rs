@@ -46,7 +46,11 @@ impl Pattern {
         if self.anchored {
             return self.matches(relative);
         }
-        let name = relative.rsplit('/').next().unwrap_or(relative).to_lowercase();
+        let name = relative
+            .rsplit('/')
+            .next()
+            .unwrap_or(relative)
+            .to_lowercase();
         let text: Vec<char> = name.chars().collect();
         wildcard(&self.text, &text)
     }
@@ -59,8 +63,7 @@ fn wildcard(pattern: &[char], text: &[char]) -> bool {
             // `**/` also matches nothing, so `**/a` matches `a`.
             let rest = &pattern[2..];
             let rest_no_slash = rest.strip_prefix(&['/']).unwrap_or(rest);
-            (0..=text.len()).any(|i| wildcard(rest, &text[i..]))
-                || wildcard(rest_no_slash, text)
+            (0..=text.len()).any(|i| wildcard(rest, &text[i..])) || wildcard(rest_no_slash, text)
         }
         Some('*') => {
             let rest = &pattern[1..];

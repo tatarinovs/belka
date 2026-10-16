@@ -12,8 +12,8 @@
 //! touched.
 
 use super::Stats;
-use belka_core::{RemoteFileInfo, StorageProvider};
 use anyhow::{bail, Context, Result};
+use belka_core::{RemoteFileInfo, StorageProvider};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use regex_lite::Regex;
 use std::collections::{BTreeMap, HashSet};

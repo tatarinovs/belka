@@ -182,7 +182,11 @@ pub fn preview_cancel(state: State<'_, AppState>) {
 
 /// Opens a cached preview in the program the system associates with it.
 #[tauri::command]
-pub fn preview_open(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<()> {
+pub fn preview_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> CmdResult<()> {
     let path = state.previews.cached(&path)?;
     Ok(native::open_file(&app, &path.to_string_lossy())?)
 }
