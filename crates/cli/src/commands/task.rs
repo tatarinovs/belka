@@ -5,8 +5,8 @@
 use super::Stats;
 use crate::remote::Accounts;
 use anyhow::{bail, Context, Result};
-use belka_store::tasks::{self, Task, TaskStore};
 use belka_core::utils::format_bytes;
+use belka_store::tasks::{self, Task, TaskStore};
 use tracing::{error, info, warn};
 
 pub fn store() -> Result<TaskStore> {
@@ -21,7 +21,11 @@ pub fn list(accounts: &mut Accounts) -> Result<()> {
         eprintln!("There are no backup tasks; they are made in the app");
         return Ok(());
     }
-    let names = accounts.source().ok().and_then(|s| s.accounts().ok()).unwrap_or_default();
+    let names = accounts
+        .source()
+        .ok()
+        .and_then(|s| s.accounts().ok())
+        .unwrap_or_default();
     for task in &tasks {
         let account = names
             .iter()
@@ -35,16 +39,30 @@ pub fn list(accounts: &mut Accounts) -> Result<()> {
             task.remote,
             task.interval_hours,
             match task.last() {
-                Some(last) => format!(
-                    "; last run {}: {} uploaded ({}), {} failed{}",
-                    last.started
-                        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_default(),
-                    last.uploaded,
-                    format_bytes(last.bytes),
-                    last.failed,
-                    last.error.as_deref().map(|e| format!(", {e}")).unwrap_or_default()
-                ),
+                Some(last) => {
+                    let when = last
+                        .started
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    if last.finished.is_none() {
+                        format!("; last run {when}: running or interrupted")
+                    } else {
+                        format!(
+                            "; last run {when}: {} uploaded ({}), {} failed{}",
+                            last.uploaded,
+                            format_bytes(last.bytes),
+                            last.failed,
+                            last.error
+                                .as_deref()
+                                .map(|e| format!(", {e}"))
+                                .unwrap_or_default()
+                        )
+                    }
+                }
                 None => "; never run".into(),
             }
         );
@@ -60,7 +78,10 @@ pub enum Selection {
 }
 
 /// Runs the selected tasks one by one; returns what each did.
-pub async fn run(accounts: &mut Accounts, selection: Selection) -> Result<Vec<(Task, Stats, Option<String>)>> {
+pub async fn run(
+    accounts: &mut Accounts,
+    selection: Selection,
+) -> Result<Vec<(Task, Stats, Option<String>)>> {
     let store = store()?;
     let all = store.list()?;
     let chosen: Vec<Task> = match selection {

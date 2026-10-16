@@ -20,14 +20,19 @@ impl StorageProvider for FakeCloud {
         Ok(())
     }
     async fn get_file_info(&self, path: &str) -> Result<Option<RemoteFileInfo>> {
-        Ok(self.files.lock().unwrap().get(path).map(|size| RemoteFileInfo {
-            name: split_remote(path).1,
-            path: path.to_string(),
-            is_dir: false,
-            size: *size,
-            md5: None,
-            modified: Some(Utc::now()),
-        }))
+        Ok(self
+            .files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|size| RemoteFileInfo {
+                name: split_remote(path).1,
+                path: path.to_string(),
+                is_dir: false,
+                size: *size,
+                md5: None,
+                modified: Some(Utc::now()),
+            }))
     }
     async fn upload(&self, source: &dyn Source, path: &str, _: &Progress) -> Result<()> {
         self.files
@@ -123,9 +128,15 @@ async fn a_moved_task_starts_over() {
         })
         .unwrap();
     assert!(moved.history.is_empty());
-    let result = run(&store, &saved.id, &provider(&cloud)).await.unwrap().result;
+    let result = run(&store, &saved.id, &provider(&cloud))
+        .await
+        .unwrap()
+        .result;
     assert_eq!(result.uploaded, 1);
-    assert_eq!(cloud.uploads.lock().unwrap().last().unwrap(), "/Other/1.jpg");
+    assert_eq!(
+        cloud.uploads.lock().unwrap().last().unwrap(),
+        "/Other/1.jpg"
+    );
 }
 
 #[tokio::test]
@@ -160,6 +171,39 @@ async fn frees_space_only_for_old_files_that_are_in_the_cloud() {
     assert!(fresh.exists());
 }
 
+#[tokio::test]
+async fn two_phones_share_a_folder_without_losing_photos() {
+    let cloud = Arc::new(FakeCloud::default());
+    let month_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    let mut phones = Vec::new();
+    for data in [&b"first"[..], b"second"] {
+        let settings = tempfile::tempdir().unwrap();
+        let photos = tempfile::tempdir().unwrap();
+        let photo = photos.path().join("IMG_1.jpg");
+        std::fs::write(&photo, data).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&photo)
+            .unwrap()
+            .set_modified(month_ago)
+            .unwrap();
+        let store = TaskStore::new(settings.path());
+        let id = store
+            .save(Task {
+                free_after_days: Some(7),
+                ..task(photos.path())
+            })
+            .unwrap()
+            .id;
+        let run = run(&store, &id, &provider(&cloud)).await.unwrap();
+        assert_eq!((run.result.uploaded, run.result.freed), (1, 1));
+        phones.push((settings, photos));
+    }
+    let files = cloud.files.lock().unwrap();
+    assert_eq!(files["/Backup/IMG_1.jpg"], 5);
+    assert_eq!(files["/Backup/IMG_1 (1).jpg"], 6);
+}
+
 #[test]
 fn tasks_are_due_after_their_interval() {
     let mut t = Task::new("/x", "a", "/y");
@@ -167,12 +211,43 @@ fn tasks_are_due_after_their_interval() {
     assert!(t.is_due(now));
     t.history.push(RunResult {
         started: Some(now - chrono::Duration::hours(23)),
+        finished: Some(now - chrono::Duration::hours(22)),
         ..RunResult::default()
     });
     assert!(!t.is_due(now));
     assert!(t.is_due(now + chrono::Duration::hours(1)));
     t.enabled = false;
     assert!(!t.is_due(now + chrono::Duration::hours(2)));
+}
+
+#[tokio::test]
+async fn a_killed_run_stays_in_the_history() {
+    let settings = tempfile::tempdir().unwrap();
+    let photos = tempfile::tempdir().unwrap();
+    std::fs::write(photos.path().join("1.jpg"), b"one").unwrap();
+    let cloud = Arc::new(FakeCloud::default());
+    let store = TaskStore::new(settings.path());
+    let id = store.save(task(photos.path())).unwrap().id;
+    run(&store, &id, &provider(&cloud)).await.unwrap();
+
+    // A run that started an hour later and never ended, as when the system
+    // kills the process.
+    let killed = RunResult {
+        started: Some(Utc::now() + chrono::Duration::hours(1)),
+        ..RunResult::default()
+    };
+    store.record(&id, &killed).unwrap();
+    let saved = store.task(&id).unwrap();
+    assert_eq!(saved.history.len(), 2);
+    assert!(saved.last().unwrap().finished.is_none());
+    // The schedule counts from the run that ended.
+    assert!(saved.is_due(Utc::now() + chrono::Duration::hours(24)));
+
+    // The next run is recorded once, with its result.
+    run(&store, &id, &provider(&cloud)).await.unwrap();
+    let saved = store.task(&id).unwrap();
+    assert_eq!(saved.history.len(), 3);
+    assert!(saved.last().unwrap().finished.is_some());
 }
 
 #[test]

@@ -378,7 +378,13 @@ impl S3Provider {
         let meta = mtime_header(source);
         let resp = send("s3: create multipart upload", || {
             Ok(self
-                .request_with(Method::POST, Some(key), &[("uploads", "")], EMPTY_SHA256, &meta)
+                .request_with(
+                    Method::POST,
+                    Some(key),
+                    &[("uploads", "")],
+                    EMPTY_SHA256,
+                    &meta,
+                )
                 .timeout(API_TIMEOUT))
         })
         .await?;
@@ -638,7 +644,10 @@ impl StorageProvider for S3Provider {
             // Multipart ETags ("...-N") are not MD5 hashes; as_md5 rejects them.
             md5: header(ETAG).and_then(as_md5),
             // The original file's date, if the uploader kept it (rclone does too).
-            modified: resp.headers().get(MTIME_META).and_then(|v| v.to_str().ok())
+            modified: resp
+                .headers()
+                .get(MTIME_META)
+                .and_then(|v| v.to_str().ok())
                 .and_then(parse_mtime)
                 .or_else(|| header(LAST_MODIFIED).and_then(parse_http_date)),
         }))
@@ -788,7 +797,12 @@ fn mtime_header(source: &dyn Source) -> Vec<(&'static str, String)> {
     source
         .modified()
         .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| vec![(MTIME_META, format!("{}.{:09}", d.as_secs(), d.subsec_nanos()))])
+        .map(|d| {
+            vec![(
+                MTIME_META,
+                format!("{}.{:09}", d.as_secs(), d.subsec_nanos()),
+            )]
+        })
         .unwrap_or_default()
 }
 

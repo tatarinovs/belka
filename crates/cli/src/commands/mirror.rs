@@ -7,7 +7,9 @@ use belka_core::client::{
 };
 use belka_core::utils::format_bytes;
 use belka_core::utils::hash::compute_md5_file;
-use belka_core::utils::path::{encode_component, join_remote, normalize_remote_dir, sanitize_file_name};
+use belka_core::utils::path::{
+    encode_component, join_remote, normalize_remote_dir, sanitize_file_name,
+};
 use belka_core::{Progress, RemoteFileInfo, StorageProvider};
 use chrono::{DateTime, Utc};
 use futures_util::stream::{self, StreamExt};
@@ -288,7 +290,9 @@ impl Mirror<'_> {
                 .any(|item| !item.is_dir && item.name == file_name);
             if exists {
                 info!("  [=] Up to date: {remote_path}");
-                *deleted += self.remove_old_versions(&target_dir, tag, &task.asset).await;
+                *deleted += self
+                    .remove_old_versions(&target_dir, tag, &task.asset)
+                    .await;
                 return Ok(None);
             }
         } else {
@@ -311,7 +315,9 @@ impl Mirror<'_> {
         if self.opts.dry_run {
             info!("  [dry-run] Would download {} -> {remote_path}", task.url);
             if let Some(tag) = &task.tag {
-                *deleted += self.remove_old_versions(&target_dir, tag, &task.asset).await;
+                *deleted += self
+                    .remove_old_versions(&target_dir, tag, &task.asset)
+                    .await;
             }
             return Ok(Some(0));
         }
@@ -339,7 +345,9 @@ impl Mirror<'_> {
 
         // Old versions are removed only after the new one is safely stored.
         if let (Some(tag), true) = (&task.tag, uploaded) {
-            *deleted += self.remove_old_versions(&target_dir, tag, &task.asset).await;
+            *deleted += self
+                .remove_old_versions(&target_dir, tag, &task.asset)
+                .await;
         }
         Ok(uploaded.then_some(size))
     }

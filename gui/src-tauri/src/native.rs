@@ -5,8 +5,8 @@
 //! through JNI ([`jni_api`]).
 //! On desktops the commands answer as if everything were allowed.
 
-use belka_store::tasks::Task;
 use crate::transfers::Transfers;
+use belka_store::tasks::Task;
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime};
 
@@ -163,7 +163,10 @@ mod imp {
 
     pub fn watch_transfers<R: Runtime>(_app: AppHandle<R>, _transfers: Arc<Transfers>) {}
 
-    pub fn schedule_backups<R: Runtime>(_app: &AppHandle<R>, _tasks: &[Task]) -> anyhow::Result<()> {
+    pub fn schedule_backups<R: Runtime>(
+        _app: &AppHandle<R>,
+        _tasks: &[Task],
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

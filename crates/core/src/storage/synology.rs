@@ -5,7 +5,7 @@
 //! folder (`/home`, `/photo`, ...). Shared folders are managed in DSM itself,
 //! so they cannot be created, renamed or deleted here.
 
-use super::{rename_target, RemoteFileInfo, ShareOptions, StorageProvider};
+use super::{as_md5, rename_target, AlreadyExists, RemoteFileInfo, ShareOptions, StorageProvider};
 use crate::client::{
     client_builder, download_into, json_response, retry_transient, send, source_body,
     upload_timeout, Failure, Sink, Source, API_TIMEOUT,
@@ -20,7 +20,7 @@ use reqwest::{Client, Response};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Deserialize;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -29,6 +29,8 @@ const DEFAULT_HTTPS_PORT: u16 = 5001;
 const PAGE_SIZE: usize = 1000;
 /// Deleting a large folder is a single blocking request.
 const DELETE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Hashing reads the file from the disks: a few seconds per gigabyte.
+const MD5_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// File Station error codes this provider reacts to.
 const NO_SUCH_FILE: i64 = 408;
@@ -151,6 +153,8 @@ struct Session {
 #[derive(Deserialize)]
 struct File {
     path: String,
+    /// Missing on an entry with `code`.
+    #[serde(default)]
     name: String,
     #[serde(default)]
     isdir: bool,
@@ -228,10 +232,27 @@ struct Links {
     total: usize,
 }
 
+#[derive(Deserialize)]
+struct Md5Task {
+    taskid: String,
+}
+
+#[derive(Deserialize)]
+struct Md5Status {
+    #[serde(default)]
+    finished: bool,
+    md5: Option<String>,
+}
+
 /// A parameter that holds a list of paths or names. Plain values are split
 /// at commas by DSM, so a JSON array is the only safe form.
 fn json_list(items: &[&str]) -> String {
     serde_json::to_string(items).expect("strings serialize")
+}
+
+/// A parameter that holds one path or id, as a JSON string for the same reason.
+fn json_str(value: &str) -> String {
+    serde_json::to_string(value).expect("strings serialize")
 }
 
 /// `http(s)://host:port/webapi` for what the user entered: a host, or a URL
@@ -405,11 +426,13 @@ impl SynologyProvider {
         }
     }
 
+    /// Without `overwrite`, a taken name fails with [`AlreadyExists`].
     async fn upload_once(
         &self,
         source: &dyn Source,
         remote: &str,
         progress: &Progress,
+        overwrite: bool,
     ) -> Result<(), Failure> {
         let (dir, name) = split_remote(remote);
         // The name goes into the multipart header as is, as browsers send it.
@@ -425,8 +448,11 @@ impl SynologyProvider {
         let mut form = Form::new()
             .percent_encode_noop()
             .text("path", dir)
-            .text("create_parents", "true")
-            .text("overwrite", "true");
+            .text("create_parents", "true");
+        // Left out, DSM refuses a taken name with error 414.
+        if overwrite {
+            form = form.text("overwrite", "true");
+        }
         // The file keeps the date of the original; DSM takes milliseconds.
         if let Some(ms) = source
             .modified()
@@ -458,8 +484,28 @@ impl SynologyProvider {
                 self.drop_sid(&sid).await;
                 Err(Failure::Transient(err))
             }
+            Err(err) if !overwrite && error_code(&err) == Some(FILE_EXISTS) => {
+                Err(Failure::Fatal(AlreadyExists(remote.to_string()).into()))
+            }
             Err(err) => Err(Failure::Fatal(err)),
         }
+    }
+
+    async fn upload_with(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+        overwrite: bool,
+    ) -> Result<()> {
+        let path = normalize_remote_dir(remote_path);
+        if depth(&path) < 2 {
+            bail!("Files are stored inside shared folders, not next to them");
+        }
+        retry_transient(&format!("synology: upload '{path}'"), progress, || {
+            self.upload_once(source, &path, progress, overwrite)
+        })
+        .await
     }
 
     /// The links to `path` the user has created.
@@ -613,20 +659,77 @@ impl StorageProvider for SynologyProvider {
         }
     }
 
+    /// DSM computes the hash in a background task, reading the whole file.
+    async fn content_md5(&self, remote_path: &str) -> Result<Option<String>> {
+        let path = normalize_remote_dir(remote_path);
+        let what = format!("Failed to compute the MD5 of '{path}'");
+        let task: Md5Task = self
+            .call(
+                &what,
+                "SYNO.FileStation.MD5",
+                1,
+                "start",
+                &[("file_path", json_str(&path))],
+                API_TIMEOUT,
+            )
+            .await?;
+        let taskid = json_str(&task.taskid);
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(100);
+        loop {
+            tokio::time::sleep(pause).await;
+            let status: Md5Status = self
+                .call(
+                    &what,
+                    "SYNO.FileStation.MD5",
+                    1,
+                    "status",
+                    &[("taskid", taskid.clone())],
+                    API_TIMEOUT,
+                )
+                .await?;
+            if status.finished {
+                let md5 = status.md5.as_deref().and_then(as_md5);
+                return md5
+                    .map(Some)
+                    .with_context(|| format!("{what}: DSM returned no hash"));
+            }
+            if started.elapsed() > MD5_TIMEOUT {
+                let _ = self
+                    .call::<IgnoredAny>(
+                        &what,
+                        "SYNO.FileStation.MD5",
+                        1,
+                        "stop",
+                        &[("taskid", taskid)],
+                        API_TIMEOUT,
+                    )
+                    .await;
+                bail!(
+                    "{what}: DSM took longer than {} minutes",
+                    MD5_TIMEOUT.as_secs() / 60
+                );
+            }
+            pause = (pause * 2).min(Duration::from_secs(1));
+        }
+    }
+
     async fn upload(
         &self,
         source: &dyn Source,
         remote_path: &str,
         progress: &Progress,
     ) -> Result<()> {
-        let path = normalize_remote_dir(remote_path);
-        if depth(&path) < 2 {
-            bail!("Files are stored inside shared folders, not next to them");
-        }
-        retry_transient(&format!("synology: upload '{path}'"), progress, || {
-            self.upload_once(source, &path, progress)
-        })
-        .await
+        self.upload_with(source, remote_path, progress, true).await
+    }
+
+    async fn upload_new(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        self.upload_with(source, remote_path, progress, false).await
     }
 
     async fn download_to(
@@ -834,12 +937,14 @@ mod tests {
         let files: Files = serde_json::from_str(
             r#"{"files":[{"isdir":false,"name":"a.txt","path":"/home/a.txt",
                 "additional":{"size":12,"time":{"mtime":1700000000}}},
-                {"code":408,"name":"x","path":"/home/x"}],"total":2}"#,
+                {"code":408,"name":"x","path":"/home/x"},
+                {"code":408,"path":"/home/y"}],"total":3}"#,
         )
         .unwrap();
         let info: Vec<_> = files.files.into_iter().map(File::into_info).collect();
         assert_eq!(info[0].size, 12);
         assert_eq!(info[0].modified.unwrap().timestamp(), 1_700_000_000);
         assert!(!info[1].is_dir);
+        assert_eq!(info.len(), 3);
     }
 }

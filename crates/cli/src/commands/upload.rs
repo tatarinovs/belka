@@ -84,8 +84,18 @@ pub async fn run(
         dry_run: opts.dry_run,
         verify: opts.verify,
         create_dirs: true,
+        // A copy of a folder: a changed file replaces its old version.
+        keep_both: false,
     };
-    let summary = sync::upload(provider, &tree, remote_dir, index.as_ref(), &upload_opts, &()).await?;
+    let summary = sync::upload(
+        provider,
+        &tree,
+        remote_dir,
+        index.as_ref(),
+        &upload_opts,
+        &(),
+    )
+    .await?;
     if let Some(index) = &index {
         let mut index = index.lock().unwrap();
         index.retain_scanned(&tree);
@@ -120,7 +130,8 @@ pub async fn run(
     }
     if opts.delete_extra {
         info!("Deleting extra items in '{remote_dir}'...");
-        let extra = sync::delete_extra(provider, &tree, remote_dir, &opts.filter, opts.dry_run).await?;
+        let extra =
+            sync::delete_extra(provider, &tree, remote_dir, &opts.filter, opts.dry_run).await?;
         stats.deleted += extra.transferred;
         stats.failed += extra.failed;
     }

@@ -145,7 +145,11 @@
     return parts.join(", ");
   }
 
-  function runText(run: BackupRun): { text: string; error?: boolean } {
+  /** `running`: the task runs now, so a run without an end is this one. */
+  function runText(run: BackupRun, running = false): { text: string; error?: boolean } {
+    // A run is recorded from its start; without an end and not running it
+    // was killed by the system, and the next run continues its work.
+    if (!run.finished) return { text: `${formatDate(run.started)} · ${running ? "идёт" : "прерван"}` };
     const when = formatDate(run.finished);
     if (run.cancelled) return { text: `${when} · остановлен` };
     if (run.error) return { text: `${when} · ${run.error}`, error: true };
@@ -444,7 +448,7 @@
         <section class="history">
           <h3>История</h3>
           {#each savedDraft.history as h, i (i)}
-            {@const t = runText(h)}
+            {@const t = runText(h, i === 0 && !!savedDraft.running)}
             {@const key = `${h.started}`}
             <div class="run">
               <button

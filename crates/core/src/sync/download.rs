@@ -66,7 +66,13 @@ pub async fn download(
         scan_remote(provider, &root.path, local_dir, opts.parallel, &mut summary).await
     } else {
         let local = local_dir.join(local_name(&root.name));
-        (Vec::new(), vec![FileJob { remote: root, local }])
+        (
+            Vec::new(),
+            vec![FileJob {
+                remote: root,
+                local,
+            }],
+        )
     };
 
     if !opts.dry_run {

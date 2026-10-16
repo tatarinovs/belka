@@ -118,7 +118,10 @@ fn open_export(file: &Path) -> Result<Backup> {
         .ok()
         .filter(|p| !p.is_empty())
         .with_context(|| {
-            format!("Set {ACCOUNTS_PASSWORD_VAR} to the password of '{}'", file.display())
+            format!(
+                "Set {ACCOUNTS_PASSWORD_VAR} to the password of '{}'",
+                file.display()
+            )
         })?;
     Backup::open(&data, &password)
         .with_context(|| format!("Cannot open accounts file '{}'", file.display()))
@@ -127,7 +130,9 @@ fn open_export(file: &Path) -> Result<Backup> {
 /// The accounts of the desktop app on this computer. Their credentials are
 /// in the system keyring, which the CLI reads on Windows and macOS.
 pub fn app_accounts() -> Result<AccountStore> {
-    if cfg!(not(any(windows, target_os = "macos"))) && std::env::var_os("BELKA_CONFIG_DIR").is_none() {
+    if cfg!(not(any(windows, target_os = "macos")))
+        && std::env::var_os("BELKA_CONFIG_DIR").is_none()
+    {
         bail!(
             "The desktop app's accounts are not available here; export them in the app \
              (Accounts → Export) and pass the file with --accounts"
@@ -184,7 +189,10 @@ mod tests {
     #[test]
     fn parses_sources_and_paths() {
         let r: Remote = "yandex:/Backups/db".parse().unwrap();
-        assert_eq!((r.source.as_str(), r.path.as_str()), ("yandex", "/Backups/db"));
+        assert_eq!(
+            (r.source.as_str(), r.path.as_str()),
+            ("yandex", "/Backups/db")
+        );
         let r: Remote = "My NAS:".parse().unwrap();
         assert_eq!((r.source.as_str(), r.path.as_str()), ("My NAS", "/"));
         let r: Remote = "s3:a/b:c".parse().unwrap();

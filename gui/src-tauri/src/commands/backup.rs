@@ -57,7 +57,11 @@ pub fn backup_save(
 }
 
 #[tauri::command]
-pub fn backup_remove(app: tauri::AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
+pub fn backup_remove(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> CmdResult<()> {
     tasks::cancel(&id);
     state.tasks.remove(&id)?;
     reschedule(&app, &state);

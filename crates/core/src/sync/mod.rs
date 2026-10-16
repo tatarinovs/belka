@@ -187,7 +187,9 @@ pub fn scan(root: &Path, filter: &Filter) -> Result<LocalTree> {
                             .push(LocalFile::from_metadata(entry.path(), child, &meta));
                     }
                     Ok(_) => {}
-                    Err(err) => tree.errors.push(format!("{}: {err}", entry.path().display())),
+                    Err(err) => tree
+                        .errors
+                        .push(format!("{}: {err}", entry.path().display())),
                 }
             }
         }
@@ -205,23 +207,40 @@ pub fn scan(root: &Path, filter: &Filter) -> Result<LocalTree> {
 
 /// Whether the cloud file already holds the local one, for uploads:
 /// 1. different size -> no;
-/// 2. the provider has a real MD5 -> compare hashes;
-/// 3. otherwise the local file must not be newer (2s tolerance). This
+/// 2. the listing has a real MD5 -> compare hashes;
+/// 3. the same date (2s tolerance) -> yes: uploads keep the original's
+///    date, so another file with the same name, size and date is unlikely;
+/// 4. the provider computes an MD5 on request -> compare hashes;
+/// 5. otherwise the local file must not be newer (2s tolerance). This
 ///    matters for multi-volume archives whose parts all have the same size.
-pub async fn cloud_has(remote: &RemoteFileInfo, local: &LocalFile) -> Result<bool> {
+///
+/// `strict` skips step 3, for when the local file is to be deleted.
+pub async fn cloud_has(
+    provider: &dyn StorageProvider,
+    remote: &RemoteFileInfo,
+    local: &LocalFile,
+    strict: bool,
+) -> Result<bool> {
     if remote.is_dir || remote.size != local.size {
         return Ok(false);
     }
-    if let Some(remote_md5) = remote.md5.as_deref() {
+    let local_time: Option<DateTime<Utc>> = local.modified.map(Into::into);
+    let same_date = matches!((local_time, remote.modified),
+        (Some(l), Some(r)) if (l - r).num_seconds().abs() <= 2);
+    let remote_md5 = match &remote.md5 {
+        Some(md5) => Some(md5.clone()),
+        None if same_date && !strict => return Ok(true),
+        None => provider.content_md5(&remote.path).await?,
+    };
+    if let Some(remote_md5) = remote_md5 {
         let local_md5 = compute_md5_file(&local.path).await?;
-        if !local_md5.eq_ignore_ascii_case(remote_md5) {
+        if !local_md5.eq_ignore_ascii_case(&remote_md5) {
             tracing::info!("  [~] Same size but different MD5: {}", remote.path);
             return Ok(false);
         }
         return Ok(true);
     }
-    if let (Some(local_time), Some(remote_time)) = (local.modified, remote.modified) {
-        let local_time: DateTime<Utc> = local_time.into();
+    if let (Some(local_time), Some(remote_time)) = (local_time, remote.modified) {
         if local_time > remote_time + chrono::Duration::seconds(2) {
             tracing::info!(
                 "  [~] Same size but local file is newer: {} (local {}, remote {})",

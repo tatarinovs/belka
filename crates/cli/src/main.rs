@@ -355,7 +355,9 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             info!("Sending a test notification...");
             notifier.test().await.map(|()| 0)
         }
-        Command::Task { action: TaskAction::List } => commands::task::list(&mut accounts).map(|()| 0),
+        Command::Task {
+            action: TaskAction::List,
+        } => commands::task::list(&mut accounts).map(|()| 0),
         Command::Task {
             action: TaskAction::Run { names, all, due },
         } => {
@@ -397,8 +399,9 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             let now = chrono::Local::now().naive_local();
             let target = Target::expand(&args.remote.path, now)?;
             let shown = format!("{}:{}", args.remote.source, target.remote_dir);
-            std::fs::metadata(&args.local)
-                .with_context(|| format!("Local path '{}' is not accessible", args.local.display()))?;
+            std::fs::metadata(&args.local).with_context(|| {
+                format!("Local path '{}' is not accessible", args.local.display())
+            })?;
             let (provider, name) = accounts.provider(&args.remote.source)?;
             let opts = commands::upload::Options {
                 jobs: usize::from(args.transfer.jobs),
@@ -451,7 +454,9 @@ async fn dispatch(cli: Cli) -> Result<u8> {
             let provider = &*provider;
             let work = async {
                 // The list is checked before anything is downloaded.
-                let list = commands::mirror::load_url_list(provider, &remote_dir, args.urls.as_deref()).await?;
+                let list =
+                    commands::mirror::load_url_list(provider, &remote_dir, args.urls.as_deref())
+                        .await?;
                 if !opts.dry_run {
                     provider.check_access(&remote_dir).await.with_context(|| {
                         format!("Cannot access '{remote_dir}' on {}", provider.name())
@@ -511,7 +516,14 @@ async fn reported(
         }
     };
     match outcome.status {
-        Status::Success => info!("Done{}", if dry_run { " (dry run, nothing was changed)" } else { "" }),
+        Status::Success => info!(
+            "Done{}",
+            if dry_run {
+                " (dry run, nothing was changed)"
+            } else {
+                ""
+            }
+        ),
         Status::Partial => error!("Finished with {} failure(s)", outcome.stats.failed),
         _ => {}
     }
@@ -669,7 +681,16 @@ mod tests {
         assert!(parse(&["upload", "d", "/no-source"]).is_err());
         assert!(parse(&["upload", "d", "y:/B", "-j", "0"]).is_err());
         assert!(parse(&["upload", "d", "y:/B", "--keep-last", "0"]).is_err());
-        assert!(parse(&["upload", "d", "y:/B", "--keep-days", "7", "--keep-last", "2"]).is_ok());
+        assert!(parse(&[
+            "upload",
+            "d",
+            "y:/B",
+            "--keep-days",
+            "7",
+            "--keep-last",
+            "2"
+        ])
+        .is_ok());
         assert!(parse(&["upload", "d", "y:/B", "--delete-extra", "--keep-last", "2"]).is_err());
         assert!(parse(&["upload", "d", "y:/B", "--share", "--expires", "7"]).is_ok());
         assert!(parse(&["upload", "d", "y:/B", "--expires", "7"]).is_err());

@@ -57,8 +57,9 @@ pub struct Task {
     /// cloud, to free space on a phone.
     #[serde(default)]
     pub free_after_days: Option<u32>,
-    /// The latest runs, newest first. Kept by the store; whatever the page
-    /// sends is ignored.
+    /// The latest runs, newest first; a run is there from its start, and one
+    /// without `finished` is going on or was killed. Kept by the store;
+    /// whatever the page sends is ignored.
     #[serde(default)]
     pub history: Vec<RunResult>,
 }
@@ -95,13 +96,15 @@ impl Task {
         self.history.first()
     }
 
-    /// Whether the task should run at `now`: enabled, and never run or the
-    /// interval has passed since the last run started.
+    /// Whether the task should run at `now`: enabled, and never run to the
+    /// end or the interval has passed since the last such run started. A
+    /// killed run does not count, the next one continues its work.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
         if !self.enabled {
             return false;
         }
-        match self.last().and_then(|r| r.started) {
+        let finished = self.history.iter().find(|r| r.finished.is_some());
+        match finished.and_then(|r| r.started) {
             None => true,
             Some(started) => now - started >= chrono::Duration::hours(self.interval_hours.into()),
         }
@@ -251,7 +254,10 @@ impl TaskStore {
 
         let _guard = STORE_LOCK.lock().unwrap();
         let mut tasks = self.list()?;
-        match tasks.iter_mut().find(|t| !task.id.is_empty() && t.id == task.id) {
+        match tasks
+            .iter_mut()
+            .find(|t| !task.id.is_empty() && t.id == task.id)
+        {
             Some(old) => {
                 task.history = if task.moved_from(old) {
                     Vec::new()
@@ -279,12 +285,23 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Puts a run into the history when it starts, so a run the system
+    /// kills is still seen, and replaces it with the result at the end.
     fn record(&self, id: &str, result: &RunResult) -> Result<()> {
         let _guard = STORE_LOCK.lock().unwrap();
         let mut tasks = self.list()?;
         if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
-            task.history.insert(0, result.clone());
-            task.history.truncate(HISTORY);
+            match task
+                .history
+                .iter_mut()
+                .find(|r| r.started == result.started)
+            {
+                Some(entry) => *entry = result.clone(),
+                None => {
+                    task.history.insert(0, result.clone());
+                    task.history.truncate(HISTORY);
+                }
+            }
             self.write(&tasks)?;
         }
         Ok(())
@@ -461,12 +478,21 @@ pub async fn run(store: &TaskStore, id: &str, provider: &ProviderFn<'_>) -> Resu
         started: Some(Utc::now()),
         ..RunResult::default()
     };
+    store.record(id, &result)?;
     let index = Mutex::new(Index::load(store.index_file(id), &task.target()));
     let mut freed = Vec::new();
 
     let work = async {
         let provider = provider(&task.account_id)?;
-        back_up(&task, &*provider, &index, &guard.live, &mut result, &mut freed).await
+        back_up(
+            &task,
+            &*provider,
+            &index,
+            &guard.live,
+            &mut result,
+            &mut freed,
+        )
+        .await
     };
     let outcome = tokio::select! {
         outcome = work => outcome,
@@ -528,7 +554,12 @@ async fn back_up(
         &tree,
         &task.remote,
         Some(index),
-        &UploadOptions::default(),
+        // Several phones may back up into one folder, and two cameras
+        // easily name photos alike.
+        &UploadOptions {
+            keep_both: true,
+            ..UploadOptions::default()
+        },
         &LiveObserver(live),
     )
     .await?;
@@ -553,8 +584,9 @@ async fn back_up(
     Ok(())
 }
 
-/// Deletes local files that the cloud holds with the same size; the cloud is
-/// asked again, the index alone is not proof enough to delete anything.
+/// Deletes local files that the cloud holds: the same size and the same MD5
+/// where the cloud can tell one. The cloud is asked again, the index alone
+/// is not proof enough to delete anything.
 async fn free_space(
     provider: &dyn StorageProvider,
     remote_root: &str,
@@ -566,28 +598,39 @@ async fn free_space(
     if files.is_empty() {
         return;
     }
+    // A file may be in the cloud under another name, see `keep_both`.
+    let cloud_paths: Vec<String> = {
+        let index = index.lock().unwrap();
+        files
+            .iter()
+            .map(|f| index.cloud_path(&f.relative).to_string())
+            .collect()
+    };
     let listing = sync::RemoteListing::new(
         provider,
         remote_root,
-        files.iter().map(|f| f.relative.as_str()),
+        cloud_paths.iter().map(String::as_str),
         sync::DEFAULT_PARALLEL,
     )
     .await;
-    for file in files {
-        let target = belka_core::utils::path::join_remote(remote_root, &file.relative);
-        match listing.info(provider, &target).await {
-            Ok(Some(remote)) if !remote.is_dir && remote.size == file.size => {
-                match std::fs::remove_file(&file.path) {
-                    Ok(()) => {
-                        tracing::info!("  [-] Freed {}", file.path.display());
-                        result.freed += 1;
-                        result.freed_bytes += file.size;
-                        index.lock().unwrap().remove(&file.relative);
-                        freed.push(file.path.clone());
-                    }
-                    Err(err) => tracing::warn!("Cannot delete '{}': {err}", file.path.display()),
+    for (file, cloud_path) in files.iter().zip(&cloud_paths) {
+        let target = belka_core::utils::path::join_remote(remote_root, cloud_path);
+        let held = match listing.info(provider, &target).await {
+            Ok(Some(remote)) => sync::cloud_has(provider, &remote, file, true).await,
+            Ok(None) => Ok(false),
+            Err(err) => Err(err),
+        };
+        match held {
+            Ok(true) => match std::fs::remove_file(&file.path) {
+                Ok(()) => {
+                    tracing::info!("  [-] Freed {}", file.path.display());
+                    result.freed += 1;
+                    result.freed_bytes += file.size;
+                    index.lock().unwrap().remove(&file.relative);
+                    freed.push(file.path.clone());
                 }
-            }
+                Err(err) => tracing::warn!("Cannot delete '{}': {err}", file.path.display()),
+            },
             Ok(_) => tracing::warn!(
                 "'{}' is not in the cloud as expected; kept on the device",
                 file.relative

@@ -21,6 +21,10 @@ struct Data {
     #[serde(default)]
     target: String,
     files: HashMap<String, (u64, i64)>,
+    /// Files backed up under another name, because theirs was taken in the
+    /// cloud by a different file: relative path -> relative cloud path.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    renamed: HashMap<String, String>,
 }
 
 impl Index {
@@ -35,7 +39,7 @@ impl Index {
             .filter(|data| data.target == target)
             .unwrap_or_else(|| Data {
                 target: target.to_string(),
-                files: HashMap::new(),
+                ..Data::default()
             });
         Self { file, data }
     }
@@ -44,7 +48,10 @@ impl Index {
     /// per source and destination pair.
     pub fn file_for(dir: &Path, target: &str) -> PathBuf {
         use md5::{Digest, Md5};
-        dir.join(format!("{}.json", hex::encode(Md5::digest(target.as_bytes()))))
+        dir.join(format!(
+            "{}.json",
+            hex::encode(Md5::digest(target.as_bytes()))
+        ))
     }
 
     pub fn path(&self) -> &Path {
@@ -69,14 +76,34 @@ impl Index {
         self.data.files.contains_key(relative)
     }
 
-    pub fn record(&mut self, file: &LocalFile) {
+    /// Where the file is in the cloud, relative to the target: its own path
+    /// unless it had to take another name.
+    pub fn cloud_path<'a>(&'a self, relative: &'a str) -> &'a str {
         self.data
-            .files
-            .insert(file.relative.clone(), file.stamp());
+            .renamed
+            .get(relative)
+            .map_or(relative, String::as_str)
+    }
+
+    pub fn record(&mut self, file: &LocalFile) {
+        self.data.files.insert(file.relative.clone(), file.stamp());
+    }
+
+    /// Records the file as backed up to `cloud_path`, relative to the target.
+    pub fn record_at(&mut self, file: &LocalFile, cloud_path: &str) {
+        self.record(file);
+        if cloud_path == file.relative {
+            self.data.renamed.remove(&file.relative);
+        } else {
+            self.data
+                .renamed
+                .insert(file.relative.clone(), cloud_path.to_string());
+        }
     }
 
     pub fn remove(&mut self, relative: &str) {
         self.data.files.remove(relative);
+        self.data.renamed.remove(relative);
     }
 
     /// Forgets files that are no longer in the tree, so the index does not
@@ -87,7 +114,12 @@ impl Index {
             return;
         }
         let present: HashSet<&str> = tree.files.iter().map(|f| f.relative.as_str()).collect();
-        self.data.files.retain(|path, _| present.contains(path.as_str()));
+        self.data
+            .files
+            .retain(|path, _| present.contains(path.as_str()));
+        self.data
+            .renamed
+            .retain(|path, _| present.contains(path.as_str()));
     }
 
     /// Writes through a temporary file, so a crash never leaves half an index.
