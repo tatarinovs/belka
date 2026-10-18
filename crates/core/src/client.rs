@@ -431,7 +431,8 @@ pub trait Sink: Send {
 
 /// Writes into `<dest>.part`, which replaces `dest` on [`PartSink::commit`].
 /// The partial file is removed when the sink is dropped without committing,
-/// which is how a cancelled download cleans up.
+/// which is how a cancelled download cleans up. A complete download that
+/// cannot be moved into place stays in `<dest>.part`.
 pub struct PartSink {
     path: PathBuf,
     file: Option<tokio::fs::File>,
@@ -460,12 +461,37 @@ impl PartSink {
             .await
             .with_context(|| format!("Failed to write '{}'", self.path.display()))?;
         drop(file);
-        tokio::fs::rename(&self.path, dest)
-            .await
-            .with_context(|| format!("Failed to move the download to '{}'", dest.display()))?;
+        let mut delay = Duration::from_millis(100);
+        let mut result = tokio::fs::rename(&self.path, dest).await;
+        // Antivirus or the search indexer may briefly hold the file that has
+        // just been closed.
+        for _ in 0..5 {
+            match &result {
+                Err(e) if is_transient_lock(e) => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    result = tokio::fs::rename(&self.path, dest).await;
+                }
+                _ => break,
+            }
+        }
+        // The data is complete either way: keep it for the user instead of
+        // deleting it on drop.
         self.committed = true;
-        Ok(())
+        result.with_context(|| {
+            format!(
+                "Failed to move the download to '{}', the data is kept in '{}'",
+                dest.display(),
+                self.path.display()
+            )
+        })
     }
+}
+
+/// Access denied, sharing or lock violation: on Windows these mean another
+/// process has the file open and usually go away soon.
+fn is_transient_lock(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
 }
 
 #[async_trait]

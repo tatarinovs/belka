@@ -19,7 +19,7 @@ chrono.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 futures-util.workspace = true
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 md-5 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

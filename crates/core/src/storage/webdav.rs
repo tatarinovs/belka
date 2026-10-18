@@ -13,6 +13,7 @@ use crate::utils::path::{encode_component, normalize_remote_dir};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use percent_encoding::percent_decode_str;
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -359,12 +360,14 @@ struct PropStat {
 /// properties from `propstat` blocks with a 2xx status are taken into account.
 fn parse_multistatus(xml: &str) -> Result<Vec<DavEntry>> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut entries = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     let mut entry: Option<DavEntry> = None;
     let mut propstat: Option<PropStat> = None;
+    // Text of the current element: the reader splits it into Text/CData
+    // pieces and separate events for entity references (`&quot;`, `&#38;`).
+    let mut text = String::new();
 
     loop {
         let event = reader
@@ -374,24 +377,37 @@ fn parse_multistatus(xml: &str) -> Result<Vec<DavEntry>> {
             Event::Start(e) => (local_name(e.local_name().as_ref()), false),
             Event::Empty(e) => (local_name(e.local_name().as_ref()), true),
             Event::End(_) => {
+                if !text.trim().is_empty() {
+                    set_text(&stack, &text, &mut entry, &mut propstat);
+                }
+                text.clear();
                 let name = stack.pop().unwrap_or_default();
                 close_element(&name, &mut entry, &mut propstat, &mut entries);
                 continue;
             }
             Event::Text(t) => {
-                let text = t.unescape().context("Malformed WebDAV XML text")?;
-                set_text(&stack, &text, &mut entry, &mut propstat);
+                text.push_str(&t.xml10_content());
                 continue;
             }
             Event::CData(c) => {
-                let text = String::from_utf8_lossy(c.as_ref()).into_owned();
-                set_text(&stack, &text, &mut entry, &mut propstat);
+                text.push_str(&c.xml10_content());
+                continue;
+            }
+            Event::GeneralRef(r) => {
+                match r.resolve_char_ref().context("Malformed WebDAV XML text")? {
+                    Some(ch) => text.push(ch),
+                    None => text.push_str(
+                        resolve_predefined_entity(r)
+                            .with_context(|| format!("Unknown XML entity &{};", &**r))?,
+                    ),
+                }
                 continue;
             }
             Event::Eof => break,
             _ => continue,
         };
 
+        text.clear();
         match name.as_str() {
             "response" => entry = Some(DavEntry::default()),
             "propstat" => {
@@ -416,8 +432,8 @@ fn parse_multistatus(xml: &str) -> Result<Vec<DavEntry>> {
     Ok(entries)
 }
 
-fn local_name(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw).to_ascii_lowercase()
+fn local_name(raw: &str) -> String {
+    raw.to_ascii_lowercase()
 }
 
 fn close_element(
@@ -523,6 +539,17 @@ mod tests {
             root.href_to_remote("/Upload/a%2Bb.txt").as_deref(),
             Some("/Upload/a+b.txt")
         );
+    }
+
+    #[test]
+    fn parses_entities_inside_text() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response>
+    <d:href>/Upload/Tom &amp; Jerry &#x2014; <![CDATA[<1>]]>.txt</d:href>
+    <d:propstat><d:prop><d:getetag></d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+</d:response></d:multistatus>"#;
+        let entries = parse_multistatus(xml).unwrap();
+        assert_eq!(entries[0].href, "/Upload/Tom & Jerry \u{2014} <1>.txt");
+        assert_eq!(entries[0].etag, None);
     }
 
     #[test]

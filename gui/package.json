@@ -1,6 +1,6 @@
 {
   "name": "belka-gui",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Desktop file manager for cloud storage",
   "type": "module",
   "scripts": {
