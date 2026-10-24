@@ -6,7 +6,7 @@ echo ===================================================================
 echo             BELKA - RELEASE BUILDER
 echo ===================================================================
 echo.
-echo Usage: build.bat [all^|exe^|gui^|arm64^|android]
+echo Usage: build.bat [all^|exe^|gui^|linux^|arm64^|android]
 echo.
 
 set TARGET_MODE=%1
@@ -19,7 +19,8 @@ if not defined BELKA_GOOGLE_CLIENT_ID echo [!] BELKA_GOOGLE_CLIENT_ID is not set
 if not defined BELKA_YANDEX_CLIENT_ID echo [!] BELKA_YANDEX_CLIENT_ID is not set: no built-in Yandex app in this build
 
 if "%TARGET_MODE%"=="gui" goto BUILD_GUI
-if "%TARGET_MODE%"=="arm64" goto BUILD_ARM64
+if "%TARGET_MODE%"=="linux" goto BUILD_LINUX
+if "%TARGET_MODE%"=="arm64" goto BUILD_LINUX
 if "%TARGET_MODE%"=="android" goto BUILD_ANDROID
 
 REM ---------------------------------------------------------------------
@@ -70,22 +71,40 @@ echo [OK] GUI ready: dist\belka-gui.exe and installer
 if "%TARGET_MODE%"=="gui" goto ALL_DONE
 
 REM ---------------------------------------------------------------------
-REM Build Linux ARM64 CLI (aarch64-unknown-linux-musl via Zig)
+REM Build Linux CLI: static musl binaries for x86_64 and ARM64 via Zig
 REM ---------------------------------------------------------------------
-:BUILD_ARM64
+:BUILD_LINUX
 where zig >nul 2>nul
 if errorlevel 1 goto ERR_NO_ZIG
 
 where cargo-zigbuild >nul 2>nul
 if errorlevel 1 goto INSTALL_ZIGBUILD
-goto CHECK_TARGET
+goto LINUX_TOOLS_OK
 
 :INSTALL_ZIGBUILD
 echo [*] cargo-zigbuild is not installed. Installing...
 cargo install cargo-zigbuild
 if errorlevel 1 goto ERR_INSTALL_ZIGBUILD
 
-:CHECK_TARGET
+:LINUX_TOOLS_OK
+if "%TARGET_MODE%"=="arm64" goto BUILD_ARM64
+
+echo [*] Checking Rust target x86_64-unknown-linux-musl...
+rustup target add x86_64-unknown-linux-musl >nul 2>nul
+
+echo.
+echo ===================================================================
+echo [LINUX] Building Linux x86_64 (x86_64-unknown-linux-musl via Zig)...
+echo ===================================================================
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+if errorlevel 1 goto ERR_BUILD_LINUX
+
+copy /Y "target\x86_64-unknown-linux-musl\release\belka" "dist\belka-linux-x64" >nul
+echo [OK] Linux x86_64 binary ready: dist\belka-linux-x64
+
+if "%TARGET_MODE%"=="linux" goto ALL_DONE
+
+:BUILD_ARM64
 echo [*] Checking Rust target aarch64-unknown-linux-musl...
 rustup target add aarch64-unknown-linux-musl >nul 2>nul
 
@@ -171,6 +190,12 @@ exit /b 1
 
 :ERR_BUILD_GUI
 echo [ERROR] GUI build failed!
+echo.
+if "%NO_PAUSE%"=="" pause
+exit /b 1
+
+:ERR_BUILD_LINUX
+echo [ERROR] Linux x86_64 build failed!
 echo.
 if "%NO_PAUSE%"=="" pause
 exit /b 1

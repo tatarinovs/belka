@@ -34,6 +34,7 @@
     checkAll: "M4 4h16v16H4zm4 8.5 3 3 5-6",
     external: "M14 4h6v6m0-6-9 9m7 1v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
     clock: "M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+    info: "M12 11v5m0-8h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
     play: "M8 5v14l11-7z",
     stop: "M7 7h10v10H7z",
   } as const;

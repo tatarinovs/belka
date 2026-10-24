@@ -69,13 +69,16 @@
 Требуется Rust 1.80+. Команды `cargo` без `-p` собирают только CLI.
 
 ```cmd
-build.bat          # всё: CLI для Windows, GUI и CLI для Linux ARM64
+build.bat          # всё: CLI для Windows, GUI и CLI для Linux x86_64 и ARM64
 build.bat exe      # только CLI для Windows
 build.bat gui      # только GUI: dist\belka-gui.exe и установщик
+build.bat linux    # только Linux x86_64 (через zig)
 build.bat arm64    # только Linux ARM64 (через zig)
 build.bat android  # только Android: dist\belka-<версия>-arm64.apk
 ```
 Готовые файлы складываются в `dist/`.
+
+Версия задаётся в `Cargo.toml` и `gui/package.json`. Чтобы поменять её в обоих файлах сразу, есть `version.bat X.Y.Z` (без аргумента скрипт покажет текущую).
 
 Ручная сборка:
 ```bash

@@ -229,12 +229,47 @@ button {
   font-size: 18px;
 }
 
-/* Accounts dialog: the list is reordered by dragging the grip only on
-   desktops; on a phone each row keeps the name, settings and delete. */
-:root.mobile .modal li .order,
-:root.mobile .modal li .grip,
-:root.mobile .modal li .btn .label {
+/* Accounts dialog: a phone has no grip or arrows, a row is reordered by a
+   long press. Settings and delete are round icons of the same size. Import
+   and export share a line, adding an account takes the whole next one. */
+:root.mobile .modal.accounts li .order,
+:root.mobile .modal.accounts li .grip,
+:root.mobile .modal.accounts li .btn .label,
+:root.mobile .modal.accounts footer .spacer {
   display: none;
+}
+
+:root.mobile .modal.accounts li {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+:root.mobile .modal.accounts li.dragged {
+  position: relative;
+  z-index: 1;
+  box-shadow: var(--shadow);
+}
+
+:root.mobile .modal.accounts li .btn {
+  justify-content: center;
+  width: 40px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+:root.mobile .modal.accounts footer {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+:root.mobile .modal.accounts footer .btn {
+  justify-content: center;
+}
+
+:root.mobile .modal.accounts footer .primary {
+  grid-column: 1 / -1;
 }
 
 :root.mobile .modal footer {

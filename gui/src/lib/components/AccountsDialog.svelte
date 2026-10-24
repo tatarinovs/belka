@@ -2,6 +2,7 @@
   import { ask, open as openFile, save as saveFile } from "@tauri-apps/plugin-dialog";
   import { api, errorText, type Account } from "$lib/api";
   import { baseName, plural } from "$lib/format";
+  import { isMobile } from "$lib/platform";
   import { providerDef } from "$lib/providers";
   import Icon from "./Icon.svelte";
   import PasswordInput from "./PasswordInput.svelte";
@@ -118,14 +119,14 @@
   }
 
   /** Puts the dragged row among the others by where the pointer is. */
-  function dragMove(event: PointerEvent) {
+  function dragMove(y: number) {
     if (!drag || !list) return;
     const others = [...list.querySelectorAll<HTMLElement>("li[data-id]")].filter(
       (row) => row.dataset.id !== drag?.id,
     );
     const index = others.filter((row) => {
       const box = row.getBoundingClientRect();
-      return box.top + box.height / 2 < event.clientY;
+      return box.top + box.height / 2 < y;
     }).length;
     const ids = others.map((row) => row.dataset.id!);
     ids.splice(index, 0, drag.id);
@@ -138,6 +139,68 @@
     drag = null;
     reorder(ids);
   }
+
+  // On a phone there is no grip: a long press on a row (the WebView fires
+  // `contextmenu` for it) picks the row up, and the finger moves it.
+
+  /** How close to the list's edge the finger scrolls it, px. */
+  const SCROLL_EDGE = 48;
+  let touchY = 0;
+  let scrollFrame = 0;
+
+  function holdRow(event: MouseEvent, account: Account) {
+    if (!isMobile || busy) return;
+    event.preventDefault();
+    if (accounts.length < 2) return;
+    drag = { id: account.id, ids: accounts.map((a) => a.id) };
+    touchY = event.clientY;
+    navigator.vibrate?.(15);
+  }
+
+  /** Scrolls the list while the finger holds a row near its top or bottom. */
+  function autoScroll() {
+    scrollFrame = 0;
+    if (!drag || !list) return;
+    const box = list.getBoundingClientRect();
+    const by = touchY < box.top + SCROLL_EDGE ? -8 : touchY > box.bottom - SCROLL_EDGE ? 8 : 0;
+    if (!by) return;
+    const before = list.scrollTop;
+    list.scrollTop += by;
+    if (list.scrollTop === before) return;
+    dragMove(touchY);
+    scrollFrame = requestAnimationFrame(autoScroll);
+  }
+
+  // Svelte's `ontouchmove` is passive, and only a non-passive listener can
+  // keep the list from scrolling under the dragged row.
+  $effect(() => {
+    if (!list) return;
+    const el = list;
+    const move = (event: TouchEvent) => {
+      if (!drag) return;
+      event.preventDefault();
+      touchY = event.touches[0].clientY;
+      dragMove(touchY);
+      if (!scrollFrame) autoScroll();
+    };
+    const end = (event: TouchEvent) => {
+      if (!drag) return;
+      // No click on the button the finger was lifted over.
+      event.preventDefault();
+      cancelAnimationFrame(scrollFrame);
+      scrollFrame = 0;
+      if (event.type === "touchend") endDrag();
+      else drag = null;
+    };
+    el.addEventListener("touchmove", move, { passive: false });
+    el.addEventListener("touchend", end);
+    el.addEventListener("touchcancel", end);
+    return () => {
+      el.removeEventListener("touchmove", move);
+      el.removeEventListener("touchend", end);
+      el.removeEventListener("touchcancel", end);
+    };
+  });
 
   $effect(() => {
     if (open && !dialog.open) {
@@ -174,7 +237,7 @@
   }
 </script>
 
-<dialog class="modal"
+<dialog class="modal accounts"
   bind:this={dialog}
   onclose={onclose}
   oncancel={(e) => {
@@ -192,7 +255,11 @@
     {#if accounts.length}
       <ul bind:this={list} class:dragging={drag !== null}>
         {#each shown as account, i (account.id)}
-          <li data-id={account.id} class:dragged={drag?.id === account.id}>
+          <li
+            data-id={account.id}
+            class:dragged={drag?.id === account.id}
+            oncontextmenu={(e) => holdRow(e, account)}
+          >
             <span
               class="grip"
               title="Перетащите, чтобы изменить порядок"
@@ -200,7 +267,7 @@
               tabindex="-1"
               aria-label="Перетащить"
               onpointerdown={(e) => startDrag(e, account)}
-              onpointermove={dragMove}
+              onpointermove={(e) => dragMove(e.clientY)}
               onpointerup={endDrag}
               onpointercancel={() => (drag = null)}
             >
@@ -233,6 +300,9 @@
           </li>
         {/each}
       </ul>
+      {#if isMobile && accounts.length > 1}
+        <p class="hint">Чтобы изменить порядок, удерживайте аккаунт и перетащите его.</p>
+      {/if}
     {:else}
       <p class="empty">Нет подключённых облаков.</p>
     {/if}
@@ -398,9 +468,15 @@
     color: #d93025;
   }
 
-  .empty {
+  .empty,
+  .hint {
     margin: 0;
     color: var(--muted);
+  }
+
+  .hint {
+    margin-top: -4px;
+    font-size: 12px;
   }
 
   footer {

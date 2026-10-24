@@ -35,6 +35,7 @@ token*.json
 *.7z
 deploy.bat
 deploy.sh
+*.belka
 
 # ------------------------------------------------------------------------------
 # Runtime data (local URL list, temp downloads, logs)

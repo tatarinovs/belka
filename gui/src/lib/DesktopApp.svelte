@@ -15,6 +15,7 @@
   import AccountList from "$lib/components/AccountList.svelte";
   import AccountMenu from "$lib/components/AccountMenu.svelte";
   import AccountDialog from "$lib/components/AccountDialog.svelte";
+  import AboutDialog from "$lib/components/AboutDialog.svelte";
   import AccountsDialog from "$lib/components/AccountsDialog.svelte";
   import BackupScreen from "$lib/components/BackupScreen.svelte";
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
@@ -50,6 +51,7 @@
   /** The backup tasks dialog is open; `backupDraft` is the task being edited. */
   let backups = $state(false);
   let backupDraft = $state<BackupTask | null>(null);
+  let about = $state(false);
   let notice = $state("");
   let busy = $state("");
   /** A message about a finished action, hidden after a while. */
@@ -415,6 +417,23 @@
 </script>
 
 <main>
+  <header class="appbar">
+    <button
+      class="tool"
+      title="Подключённые облака: добавить, настроить, изменить порядок, импорт и экспорт"
+      onclick={() => (managing = true)}
+    >
+      <Icon name="cloud" /> Аккаунты
+    </button>
+    <button class="tool" title="Регулярное копирование папок компьютера в облако" onclick={() => (backups = true)}>
+      <Icon name="clock" /> Автобэкап
+    </button>
+    <span class="spacer"></span>
+    <button class="tool" onclick={() => (about = true)}>
+      <Icon name="info" /> О приложении
+    </button>
+  </header>
+
   <div class="panes">
     <div class="slot">
       {#if cloudTabs.length}
@@ -474,9 +493,6 @@
                 onmanage={() => (managing = true)}
                 onremove={remove}
               />
-              <button class="icon-btn" title="Автобэкап" aria-label="Автобэкап" onclick={() => (backups = true)}>
-                <Icon name="clock" />
-              </button>
             {/snippet}
             {#snippet actions()}
               <button
@@ -643,6 +659,8 @@
   onimported={importedAccounts}
 />
 
+<AboutDialog open={about} onclose={() => (about = false)} />
+
 <AccountDialog
   open={adding || editing !== null}
   account={editing}
@@ -659,6 +677,39 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
+  }
+
+  /* The app's own tools, above both panes. */
+  .appbar {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+    background: var(--sidebar);
+  }
+
+  .tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 6px;
+    background: none;
+  }
+
+  .tool:hover {
+    background: var(--hover);
+  }
+
+  .tool :global(svg) {
+    color: var(--muted);
+  }
+
+  .spacer {
+    flex: 1;
   }
 
   .panes {
