@@ -1,10 +1,12 @@
 use super::{local_has, Summary};
+use crate::client::PartSink;
 use crate::progress::Progress;
 use crate::storage::{RemoteFileInfo, StorageProvider};
-use crate::utils::path::{normalize_remote_dir, sanitize_file_name};
+use crate::utils::path::{normalize_remote_dir, sanitize_file_name, unique_path};
 use crate::utils::{format_bytes, format_rate};
 use anyhow::{bail, Context, Result};
 use futures_util::stream::{self, StreamExt};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 use tracing::{error, info, warn};
@@ -127,6 +129,8 @@ async fn scan_remote(
 ) -> (Vec<PathBuf>, Vec<FileJob>) {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
+    // Names that are equal once made safe, or differ only in case.
+    let mut taken = HashSet::new();
     let mut level = vec![(remote_root.to_string(), local_root.to_path_buf())];
     while !level.is_empty() {
         let mut listings = stream::iter(std::mem::take(&mut level))
@@ -145,7 +149,7 @@ async fn scan_remote(
                 }
             };
             for item in items {
-                let path = local.join(local_name(&item.name));
+                let path = unique_path(local.join(local_name(&item.name)), &mut taken);
                 if item.is_dir {
                     dirs.push(path.clone());
                     level.push((item.path, path));
@@ -179,8 +183,16 @@ async fn download_one(
     job: &FileJob,
     opts: &DownloadOptions,
 ) -> Result<Option<u64>> {
+    let mut remote = job.remote.clone();
+    // Listings with upload times instead of the original dates (S3): the
+    // original is asked when it is needed, to compare or to set.
+    let mut dated = !provider.listed_dates_are_upload_times();
+    if !dated && remote.md5.is_none() && !opts.overwrite {
+        original_date(provider, &mut remote).await;
+        dated = true;
+    }
     if !opts.overwrite {
-        match local_has(&job.remote, &job.local).await {
+        match local_has(&remote, &job.local).await {
             Ok(true) => {
                 info!("  [=] Unchanged: {}", job.local.display());
                 return Ok(None);
@@ -206,11 +218,25 @@ async fn download_one(
         format_bytes(job.remote.size)
     );
     let started = Instant::now();
+    let mut part = PartSink::new(&job.local);
     let size = provider
-        .download_file(&job.remote.path, &job.local, &Progress::new())
+        .download_to(&job.remote.path, &mut part, &Progress::new())
         .await?;
+    // Whatever came instead of the file (an error page, a changed file)
+    // must not replace the local copy. A listed 0 may also mean "unknown"
+    // (WebDAV servers without getcontentlength).
+    if job.remote.size > 0 && size != job.remote.size {
+        bail!(
+            "Received {size} bytes instead of {}; the file may have changed in the cloud",
+            job.remote.size
+        );
+    }
+    part.commit(&job.local).await?;
+    if !dated {
+        original_date(provider, &mut remote).await;
+    }
     // The cloud's date, so that the next upload sees the file as unchanged.
-    if let Some(modified) = job.remote.modified {
+    if let Some(modified) = remote.modified {
         if let Err(err) = set_modified(&job.local, modified.into()) {
             warn!(
                 "  [~] Cannot set the date of '{}': {err}",
@@ -225,6 +251,16 @@ async fn download_one(
         format_rate(size, started.elapsed())
     );
     Ok(Some(size))
+}
+
+/// Replaces the listed date of `remote` with the one the cloud keeps for
+/// the file itself, if it can be asked.
+async fn original_date(provider: &dyn StorageProvider, remote: &mut RemoteFileInfo) {
+    match provider.get_file_info(&remote.path).await {
+        Ok(Some(info)) => remote.modified = info.modified.or(remote.modified),
+        Ok(None) => {}
+        Err(err) => warn!("  [~] Cannot read the date of '{}': {err:#}", remote.path),
+    }
 }
 
 pub(crate) fn set_modified(path: &Path, time: SystemTime) -> std::io::Result<()> {

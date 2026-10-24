@@ -52,7 +52,8 @@ impl MailruProvider {
         let url = url.unwrap_or_else(|| MAILRU_WEBDAV_URL.to_string());
         // Mail.ru ETags are internal revision ids, not MD5 hashes.
         let dav =
-            WebDavProvider::new("Mail.ru Cloud", &url, user.clone(), password.clone(), false)?;
+            WebDavProvider::new("Mail.ru Cloud", &url, user.clone(), password.clone(), false)?
+                .errors_mean_missing();
         Ok(Self {
             dav,
             user,
@@ -85,7 +86,8 @@ impl MailruProvider {
             let reason = token.error_description.or(token.error).unwrap_or_default();
             // A password made for WebDAV only works for files but not here.
             bail!(
-                "Mail.ru refused to sign in for public links: {reason}. Links need an app                  password with full access to Mail, Cloud and Calendar (all protocols)"
+                "Mail.ru refused to sign in for public links: {reason}. Links need an app \
+                 password with full access to Mail, Cloud and Calendar (all protocols)"
             );
         };
         Ok((access_token, token.expires_in))

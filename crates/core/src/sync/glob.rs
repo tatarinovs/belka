@@ -57,29 +57,58 @@ impl Pattern {
 }
 
 fn wildcard(pattern: &[char], text: &[char]) -> bool {
-    match pattern.first() {
-        None => text.is_empty(),
-        Some('*') if pattern.get(1) == Some(&'*') => {
+    // Every (pattern, text) position is decided once: without this, several
+    // stars make the backtracking exponential.
+    let mut memo = vec![None; (pattern.len() + 1) * (text.len() + 1)];
+    matches_from(pattern, text, 0, 0, &mut memo)
+}
+
+/// Whether `pattern[p..]` matches `text[t..]`.
+fn matches_from(
+    pattern: &[char],
+    text: &[char],
+    p: usize,
+    t: usize,
+    memo: &mut [Option<bool>],
+) -> bool {
+    let key = p * (text.len() + 1) + t;
+    if let Some(known) = memo[key] {
+        return known;
+    }
+    let result = match pattern.get(p) {
+        None => t == text.len(),
+        Some('*') if pattern.get(p + 1) == Some(&'*') => {
             // `**/` also matches nothing, so `**/a` matches `a`.
-            let rest = &pattern[2..];
-            let rest_no_slash = rest.strip_prefix(&['/']).unwrap_or(rest);
-            (0..=text.len()).any(|i| wildcard(rest, &text[i..])) || wildcard(rest_no_slash, text)
+            let rest = p + 2;
+            let rest_no_slash = if pattern.get(rest) == Some(&'/') {
+                rest + 1
+            } else {
+                rest
+            };
+            (t..=text.len()).any(|i| matches_from(pattern, text, rest, i, memo))
+                || matches_from(pattern, text, rest_no_slash, t, memo)
         }
         Some('*') => {
-            let rest = &pattern[1..];
-            for i in 0..=text.len() {
-                if wildcard(rest, &text[i..]) {
-                    return true;
+            let mut found = false;
+            for i in t..=text.len() {
+                if matches_from(pattern, text, p + 1, i, memo) {
+                    found = true;
+                    break;
                 }
                 if text.get(i) == Some(&'/') {
                     break;
                 }
             }
-            false
+            found
         }
-        Some('?') => text.first().is_some_and(|c| *c != '/') && wildcard(&pattern[1..], &text[1..]),
-        Some(c) => text.first() == Some(c) && wildcard(&pattern[1..], &text[1..]),
-    }
+        Some('?') => {
+            text.get(t).is_some_and(|c| *c != '/')
+                && matches_from(pattern, text, p + 1, t + 1, memo)
+        }
+        Some(c) => text.get(t) == Some(c) && matches_from(pattern, text, p + 1, t + 1, memo),
+    };
+    memo[key] = Some(result);
+    result
 }
 
 #[cfg(test)]
@@ -116,6 +145,14 @@ mod tests {
         let p = Pattern::new("img_?.jpg");
         assert!(p.matches("IMG_1.JPG"));
         assert!(!p.matches("img_12.jpg"));
+    }
+
+    #[test]
+    fn many_stars_stay_fast() {
+        let p = Pattern::new(&format!("{}b", "*a".repeat(30)));
+        let started = std::time::Instant::now();
+        assert!(!p.matches(&"a".repeat(200)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

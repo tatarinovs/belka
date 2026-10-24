@@ -229,6 +229,7 @@ mod jni_api {
                 value["freed_paths"] = serde_json::json!(run.freed);
                 value.to_string()
             }
+            Err(err) if err.is::<tasks::AlreadyRunning>() => r#"{"busy":true}"#.to_string(),
             Err(err) => serde_json::json!({ "error": translate(&format!("{err:#}")) }).to_string(),
         };
         to_java(&mut env, &json)

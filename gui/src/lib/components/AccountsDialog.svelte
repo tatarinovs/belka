@@ -32,6 +32,8 @@
   let busy = $state(false);
 
   const BACKUP_FILTERS = [{ name: "Аккаунты Belka", extensions: ["belka"] }];
+  /** As `MIN_EXPORT_PASSWORD` in the store crate. */
+  const MIN_EXPORT_PASSWORD = 8;
 
   function startExport() {
     error = info = password = repeat = "";
@@ -54,6 +56,11 @@
     error = "";
     if (!password) {
       error = "Введите пароль";
+      return;
+    }
+    // The file holds the keys to every cloud.
+    if (backup.mode === "export" && [...password].length < MIN_EXPORT_PASSWORD) {
+      error = `Пароль должен быть не короче ${MIN_EXPORT_PASSWORD} символов`;
       return;
     }
     if (backup.mode === "export" && password !== repeat) {

@@ -99,6 +99,7 @@ impl Previews {
                 result = provider.download_file(item.path, &local, &progress) => { result?; }
                 _ = cancelled => bail!("Preview cancelled"),
             }
+            mark_from_internet(&local);
         }
         let (text, truncated) = if text {
             let (text, truncated) = read_text(&local)?;
@@ -138,6 +139,34 @@ impl Previews {
     }
 }
 
+/// Extensions that Windows runs rather than shows when such a file is
+/// opened: scripts and programs. A file from someone's shared folder must
+/// not run because its preview was opened "in the program".
+const RUNNABLE: &[&str] = &[
+    "bat", "cmd", "com", "cpl", "exe", "hta", "jar", "js", "jse", "lnk", "msi", "msp", "pif",
+    "ps1", "psm1", "reg", "scr", "url", "vb", "vbe", "vbs", "wsf", "wsh",
+];
+
+pub fn runs_when_opened(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .is_some_and(|e| RUNNABLE.contains(&e.as_str()))
+}
+
+/// Marks a file as downloaded from the internet (Mark of the Web), so
+/// Windows and Office treat it with the caution they give to downloads.
+#[cfg(windows)]
+fn mark_from_internet(path: &Path) {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    if let Err(err) = std::fs::write(&stream, "[ZoneTransfer]\r\nZoneId=3\r\n") {
+        tracing::debug!("Cannot mark '{}' as downloaded: {err}", path.display());
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_from_internet(_path: &Path) {}
+
 fn read_text(path: &Path) -> Result<(String, bool)> {
     let mut data = Vec::new();
     std::fs::File::open(path)
@@ -171,6 +200,14 @@ mod tests {
         let cp1251 = dir.path().join("b.txt");
         std::fs::write(&cp1251, [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]).unwrap();
         assert_eq!(read_text(&cp1251).unwrap().0, "Привет");
+    }
+
+    #[test]
+    fn scripts_are_runnable() {
+        assert!(runs_when_opened(Path::new("a/x.BAT")));
+        assert!(runs_when_opened(Path::new("x.js")));
+        assert!(!runs_when_opened(Path::new("x.txt")));
+        assert!(!runs_when_opened(Path::new("README")));
     }
 
     #[test]

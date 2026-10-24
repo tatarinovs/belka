@@ -4,7 +4,7 @@
 
 use super::Stats;
 use crate::remote::Accounts;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use belka_core::utils::format_bytes;
 use belka_store::tasks::{self, Task, TaskStore};
 use tracing::{error, info, warn};
@@ -102,12 +102,13 @@ pub async fn run(
     let source = accounts.source()?;
     let mut done = Vec::new();
     for task in chosen {
-        if tasks::is_running(&task.id) {
-            bail!("The backup «{}» is running already", task.name);
-        }
         info!("Backup «{}»: {} -> {}", task.name, task.local, task.remote);
         let provider = |id: &str| source.provider(id);
         match tasks::run(&store, &task.id, &provider).await {
+            // The app (or another scheduled run) is doing it now.
+            Err(err) if err.is::<tasks::AlreadyRunning>() => {
+                info!("{err}; skipped");
+            }
             Ok(run) => {
                 let r = &run.result;
                 let stats = Stats {

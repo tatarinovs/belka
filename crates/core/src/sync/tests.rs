@@ -435,6 +435,47 @@ async fn delete_extra_removes_only_what_is_gone_locally() {
 }
 
 #[tokio::test]
+async fn delete_extra_keeps_folders_that_became_links() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "keep.txt", b"k");
+    let cloud = FakeCloud::default();
+    cloud.put("/B/keep.txt", b"k");
+    cloud.put("/B/moved/photo.jpg", b"p");
+    let filter = Filter::all();
+    let mut tree = scan(dir.path(), &filter).unwrap();
+    // What `scan` records for a symlinked folder or a junction.
+    tree.links.push("moved".into());
+
+    let summary = delete_extra(&cloud, &tree, "/B", &filter, false)
+        .await
+        .unwrap();
+    assert_eq!(summary.transferred, 0);
+    assert!(cloud
+        .files
+        .lock()
+        .unwrap()
+        .contains_key("/B/moved/photo.jpg"));
+}
+
+#[tokio::test]
+async fn download_keeps_names_that_become_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let cloud = FakeCloud::default();
+    cloud.put("/B/a:b.txt", b"1");
+    cloud.put("/B/a_b.txt", b"2");
+    let summary = download(&cloud, "/B", dir.path(), &DownloadOptions::default())
+        .await
+        .unwrap();
+    assert_eq!((summary.transferred, summary.failed), (2, 0));
+    let mut got = vec![
+        std::fs::read(dir.path().join("a_b.txt")).unwrap(),
+        std::fs::read(dir.path().join("a_b (2).txt")).unwrap(),
+    ];
+    got.sort();
+    assert_eq!(got, [b"1".to_vec(), b"2".to_vec()]);
+}
+
+#[tokio::test]
 async fn download_restores_a_tree_and_skips_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("restored");

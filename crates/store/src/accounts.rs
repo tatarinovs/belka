@@ -21,6 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CRYPT_KIND: &str = "crypt";
 
+/// The shortest password an export of accounts may have.
+pub const MIN_EXPORT_PASSWORD: usize = 8;
+
 /// An encrypted folder in another account.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CryptFolder {
@@ -350,8 +353,12 @@ impl Backup {
     }
 
     /// Seals the accounts with `password` into the bytes of a `.belka` file.
-    /// Key derivation is deliberately slow.
+    /// Key derivation is deliberately slow; the password must be at least
+    /// [`MIN_EXPORT_PASSWORD`] characters, the file holds every credential.
     pub fn seal(&self, password: &str) -> Result<Vec<u8>> {
+        if password.chars().count() < MIN_EXPORT_PASSWORD {
+            bail!("The password must be at least {MIN_EXPORT_PASSWORD} characters long");
+        }
         belka_core::crypt::seal(password, &serde_json::to_vec(self)?)
     }
 
@@ -470,8 +477,8 @@ mod tests {
             .to_string()
             .contains("'NAS'"));
 
-        let sealed = store.export().unwrap().seal("pw").unwrap();
-        let backup = Backup::open(&sealed, "pw").unwrap();
+        let sealed = store.export().unwrap().seal("password").unwrap();
+        let backup = Backup::open(&sealed, "password").unwrap();
         assert_eq!(backup.account_count(), 2);
         assert!(matches!(
             backup.credentials(&backup.find("nas").unwrap().id).unwrap(),
@@ -481,9 +488,13 @@ mod tests {
 
         let other = tempfile::tempdir().unwrap();
         let copy = AccountStore::new(other.path(), Secrets::memory());
-        let imported = copy.import(Backup::open(&sealed, "pw").unwrap()).unwrap();
+        let imported = copy
+            .import(Backup::open(&sealed, "password").unwrap())
+            .unwrap();
         assert_eq!((imported.added, imported.skipped), (2, 0));
-        let again = copy.import(Backup::open(&sealed, "pw").unwrap()).unwrap();
+        let again = copy
+            .import(Backup::open(&sealed, "password").unwrap())
+            .unwrap();
         assert_eq!((again.added, again.skipped), (0, 2));
     }
 }

@@ -5,9 +5,12 @@
 //! folder (`/home`, `/photo`, ...). Shared folders are managed in DSM itself,
 //! so they cannot be created, renamed or deleted here.
 
-use super::{as_md5, rename_target, AlreadyExists, RemoteFileInfo, ShareOptions, StorageProvider};
+use super::{
+    as_md5, plain_names_only, rename_target, AlreadyExists, RemoteFileInfo, ShareOptions,
+    StorageProvider,
+};
 use crate::client::{
-    client_builder, download_into, json_response, retry_transient, send, source_body,
+    client_builder, download_into_checked, json_response, retry_transient, send, source_body,
     upload_timeout, Failure, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
@@ -15,13 +18,16 @@ use crate::utils::path::{normalize_remote_dir, split_remote};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::DateTime;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Response};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::Deserialize;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tracing::warn;
 use url::Url;
 
 const DEFAULT_HTTP_PORT: u16 = 5000;
@@ -283,6 +289,20 @@ pub fn api_base(address: &str, port: Option<u16>, https: bool) -> Result<String>
     Ok(format!("{}/webapi", url.as_str().trim_end_matches('/')))
 }
 
+/// A host of the local network, where plain HTTP to the NAS is common:
+/// a private or link-local address, or a name without dots or in `.local`.
+fn is_local_host(host: &str) -> bool {
+    match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => !host.contains('.') || host.ends_with(".local") || host.ends_with(".lan"),
+    }
+}
+
 /// Depth of a normalized path: 0 for `/`, 1 for a shared folder.
 fn depth(path: &str) -> usize {
     path.split('/').filter(|s| !s.is_empty()).count()
@@ -299,8 +319,20 @@ impl SynologyProvider {
         user: String,
         password: String,
     ) -> Result<Self> {
+        let base = api_base(address, port, https)?;
+        if let Some(host) = base
+            .strip_prefix("http://")
+            .and_then(|rest| Url::parse(&format!("http://{rest}")).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+            .filter(|host| !is_local_host(host))
+        {
+            warn!(
+                "DSM at {host} is reached over plain HTTP: the password and files go \
+                 unencrypted; turn on HTTPS"
+            );
+        }
         Ok(Self {
-            base: api_base(address, port, https)?,
+            base,
             user,
             password,
             client: client_builder()
@@ -739,20 +771,28 @@ impl StorageProvider for SynologyProvider {
         progress: &Progress,
     ) -> Result<u64> {
         let path = normalize_remote_dir(remote_path);
-        // DSM reports a missing file as JSON with status 200, which would
-        // otherwise end up in the file; this also renews an expired session.
-        match self.get_file_info(&path).await? {
+        // DSM reports errors as JSON with status 200, which would otherwise
+        // end up in the file; this also renews an expired session.
+        let size = match self.get_file_info(&path).await? {
             None => bail!("'{path}' does not exist"),
             Some(info) if info.is_dir => bail!("'{path}' is a folder"),
-            Some(_) => {}
-        }
-        let sid = self.sid().await?;
+            Some(info) => info.size,
+        };
         let paths = json_list(&[&path]);
-        download_into(
+        // The session of the last attempt, and whether DSM rejected it.
+        let used = std::sync::Mutex::new(String::new());
+        let rejected = AtomicBool::new(false);
+        download_into_checked(
             &format!("synology: download '{path}'"),
             sink,
             progress,
             || async {
+                if rejected.swap(false, Ordering::Relaxed) {
+                    let stale = used.lock().unwrap().clone();
+                    self.drop_sid(&stale).await;
+                }
+                let sid = self.sid().await?;
+                *used.lock().unwrap() = sid.clone();
                 Ok(self.client.get(self.entry()).query(&[
                     ("api", "SYNO.FileStation.Download"),
                     ("version", "2"),
@@ -761,6 +801,21 @@ impl StorageProvider for SynologyProvider {
                     ("mode", "download"),
                     ("_sid", sid.as_str()),
                 ]))
+            },
+            |resp, total| {
+                let json = resp
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|t| t.contains("json"));
+                if json || total.is_some_and(|t| t != size) {
+                    // Most likely the session expired or was replaced.
+                    rejected.store(true, Ordering::Relaxed);
+                    return Err(Failure::Transient(anyhow::anyhow!(
+                        "DSM answered with an error instead of the file"
+                    )));
+                }
+                Ok(())
             },
         )
         .await
@@ -860,7 +915,7 @@ impl StorageProvider for SynologyProvider {
                 break;
             }
         }
-        Ok(items)
+        Ok(plain_names_only(&dir, items))
     }
 
     fn check_share(&self, _options: &ShareOptions) -> Result<()> {
@@ -925,6 +980,23 @@ mod tests {
         );
         assert!(api_base("ftp://nas", None, false).is_err());
         assert!(api_base("", None, false).is_err());
+    }
+
+    #[test]
+    fn tells_local_hosts() {
+        for host in [
+            "192.168.1.10",
+            "10.0.0.2",
+            "nas",
+            "nas.local",
+            "[fe80::1]",
+            "127.0.0.1",
+        ] {
+            assert!(is_local_host(host), "{host}");
+        }
+        for host in ["nas.example.com", "8.8.8.8", "[2001:db8::1]"] {
+            assert!(!is_local_host(host), "{host}");
+        }
     }
 
     #[test]

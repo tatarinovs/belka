@@ -24,6 +24,15 @@ export function previewKind(name: string): PreviewKind | null {
   return BY_EXTENSION.get(ext) ?? null;
 }
 
+/** Text kinds that Windows runs instead of showing when opened in "the program";
+ * as `RUNNABLE` in `preview.rs`, which refuses them. */
+const RUNNABLE = new Set(["bat", "cmd", "js", "ps1"]);
+
+export function runsWhenOpened(name: string): boolean {
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 && RUNNABLE.has(name.slice(dot + 1).toLowerCase());
+}
+
 /** Larger files are downloaded for preview only after confirmation. */
 export const PREVIEW_CONFIRM_SIZE = 100 * 1024 * 1024;
 /** Text larger than this is not previewed at all. */

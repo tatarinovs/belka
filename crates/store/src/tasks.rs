@@ -21,6 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 const DEFAULT_INTERVAL_HOURS: u32 = 24;
+/// A run that ended with errors is tried again this soon.
+const RETRY_HOURS: u32 = 1;
 /// Runs kept in a task's history.
 const HISTORY: usize = 20;
 /// Failed files kept in a run's result.
@@ -98,16 +100,24 @@ impl Task {
 
     /// Whether the task should run at `now`: enabled, and never run to the
     /// end or the interval has passed since the last such run started. A
-    /// killed run does not count, the next one continues its work.
+    /// killed run does not count, the next one continues its work. After a
+    /// run with errors (no network, say) the next one comes within
+    /// [`RETRY_HOURS`], not a whole interval later.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
         if !self.enabled {
             return false;
         }
-        let finished = self.history.iter().find(|r| r.finished.is_some());
-        match finished.and_then(|r| r.started) {
-            None => true,
-            Some(started) => now - started >= chrono::Duration::hours(self.interval_hours.into()),
+        let Some(last) = self.history.iter().find(|r| r.finished.is_some()) else {
+            return true;
+        };
+        let Some(started) = last.started else {
+            return true;
+        };
+        let mut hours = self.interval_hours;
+        if last.error.is_some() || last.failed > 0 {
+            hours = hours.min(RETRY_HOURS);
         }
+        now - started >= chrono::Duration::hours(hours.into())
     }
 
     fn filter(&self) -> Filter {
@@ -160,8 +170,15 @@ pub struct TaskView {
 }
 
 /// Serializes changes of the task list: the page and a background run may
-/// both write it.
+/// both write it. [`TaskStore::lock`] adds a file lock for other processes.
 static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds the task list for one read-modify-write, in this process and
+/// against others (the app and `belka task run` from a scheduler).
+struct StoreGuard {
+    _file: std::fs::File,
+    _local: std::sync::MutexGuard<'static, ()>,
+}
 
 /// Tasks in `backups.json`, indexes in `backup-index/<id>.json`.
 pub struct TaskStore {
@@ -179,6 +196,42 @@ impl TaskStore {
 
     fn index_file(&self, id: &str) -> PathBuf {
         self.dir.join("backup-index").join(format!("{id}.json"))
+    }
+
+    /// Opens (creating it) a file used only for locking.
+    fn lock_file(&self, path: &Path) -> Result<std::fs::File> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create '{}'", dir.display()))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open '{}'", path.display()))
+    }
+
+    fn lock(&self) -> Result<StoreGuard> {
+        let local = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file = self.lock_file(&self.dir.join("backups.lock"))?;
+        file.lock().context("Failed to lock the backup tasks")?;
+        Ok(StoreGuard {
+            _file: file,
+            _local: local,
+        })
+    }
+
+    /// Claims task `id` for a run in any process; `None` if a run holds it.
+    fn claim(&self, id: &str) -> Result<Option<std::fs::File>> {
+        let file = self.lock_file(&self.dir.join("backup-index").join(format!("{id}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(err)) => {
+                Err(err).context("Failed to lock the backup task")
+            }
+        }
     }
 
     pub fn list(&self) -> Result<Vec<Task>> {
@@ -252,7 +305,7 @@ impl TaskStore {
         task.interval_hours = task.interval_hours.max(1);
         task.free_after_days = task.free_after_days.filter(|d| *d > 0);
 
-        let _guard = STORE_LOCK.lock().unwrap();
+        let _guard = self.lock()?;
         let mut tasks = self.list()?;
         match tasks
             .iter_mut()
@@ -277,7 +330,7 @@ impl TaskStore {
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
-        let _guard = STORE_LOCK.lock().unwrap();
+        let _guard = self.lock()?;
         let mut tasks = self.list()?;
         tasks.retain(|t| t.id != id);
         self.write(&tasks)?;
@@ -288,7 +341,7 @@ impl TaskStore {
     /// Puts a run into the history when it starts, so a run the system
     /// kills is still seen, and replaces it with the result at the end.
     fn record(&self, id: &str, result: &RunResult) -> Result<()> {
-        let _guard = STORE_LOCK.lock().unwrap();
+        let _guard = self.lock()?;
         let mut tasks = self.list()?;
         if let Some(task) = tasks.iter_mut().find(|t| t.id == id) {
             match task
@@ -339,6 +392,11 @@ struct Live {
     bytes_finished: u64,
     /// Files being uploaded, by their local path.
     uploading: Vec<(PathBuf, Progress)>,
+    /// Outcomes so far, for a run that is cancelled before its summary.
+    uploaded: u64,
+    uploaded_bytes: u64,
+    unchanged: u64,
+    failed: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -448,11 +506,19 @@ impl Observer for LiveObserver<'_> {
             .push((file.path.clone(), progress.clone()));
     }
 
-    fn finished(&self, file: &LocalFile, _outcome: &Outcome) {
+    fn finished(&self, file: &LocalFile, outcome: &Outcome) {
         let mut live = self.0.lock().unwrap();
         live.uploading.retain(|(path, _)| path != &file.path);
         live.files_done += 1;
         live.bytes_finished += file.size;
+        match outcome {
+            Outcome::Transferred(bytes) => {
+                live.uploaded += 1;
+                live.uploaded_bytes += bytes;
+            }
+            Outcome::Unchanged => live.unchanged += 1,
+            Outcome::Failed(_) => live.failed += 1,
+        }
     }
 }
 
@@ -465,6 +531,19 @@ pub struct Run {
     pub freed: Vec<PathBuf>,
 }
 
+/// [`run`] found the task running already, here or in another process
+/// (the app and `belka task run` from a scheduler).
+#[derive(Debug)]
+pub struct AlreadyRunning(pub String);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The backup «{}» is running already", self.0)
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
 /// Gives the provider of an account.
 pub type ProviderFn<'a> = dyn Fn(&str) -> Result<Arc<dyn StorageProvider>> + Sync + 'a;
 
@@ -472,7 +551,11 @@ pub type ProviderFn<'a> = dyn Fn(&str) -> Result<Arc<dyn StorageProvider>> + Syn
 pub async fn run(store: &TaskStore, id: &str, provider: &ProviderFn<'_>) -> Result<Run> {
     let task = store.task(id)?;
     let Some(mut guard) = RunGuard::start(id) else {
-        bail!("The backup «{}» is running already", task.name);
+        return Err(AlreadyRunning(task.name).into());
+    };
+    // The app and `belka task run` from a scheduler may both find it due.
+    let Some(_claim) = store.claim(id)? else {
+        return Err(AlreadyRunning(task.name).into());
     };
     let mut result = RunResult {
         started: Some(Utc::now()),
@@ -497,6 +580,12 @@ pub async fn run(store: &TaskStore, id: &str, provider: &ProviderFn<'_>) -> Resu
     let outcome = tokio::select! {
         outcome = work => outcome,
         _ = guard.cancelled.wait_for(|c| *c) => {
+            // What the files finished so far did.
+            let live = guard.live.lock().unwrap();
+            result.uploaded = live.uploaded;
+            result.bytes = live.uploaded_bytes;
+            result.unchanged = live.unchanged;
+            result.failed = live.failed;
             result.cancelled = true;
             Ok(())
         }

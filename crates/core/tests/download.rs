@@ -100,7 +100,7 @@ async fn fetch(url: &str, dest: &Path, progress: &Progress) -> anyhow::Result<u6
 }
 
 fn part_of(dest: &Path) -> std::path::PathBuf {
-    dest.with_file_name("out.bin.part")
+    dest.with_file_name("out.bin.belka.part")
 }
 
 #[tokio::test]

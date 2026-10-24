@@ -2,7 +2,7 @@
 //! encrypted, like an rclone crypt remote. Data is encrypted while it is
 //! uploaded and decrypted while it is downloaded, without temporary files.
 
-use super::{check_name, RemoteFileInfo, StorageProvider};
+use super::{check_name, is_plain_name, RemoteFileInfo, StorageProvider};
 use crate::client::{Sink, Source};
 use crate::crypt::{decrypted_size, Cipher, CryptConfig, DecryptSink, EncryptedSource};
 use crate::progress::Progress;
@@ -68,6 +68,10 @@ impl CryptProvider {
                 decrypted_size(item.size)?,
             )
         };
+        // A decrypted name is whatever its writer chose, `..` included.
+        if !is_plain_name(&name) {
+            return None;
+        }
         Some(RemoteFileInfo {
             path: join_remote(dir, &name),
             name,
@@ -91,7 +95,7 @@ impl CryptProvider {
         if !readable {
             bail!(
                 "'{}' contains files that cannot be decrypted with this password. \
-                 Check the password, or choose an empty folder",
+                 Check the password and the salt, or choose an empty folder",
                 self.root
             );
         }
@@ -111,6 +115,10 @@ impl StorageProvider for CryptProvider {
 
     async fn ensure_dir(&self, remote_dir: &str) -> Result<()> {
         self.inner.ensure_dir(&self.inner_dir(remote_dir)).await
+    }
+
+    fn listed_dates_are_upload_times(&self) -> bool {
+        self.inner.listed_dates_are_upload_times()
     }
 
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {

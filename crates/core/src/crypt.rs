@@ -54,8 +54,16 @@ pub struct Cipher {
     encrypt_names: bool,
 }
 
+/// scrypt's cost as rclone has it: N = 2^14.
+const RCLONE_LOG_N: u8 = 14;
+
 impl Cipher {
     pub fn new(config: &CryptConfig) -> Result<Self> {
+        Self::with_cost(config, RCLONE_LOG_N)
+    }
+
+    /// With scrypt's N = 2^`log_n`; anything but 14 is not readable by rclone.
+    fn with_cost(config: &CryptConfig, log_n: u8) -> Result<Self> {
         ensure!(
             !config.password.is_empty(),
             "The encryption password is empty"
@@ -67,7 +75,7 @@ impl Cipher {
         };
         let mut key = [0u8; 80];
         // The length here only matters for password hashes; the output is `key`.
-        let params = scrypt::Params::new(14, 8, 1, 32).expect("valid scrypt parameters");
+        let params = scrypt::Params::new(log_n, 8, 1, 32).expect("valid scrypt parameters");
         scrypt::scrypt(config.password.as_bytes(), salt, &params, &mut key)
             .expect("valid scrypt output length");
         Ok(Self {
@@ -404,7 +412,13 @@ impl Sink for DecryptSink<'_> {
     }
 }
 
-const SEALED_MAGIC: &[u8; 8] = b"BELKA\x00\x00\x01";
+/// The magic of sealed files without its last byte, the version.
+const SEALED_MAGIC: &[u8; 7] = b"BELKA\x00\x00";
+/// Version 2 derives the key with scrypt N = 2^17 (128 MiB, a fraction of a
+/// second): such a file holds the keys to every cloud, and nothing but this
+/// program has to read it. Version 1 used rclone's N = 2^14.
+const SEALED_VERSION: u8 = 2;
+const SEALED_LOG_N: [(u8, u8); 2] = [(1, RCLONE_LOG_N), (2, 17)];
 const SEALED_SALT: usize = 16;
 
 /// Encrypts `data` with a password alone, for files such as an export of
@@ -415,27 +429,38 @@ pub fn seal(password: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut salt = [0u8; SEALED_SALT];
     getrandom::fill(&mut salt).map_err(|err| anyhow::anyhow!("No random source: {err}"))?;
     let mut out = SEALED_MAGIC.to_vec();
+    out.push(SEALED_VERSION);
     out.extend_from_slice(&salt);
-    out.extend(sealed_cipher(password, &salt)?.encrypt_bytes(data)?);
+    out.extend(sealed_cipher(password, &salt, SEALED_VERSION)?.encrypt_bytes(data)?);
     Ok(out)
 }
 
-/// Opens a file made by [`seal`].
+/// Opens a file made by [`seal`], of this version or an earlier one.
 pub fn unseal(password: &str, file: &[u8]) -> Result<Vec<u8>> {
-    let Some(rest) = file.strip_prefix(SEALED_MAGIC) else {
+    let Some(&[version, ref rest @ ..]) = file.strip_prefix(SEALED_MAGIC) else {
         bail!("Not a file of this program, or it is damaged");
     };
+    ensure!(
+        version <= SEALED_VERSION,
+        "The file was made by a newer version of the program"
+    );
     ensure!(rest.len() >= SEALED_SALT, "The file is damaged");
     let (salt, data) = rest.split_at(SEALED_SALT);
-    sealed_cipher(password, salt)?.decrypt_bytes(data)
+    sealed_cipher(password, salt, version)?.decrypt_bytes(data)
 }
 
-fn sealed_cipher(password: &str, salt: &[u8]) -> Result<Cipher> {
-    Cipher::new(&CryptConfig {
+fn sealed_cipher(password: &str, salt: &[u8], version: u8) -> Result<Cipher> {
+    let log_n = SEALED_LOG_N
+        .iter()
+        .find(|(v, _)| *v == version)
+        .map(|(_, n)| *n)
+        .context("Not a file of this program, or it is damaged")?;
+    let config = CryptConfig {
         password: password.to_string(),
         salt: hex::encode(salt),
         encrypt_names: false,
-    })
+    };
+    Cipher::with_cost(&config, log_n)
 }
 
 /// Size of a file after encryption.
@@ -763,6 +788,22 @@ mod tests {
         assert!(unseal("pass", &file[..20]).is_err());
         assert!(unseal("pass", b"{\"accounts\": []}").is_err());
         assert!(seal("", data).is_err());
+        assert_eq!(file[SEALED_MAGIC.len()], SEALED_VERSION);
+    }
+
+    #[test]
+    fn sealed_files_of_version_1_still_open() {
+        let salt = [7u8; SEALED_SALT];
+        let mut file = SEALED_MAGIC.to_vec();
+        file.push(1);
+        file.extend_from_slice(&salt);
+        let cipher = sealed_cipher("pass", &salt, 1).unwrap();
+        file.extend(cipher.encrypt_bytes(b"old").unwrap());
+        assert_eq!(unseal("pass", &file).unwrap(), b"old");
+
+        let mut newer = file.clone();
+        newer[SEALED_MAGIC.len()] = SEALED_VERSION + 1;
+        assert!(unseal("pass", &newer).is_err());
     }
 
     #[tokio::test]

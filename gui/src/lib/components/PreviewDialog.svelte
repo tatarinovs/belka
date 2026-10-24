@@ -2,7 +2,7 @@
   import { convertFileSrc } from "@tauri-apps/api/core";
   import { api, errorText, type Account, type Entry, type Preview } from "$lib/api";
   import { formatBytes } from "$lib/format";
-  import { PREVIEW_CONFIRM_SIZE, TEXT_PREVIEW_MAX, previewKind } from "$lib/preview";
+  import { PREVIEW_CONFIRM_SIZE, TEXT_PREVIEW_MAX, previewKind, runsWhenOpened } from "$lib/preview";
   import { isMobile } from "$lib/platform";
   import Icon from "./Icon.svelte";
 
@@ -141,7 +141,14 @@
       <button class="icon-btn" title="Следующий (→)" onclick={() => go(1)} disabled={index >= files.length - 1}>
         <Icon name="arrowRight" />
       </button>
-      <button class="btn" onclick={openExternally} disabled={!preview} title="Открыть в программе, назначенной в системе">
+      <button
+        class="btn"
+        onclick={openExternally}
+        disabled={!preview || runsWhenOpened(entry?.name ?? "")}
+        title={runsWhenOpened(entry?.name ?? "")
+          ? "Такой файл при открытии запустится как программа"
+          : "Открыть в программе, назначенной в системе"}
+      >
         Открыть в программе
       </button>
       <button class="icon-btn" title="Закрыть (Esc)" onclick={() => dialog.close()}>

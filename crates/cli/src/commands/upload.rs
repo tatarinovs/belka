@@ -52,6 +52,9 @@ pub async fn run(
     for err in &tree.errors {
         error!("  [!] Cannot read {err}");
     }
+    for link in &tree.links {
+        warn!("  [~] Not followed: '{link}' is a link to a folder");
+    }
     let total: u64 = tree.files.iter().map(|f| f.size).sum();
     info!(
         "Found {} file(s), {} total; uploading into '{remote_dir}' with {} parallel job(s)",

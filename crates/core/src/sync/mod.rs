@@ -115,6 +115,9 @@ pub struct LocalTree {
     pub dirs: Vec<String>,
     /// Entries that could not be read, with the reason.
     pub errors: Vec<String>,
+    /// Folders reached through a symlink or junction, relative: they are not
+    /// walked, and what the cloud has under their names is not extra.
+    pub links: Vec<String>,
     /// The root was a single file rather than a folder.
     pub single_file: bool,
 }
@@ -186,6 +189,7 @@ pub fn scan(root: &Path, filter: &Filter) -> Result<LocalTree> {
                         tree.files
                             .push(LocalFile::from_metadata(entry.path(), child, &meta));
                     }
+                    Ok(meta) if meta.is_dir() => tree.links.push(child),
                     Ok(_) => {}
                     Err(err) => tree
                         .errors
@@ -201,6 +205,7 @@ pub fn scan(root: &Path, filter: &Filter) -> Result<LocalTree> {
         stack.extend(subdirs);
     }
     tree.dirs.sort();
+    tree.links.sort();
     tree.files.sort_by(|a, b| a.relative.cmp(&b.relative));
     Ok(tree)
 }

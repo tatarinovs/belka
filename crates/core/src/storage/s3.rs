@@ -2,8 +2,8 @@
 //! Storage, ...) using path-style requests signed with AWS Signature V4.
 
 use super::{
-    as_md5, base_name, parse_http_date, parse_rfc3339, rename_target, RemoteFileInfo,
-    StorageProvider,
+    as_md5, base_name, parse_http_date, parse_rfc3339, plain_names_only, rename_target,
+    RemoteFileInfo, StorageProvider,
 };
 use crate::client::{
     build_http_client, bytes_body, download_into, ensure_success, http_error, send, source_body,
@@ -303,6 +303,28 @@ impl S3Provider {
             }
         }
         Ok((objects, prefixes))
+    }
+
+    /// Whether any object has a key starting with `prefix`.
+    async fn prefix_exists(&self, prefix: &str) -> Result<bool> {
+        let resp = send("s3: list objects", || {
+            Ok(self
+                .request(
+                    Method::GET,
+                    None,
+                    &[("list-type", "2"), ("max-keys", "1"), ("prefix", prefix)],
+                    EMPTY_SHA256,
+                )
+                .timeout(API_TIMEOUT))
+        })
+        .await?;
+        let xml = ensure_success(resp, format!("Failed to list '{prefix}'"))
+            .await?
+            .text()
+            .await?;
+        let page: ListBucketResult =
+            quick_xml::de::from_str(&xml).context("Invalid S3 listing XML")?;
+        Ok(!page.contents.is_empty() || !page.common_prefixes.is_empty())
     }
 
     async fn delete_object(&self, key: &str) -> Result<()> {
@@ -612,6 +634,11 @@ impl StorageProvider for S3Provider {
         Ok(())
     }
 
+    /// Listings lack the `mtime` metadata, which only HEAD returns.
+    fn listed_dates_are_upload_times(&self) -> bool {
+        true
+    }
+
     /// S3 has no real directories; prefixes appear implicitly with objects.
     async fn ensure_dir(&self, _remote_dir: &str) -> Result<()> {
         Ok(())
@@ -629,7 +656,11 @@ impl StorageProvider for S3Provider {
         })
         .await?;
         if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
+            // No such object, but it may be a folder: a prefix of other keys.
+            return Ok(self
+                .prefix_exists(&format!("{key}/"))
+                .await?
+                .then(|| RemoteFileInfo::dir(format!("/{key}"))));
         }
         let resp = ensure_success(resp, format!("Failed to get info for '{key}'")).await?;
         let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
@@ -755,21 +786,31 @@ impl StorageProvider for S3Provider {
         };
         let (objects, prefixes) = self.list_objects(&prefix, true).await?;
 
-        let dirs = prefixes
-            .into_iter()
-            .map(|p| RemoteFileInfo::dir(format!("/{}", p.prefix.trim_end_matches('/'))));
+        // Names are what follows the prefix: keys such as `a//b` or `a/../b`
+        // must not turn into the folder itself or its parent.
+        let child = |key: &str| key.strip_prefix(prefix.as_str()).map(str::to_string);
+        let dirs = prefixes.into_iter().filter_map(|p| {
+            let name = child(&p.prefix)?.strip_suffix('/')?.to_string();
+            let path = format!("/{prefix}{name}");
+            Some(RemoteFileInfo {
+                name,
+                ..RemoteFileInfo::dir(path)
+            })
+        });
         let files = objects
             .into_iter()
             .filter(|o| o.key != prefix && !o.key.ends_with('/'))
-            .map(|o| RemoteFileInfo {
-                name: base_name(&o.key).to_string(),
-                path: format!("/{}", o.key),
-                is_dir: false,
-                size: o.size,
-                md5: o.etag.as_deref().and_then(as_md5),
-                modified: o.last_modified.as_deref().and_then(parse_rfc3339),
+            .filter_map(|o| {
+                Some(RemoteFileInfo {
+                    name: child(&o.key)?,
+                    path: format!("/{}", o.key),
+                    is_dir: false,
+                    size: o.size,
+                    md5: o.etag.as_deref().and_then(as_md5),
+                    modified: o.last_modified.as_deref().and_then(parse_rfc3339),
+                })
             });
-        Ok(dirs.chain(files).collect())
+        Ok(plain_names_only(remote_dir, dirs.chain(files).collect()))
     }
 }
 

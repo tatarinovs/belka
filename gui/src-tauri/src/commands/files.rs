@@ -6,7 +6,7 @@ use crate::transfers::{Direction, Spec, TransferList};
 use crate::{local, native, AppState};
 use anyhow::{bail, Context, Result};
 use belka_core::sync::{self, Filter};
-use belka_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name};
+use belka_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name, unique_path};
 use belka_core::StorageProvider;
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
@@ -102,29 +102,6 @@ async fn expand_download(
         }
     }
     Ok(files)
-}
-
-/// Clouds such as Google Drive allow equal names in one folder, and
-/// sanitizing can make different names equal; such files get " (2)" etc.
-fn unique_path(path: PathBuf, taken: &mut HashSet<String>) -> PathBuf {
-    // Windows and macOS file systems are case-insensitive.
-    let key = |p: &Path| p.to_string_lossy().to_lowercase();
-    if taken.insert(key(&path)) {
-        return path;
-    }
-    let stem = path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let ext = path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    (2..)
-        .map(|n| path.with_file_name(format!("{stem} ({n}){ext}")))
-        .find(|candidate| taken.insert(key(candidate)))
-        .expect("an unused name exists")
 }
 
 /// Queues uploads of local files and folders into `remote_dir`.
@@ -298,25 +275,6 @@ pub fn clear_transfers(state: State<'_, AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unique_path_numbers_duplicates_case_insensitively() {
-        let mut taken = HashSet::new();
-        let dir = Path::new("dl");
-        assert_eq!(
-            unique_path(dir.join("a.txt"), &mut taken),
-            dir.join("a.txt")
-        );
-        assert_eq!(
-            unique_path(dir.join("A.txt"), &mut taken),
-            dir.join("A (2).txt")
-        );
-        assert_eq!(
-            unique_path(dir.join("a.txt"), &mut taken),
-            dir.join("a (3).txt")
-        );
-        assert_eq!(unique_path(dir.join("b"), &mut taken), dir.join("b"));
-    }
 
     #[test]
     fn expand_upload_walks_folders() {

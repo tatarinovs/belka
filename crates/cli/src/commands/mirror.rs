@@ -20,6 +20,7 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -77,6 +78,18 @@ impl DownloadTask {
             Some(tag) => format!("[{tag}] {}", self.asset),
             None => self.asset.clone(),
         }
+    }
+
+    fn target_dir(&self, base_dir: &str) -> String {
+        if self.subfolder.is_empty() {
+            base_dir.to_string()
+        } else {
+            join_remote(base_dir, &self.subfolder)
+        }
+    }
+
+    fn remote_path(&self, base_dir: &str) -> String {
+        join_remote(&self.target_dir(base_dir), &self.remote_name())
     }
 }
 
@@ -209,9 +222,29 @@ pub async fn run(
         }
     }
 
+    // Two entries of the list may come to one cloud file: equal names of
+    // direct links, or one repository both as latest and by tag. Each file
+    // is written once, and no entry deletes a file that another one keeps.
+    let base_dir = normalize_remote_dir(remote_dir);
+    let mut planned = HashSet::new();
+    tasks.retain(|task| {
+        let path = task.remote_path(&base_dir);
+        if planned.insert(path.clone()) {
+            return true;
+        }
+        error!(
+            "  [!] {}: another entry of the list goes to '{path}' too",
+            task.url
+        );
+        stats.failed += 1;
+        false
+    });
+
     let mirror = Mirror {
         provider,
-        base_dir: normalize_remote_dir(remote_dir),
+        planned,
+        temp_names: AtomicU64::new(0),
+        base_dir,
         opts,
         client,
         temp_dir: tempfile::Builder::new()
@@ -252,6 +285,10 @@ pub async fn run(
 
 struct Mirror<'a> {
     provider: &'a dyn StorageProvider,
+    /// Cloud paths this run writes or keeps: never old versions.
+    planned: HashSet<String>,
+    /// Numbers that keep temporary file names apart.
+    temp_names: AtomicU64,
     base_dir: String,
     opts: &'a MirrorOptions,
     client: Client,
@@ -273,13 +310,9 @@ impl Mirror<'_> {
     /// Returns `Some(bytes)` if a file was uploaded, `None` if it was up to
     /// date; counts deleted old versions in `deleted`.
     async fn mirror(&self, task: &DownloadTask, deleted: &mut u64) -> Result<Option<u64>> {
-        let target_dir = if task.subfolder.is_empty() {
-            self.base_dir.clone()
-        } else {
-            join_remote(&self.base_dir, &task.subfolder)
-        };
+        let target_dir = task.target_dir(&self.base_dir);
         let file_name = task.remote_name();
-        let remote_path = join_remote(&target_dir, &file_name);
+        let remote_path = task.remote_path(&self.base_dir);
 
         let mut head = Head::default();
         if let Some(tag) = &task.tag {
@@ -324,10 +357,8 @@ impl Mirror<'_> {
 
         // Parallel downloads of equal names (two repositories with one asset
         // name) must not share a temporary file.
-        let local = self
-            .temp_dir
-            .path()
-            .join(format!("{}-{file_name}", task.subfolder));
+        let n = self.temp_names.fetch_add(1, Ordering::Relaxed);
+        let local = self.temp_dir.path().join(format!("{n}-{file_name}"));
         info!("  [v] Downloading {}", task.url);
         let size = download_to_file(&self.client, &task.url, &local).await?;
         if let Some(modified) = head.modified {
@@ -457,7 +488,11 @@ impl Mirror<'_> {
             }
         };
         let mut deleted = 0;
-        for item in old_versions(&items, tag, asset) {
+        let others = old_versions(&items, tag, asset);
+        for item in others
+            .into_iter()
+            .filter(|i| !self.planned.contains(&i.path))
+        {
             if self.opts.dry_run {
                 info!("  [dry-run] Would delete old version {}", item.path);
                 deleted += 1;

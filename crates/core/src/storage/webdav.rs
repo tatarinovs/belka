@@ -41,6 +41,8 @@ pub struct WebDavProvider {
     password: String,
     /// Whether ETags are MD5 content hashes. True for very few servers.
     trust_etag_as_md5: bool,
+    /// The server answers 500 for paths that do not exist (Mail.ru).
+    errors_mean_missing: bool,
     client: Client,
 }
 
@@ -76,8 +78,17 @@ impl WebDavProvider {
             user,
             password,
             trust_etag_as_md5,
+            errors_mean_missing: false,
             client: build_http_client()?,
         })
+    }
+
+    /// For servers that answer 500 instead of 404 for paths that do not
+    /// exist (Mail.ru): such answers then mean "missing" and are not
+    /// retried. Elsewhere a 500 is a server failure, retried and reported.
+    pub fn errors_mean_missing(mut self) -> Self {
+        self.errors_mean_missing = true;
+        self
     }
 
     fn url_for(&self, remote_path: &str, collection: bool) -> String {
@@ -121,6 +132,13 @@ impl WebDavProvider {
         let decoded = percent_decode_str(&raw_path).decode_utf8().ok()?;
         let relative = decoded.strip_prefix(self.base_path.as_str())?;
         if !relative.is_empty() && !relative.starts_with('/') {
+            return None;
+        }
+        // An encoded `..` or `\` would make the path point elsewhere.
+        if relative
+            .split('/')
+            .any(|s| s == "." || s == ".." || s.contains('\\'))
+        {
             return None;
         }
         Some(normalize_remote_dir(relative))
@@ -192,20 +210,19 @@ impl StorageProvider for WebDavProvider {
         let path = normalize_remote_dir(remote_path);
         let url = self.url_for(&path, false);
         let policy = RetryPolicy {
-            retry_server_errors: false,
+            retry_server_errors: !self.errors_mean_missing,
             ..RetryPolicy::default()
         };
         let resp = send_with("webdav: PROPFIND", policy, || Ok(self.propfind(&url, "0"))).await?;
 
         let status = resp.status();
-        // Mail.ru answers 500 (and some servers 400) for paths that do not exist.
-        if matches!(
+        // Some servers answer 400 for paths that do not exist.
+        let missing = matches!(
             status,
-            StatusCode::NOT_FOUND
-                | StatusCode::GONE
-                | StatusCode::BAD_REQUEST
-                | StatusCode::INTERNAL_SERVER_ERROR
-        ) {
+            StatusCode::NOT_FOUND | StatusCode::GONE | StatusCode::BAD_REQUEST
+        ) || (self.errors_mean_missing
+            && status == StatusCode::INTERNAL_SERVER_ERROR);
+        if missing {
             return Ok(None);
         }
         if !status.is_success() {
@@ -533,6 +550,14 @@ mod tests {
             Some("/Upload")
         );
         assert_eq!(p.href_to_remote("/remote.php/dav/files/user2/x"), None);
+        assert_eq!(
+            p.href_to_remote("/remote.php/dav/files/user/Upload/%2E%2E"),
+            None
+        );
+        assert_eq!(
+            p.href_to_remote("/remote.php/dav/files/user/Upload/a%5Cb"),
+            None
+        );
 
         let root = provider("https://webdav.mail.ru");
         assert_eq!(

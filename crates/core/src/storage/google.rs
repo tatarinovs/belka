@@ -1,8 +1,8 @@
 //! Google Drive API v3 with resumable uploads.
 
 use super::{
-    as_md5, parse_rfc3339, plain_links_only, rename_target, RemoteFileInfo, ShareOptions,
-    StorageProvider, TokenCache,
+    as_md5, parse_rfc3339, plain_links_only, plain_names_only, rename_target, RemoteFileInfo,
+    ShareOptions, StorageProvider, TokenCache,
 };
 use crate::client::{
     client_builder, download_into, ensure_success, http_error, json_response, pause_before_retry,
@@ -262,26 +262,49 @@ impl GoogleDriveProvider {
         Ok(Some(parent))
     }
 
+    /// Creating is not idempotent and Drive allows equal names: after a
+    /// timeout or a server error the folder may exist already, so it is
+    /// looked up before the request is sent again.
     async fn create_folder(&self, name: &str, parent_id: &str) -> Result<String> {
-        let token = self.access_token().await?;
-        let metadata = json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id] });
-        let resp = send("google: create folder", || {
-            Ok(self
-                .client
-                .post(FILES_API)
-                .bearer_auth(&token)
-                .query(&[("fields", "id")])
-                .json(&metadata)
-                .timeout(API_TIMEOUT))
-        })
-        .await?;
         #[derive(Deserialize)]
         struct Created {
             id: String,
         }
-        let created: Created =
-            json_response(resp, format!("Failed to create folder '{name}'")).await?;
-        Ok(created.id)
+        let token = self.access_token().await?;
+        let metadata = json!({ "name": name, "mimeType": FOLDER_MIME, "parents": [parent_id] });
+        let what = format!("Failed to create folder '{name}'");
+        let progress = Progress::new();
+        let mut attempt = 1;
+        loop {
+            let result: Result<String, Failure> = async {
+                let resp = self
+                    .client
+                    .post(FILES_API)
+                    .bearer_auth(&token)
+                    .query(&[("fields", "id")])
+                    .json(&metadata)
+                    .timeout(API_TIMEOUT)
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    return Err(Failure::from_response(resp, &what).await);
+                }
+                let created: Created = json_response(resp, &what).await?;
+                Ok(created.id)
+            }
+            .await;
+            match result {
+                Ok(id) => return Ok(id),
+                Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
+                    pause_before_retry("google: create folder", &err, attempt, &progress).await;
+                    if let Some(folder) = self.find_child(parent_id, name, Some(true)).await? {
+                        return Ok(folder.id);
+                    }
+                }
+                Err(failure) => return Err(failure.into_inner()),
+            }
+            attempt += 1;
+        }
     }
 
     /// Locates an item by path without creating anything.
@@ -450,6 +473,10 @@ impl GoogleDriveProvider {
                         UploadState::Done => return Ok(()),
                         UploadState::Incomplete(next) => {
                             debug!("google: resuming upload at byte {next} of {size}");
+                            // An upload that moves on keeps all its attempts.
+                            if next > offset {
+                                attempt = 1;
+                            }
                             offset = next;
                         }
                     }
@@ -643,7 +670,7 @@ impl StorageProvider for GoogleDriveProvider {
             "'{}' in parents and trashed = false",
             escape_query(&folder_id)
         );
-        Ok(self
+        let items = self
             .query_files(&q, None)
             .await?
             .into_iter()
@@ -651,7 +678,8 @@ impl StorageProvider for GoogleDriveProvider {
                 let path = join_remote(&dir, &file.name);
                 file.into_info(path)
             })
-            .collect())
+            .collect();
+        Ok(plain_names_only(&dir, items))
     }
 
     fn check_share(&self, options: &ShareOptions) -> Result<()> {

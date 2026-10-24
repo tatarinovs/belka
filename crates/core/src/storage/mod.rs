@@ -47,6 +47,26 @@ pub(crate) fn base_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or_default()
 }
 
+/// Whether a name a cloud listed can stand for one item in a path. Some
+/// clouds allow `..` or `/` in names (Google Drive, S3 keys); as a path such
+/// an item would be its parent or something else entirely, and deleting it
+/// would delete that.
+pub(crate) fn is_plain_name(name: &str) -> bool {
+    !name.trim().is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+}
+
+/// Leaves out listed items whose names cannot be used in paths, with a warning.
+pub(crate) fn plain_names_only(dir: &str, items: Vec<RemoteFileInfo>) -> Vec<RemoteFileInfo> {
+    let (kept, odd): (Vec<_>, Vec<_>) = items.into_iter().partition(|i| is_plain_name(&i.name));
+    for item in odd {
+        tracing::warn!(
+            "Ignoring '{}' in '{dir}': the name cannot be used in a path",
+            item.name
+        );
+    }
+    kept
+}
+
 /// A cloud storage backend. All paths are absolute, `/`-separated and
 /// normalized (see [`crate::utils::path::normalize_remote_dir`]).
 #[async_trait]
@@ -69,6 +89,12 @@ pub trait StorageProvider: Send + Sync {
     /// file on the server; `None` where it is not known.
     async fn content_md5(&self, _remote_path: &str) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Listings give the time of the upload, while [`Self::get_file_info`]
+    /// gives the date of the original file (S3 keeps it in metadata).
+    fn listed_dates_are_upload_times(&self) -> bool {
+        false
     }
 
     /// Uploads or overwrites a file with the data of `source`. The parent

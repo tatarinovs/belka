@@ -126,6 +126,18 @@ const EXACT: &[(&str, &str)] = &[
         "Облачный аккаунт задачи удалён",
     ),
     ("Nothing to upload", "Нечего загружать"),
+    (
+        "Files of this type run as programs when opened",
+        "Файлы этого типа при открытии запускаются как программы; чтобы изучить такой файл, скачайте его",
+    ),
+    (
+        "The password must be at least 8 characters long",
+        "Пароль должен быть не короче 8 символов",
+    ),
+    (
+        "The file was made by a newer version of the program",
+        "Файл создан более новой версией программы: обновите Belka",
+    ),
     ("The file is damaged", "Файл повреждён"),
     (
         "Wrong password, or the encrypted file is damaged",
@@ -172,6 +184,13 @@ fn known(msg: &str) -> Option<String> {
     ) {
         return Some(format!(
             "В этом аккаунте хранятся зашифрованные папки {names}: сначала удалите их"
+        ));
+    }
+    if let Some(path) = between(msg, "", " contains files that cannot be decrypted") {
+        return Some(format!(
+            "В {} есть файлы, которые не расшифровываются этим паролем: проверьте пароль и соль \
+             или выберите пустую папку",
+            quotes(path)
         ));
     }
     if let Some(path) = between(msg, "", " is not a folder") {
@@ -225,6 +244,11 @@ mod tests {
             translate("Backups «Камера» go to this account; remove them first"),
             "В этот аккаунт копируют задачи автобэкапа «Камера»: сначала удалите их"
         );
+        assert!(translate(
+            "'/Encrypted' contains files that cannot be decrypted with this password. \
+             Check the password and the salt, or choose an empty folder"
+        )
+        .starts_with("В «/Encrypted» есть файлы"));
     }
 
     #[test]

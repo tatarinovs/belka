@@ -188,5 +188,11 @@ pub fn preview_open(
     path: String,
 ) -> CmdResult<()> {
     let path = state.previews.cached(&path)?;
+    if cfg!(windows) && preview::runs_when_opened(&path) {
+        return Err(anyhow::anyhow!(
+            "Files of this type run as programs when opened; download the file to look at it"
+        )
+        .into());
+    }
     Ok(native::open_file(&app, &path.to_string_lossy())?)
 }

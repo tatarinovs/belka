@@ -220,6 +220,38 @@ fn tasks_are_due_after_their_interval() {
     assert!(!t.is_due(now + chrono::Duration::hours(2)));
 }
 
+#[test]
+fn a_failed_run_is_retried_soon() {
+    let mut t = Task::new("/x", "a", "/y");
+    let now = Utc::now();
+    t.history.push(RunResult {
+        started: Some(now - chrono::Duration::minutes(90)),
+        finished: Some(now - chrono::Duration::minutes(89)),
+        error: Some("no network".into()),
+        ..RunResult::default()
+    });
+    assert!(t.is_due(now));
+    t.history[0].started = Some(now - chrono::Duration::minutes(30));
+    assert!(!t.is_due(now));
+}
+
+#[tokio::test]
+async fn a_task_runs_once_at_a_time_across_processes() {
+    let settings = tempfile::tempdir().unwrap();
+    let photos = tempfile::tempdir().unwrap();
+    std::fs::write(photos.path().join("1.jpg"), b"one").unwrap();
+    let cloud = Arc::new(FakeCloud::default());
+    let store = TaskStore::new(settings.path());
+    let id = store.save(task(photos.path())).unwrap().id;
+
+    // Another process holds the task: the lock is on a file, not in memory.
+    let other = TaskStore::new(settings.path()).claim(&id).unwrap().unwrap();
+    let err = run(&store, &id, &provider(&cloud)).await.err().unwrap();
+    assert!(err.to_string().contains("running already"), "{err:#}");
+    drop(other);
+    run(&store, &id, &provider(&cloud)).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_killed_run_stays_in_the_history() {
     let settings = tempfile::tempdir().unwrap();

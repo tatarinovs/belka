@@ -1,8 +1,8 @@
 //! Yandex Disk REST API: https://yandex.ru/dev/disk-api/doc/
 
 use super::{
-    as_md5, create_dirs, parse_rfc3339, plain_links_only, rename_target, Mkdir, RemoteFileInfo,
-    ShareOptions, StorageProvider,
+    as_md5, create_dirs, parse_rfc3339, plain_links_only, plain_names_only, rename_target, Mkdir,
+    RemoteFileInfo, ShareOptions, StorageProvider,
 };
 use crate::client::{
     build_http_client, download_into, ensure_success, http_error, json_response, retry_transient,
@@ -338,7 +338,7 @@ impl StorageProvider for YandexDiskProvider {
                 break;
             }
         }
-        Ok(items)
+        Ok(plain_names_only(&dir, items))
     }
 
     fn check_share(&self, options: &ShareOptions) -> Result<()> {

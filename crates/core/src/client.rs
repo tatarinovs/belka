@@ -6,7 +6,7 @@
 //! can be transformed on the way (encrypted, decrypted) without temporary files.
 
 use crate::progress::Progress;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -110,12 +110,26 @@ impl Source for FileSource {
         self.len
     }
 
+    /// Fails if the file has changed since [`FileSource::new`]: a retried or
+    /// resumed upload would mix two versions (and with encryption, use one
+    /// nonce for different data).
     fn open_at(&self, offset: u64) -> Result<SourceReader> {
         let mut file = std::fs::File::open(&self.path)
             .with_context(|| format!("Failed to open '{}'", self.path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("Failed to read metadata of '{}'", self.path.display()))?;
+        if meta.len() != self.len || meta.modified().ok() != self.modified {
+            bail!(
+                "'{}' changed while it was being uploaded",
+                self.path.display()
+            );
+        }
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("Failed to read '{}'", self.path.display()))?;
-        Ok(Box::new(tokio::fs::File::from_std(file)))
+        // A file that grows meanwhile must not outrun the announced length.
+        let rest = self.len.saturating_sub(offset);
+        Ok(Box::new(tokio::fs::File::from_std(file).take(rest)))
     }
 
     fn modified(&self) -> Option<SystemTime> {
@@ -219,10 +233,15 @@ where
             Ok(resp) => return Ok(resp),
             Err(err) if can_retry && is_transient(&err) => {
                 let delay = backoff(attempt);
+                let err = err.without_url();
                 pause(op, &describe(&err), delay, attempt, policy.max_attempts).await;
             }
+            // URLs can hold tokens (Mail.ru, Synology, bot tokens), and the
+            // message ends up in logs, the task history and notifications.
             Err(err) => {
-                return Err(anyhow::Error::new(err).context(format!("{op}: request failed")))
+                return Err(
+                    anyhow::Error::new(err.without_url()).context(format!("{op}: request failed"))
+                )
             }
         }
         attempt += 1;
@@ -262,7 +281,7 @@ impl From<anyhow::Error> for Failure {
 impl From<reqwest::Error> for Failure {
     fn from(err: reqwest::Error) -> Self {
         let transient = is_transient(&err);
-        let err = anyhow::Error::new(err);
+        let err = anyhow::Error::new(err.without_url());
         if transient {
             Self::Transient(err)
         } else {
@@ -395,6 +414,7 @@ pub async fn json_response<T: DeserializeOwned>(resp: Response, what: impl Displ
         .await?
         .json()
         .await
+        .map_err(reqwest::Error::without_url)
         .with_context(|| format!("{what}: invalid response"))
 }
 
@@ -429,10 +449,11 @@ pub trait Sink: Send {
     async fn reset(&mut self) -> Result<()>;
 }
 
-/// Writes into `<dest>.part`, which replaces `dest` on [`PartSink::commit`].
+/// Writes into `<dest>.belka.part`, which replaces `dest` on [`PartSink::commit`].
 /// The partial file is removed when the sink is dropped without committing,
 /// which is how a cancelled download cleans up. A complete download that
-/// cannot be moved into place stays in `<dest>.part`.
+/// cannot be moved into place stays there. The suffix is unusual so that a
+/// real file such as `video.mkv.part` next to `video.mkv` is never taken.
 pub struct PartSink {
     path: PathBuf,
     file: Option<tokio::fs::File>,
@@ -443,7 +464,7 @@ pub struct PartSink {
 impl PartSink {
     pub fn new(dest: &Path) -> Self {
         let mut name = dest.file_name().unwrap_or_default().to_os_string();
-        name.push(".part");
+        name.push(".belka.part");
         Self {
             path: dest.with_file_name(name),
             file: None,
@@ -577,21 +598,46 @@ pub async fn download_into<F, Fut>(
     op: &str,
     sink: &mut dyn Sink,
     progress: &Progress,
-    mut request: F,
+    request: F,
 ) -> Result<u64>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<RequestBuilder>>,
 {
+    download_into_checked(op, sink, progress, request, |_, _| Ok(())).await
+}
+
+/// [`download_into`] where `check` looks at every successful response and
+/// its expected total size before any data is written, so a server that
+/// answers errors with status 200 (Synology DSM) cannot end up in the file.
+pub async fn download_into_checked<F, Fut, C>(
+    op: &str,
+    sink: &mut dyn Sink,
+    progress: &Progress,
+    mut request: F,
+    check: C,
+) -> Result<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<RequestBuilder>>,
+    C: Fn(&Response, Option<u64>) -> std::result::Result<(), Failure>,
+{
     sink.reset().await?;
     progress.set_done(0);
     progress.set_attempt(1);
     let mut attempt = 1;
+    // A failure after new data does not use up an attempt, so a long
+    // download survives a flaky connection as long as it moves on.
+    let mut furthest = 0;
     loop {
-        match download_attempt(sink, progress, request()).await {
+        match download_attempt(sink, progress, request(), &check).await {
             Ok(size) => return Ok(size),
             Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
-                pause_before_retry(op, &err, attempt, progress).await;
+                if sink.position() > furthest {
+                    furthest = sink.position();
+                    attempt = 0;
+                }
+                pause_before_retry(op, &err, attempt.max(1), progress).await;
             }
             Err(failure) => return Err(failure.into_inner()),
         }
@@ -599,11 +645,15 @@ where
     }
 }
 
-async fn download_attempt(
+async fn download_attempt<C>(
     sink: &mut dyn Sink,
     progress: &Progress,
     request: impl Future<Output = Result<RequestBuilder>>,
-) -> std::result::Result<u64, Failure> {
+    check: &C,
+) -> std::result::Result<u64, Failure>
+where
+    C: Fn(&Response, Option<u64>) -> std::result::Result<(), Failure>,
+{
     let offset = sink.position();
     let mut req = request.await?;
     if offset > 0 {
@@ -653,6 +703,7 @@ async fn download_attempt(
     } else {
         return Err(Failure::from_response(resp, "Download failed").await);
     };
+    check(&resp, expected)?;
     if let Some(total) = expected {
         progress.set_total(total);
     }
@@ -668,7 +719,7 @@ async fn download_attempt(
             }
             // A connection dropped mid-body surfaces as a "decode" error, which
             // `is_transient` does not cover; any failure here is worth a resume.
-            Ok(chunk) => chunk.map_err(|err| Failure::Transient(err.into()))?,
+            Ok(chunk) => chunk.map_err(|err| Failure::Transient(err.without_url().into()))?,
         };
         let Some(chunk) = chunk else { break };
         if pos == offset {

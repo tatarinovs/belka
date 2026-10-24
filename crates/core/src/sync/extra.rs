@@ -25,6 +25,9 @@ pub async fn delete_extra(
     }
     let files: HashSet<&str> = tree.files.iter().map(|f| f.relative.as_str()).collect();
     let dirs: HashSet<&str> = tree.dirs.iter().map(String::as_str).collect();
+    // A folder that became a link (say, moved to another disk) is still
+    // there locally; its cloud copy is the only one left.
+    let links: HashSet<&str> = tree.links.iter().map(String::as_str).collect();
 
     let mut summary = Summary::default();
     let mut pending = vec![(root.clone(), String::new())];
@@ -39,7 +42,7 @@ pub async fn delete_extra(
             } else {
                 format!("{relative}/{}", item.name)
             };
-            if !filter.accepts(&child, item.is_dir) {
+            if !filter.accepts(&child, item.is_dir) || links.contains(child.as_str()) {
                 continue;
             }
             if item.is_dir && dirs.contains(child.as_str()) {
