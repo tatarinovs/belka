@@ -16,7 +16,8 @@ import androidx.core.content.ContextCompat
 /**
  * A foreground service that only shows the transfer progress: while it runs,
  * Android does not freeze or kill the app, so the Rust side keeps transferring
- * with the screen off or another app open.
+ * with the screen off or another app open. It also keeps the media server
+ * going while an external player streams from it.
  */
 class TransferService : Service() {
     companion object {
@@ -29,9 +30,21 @@ class TransferService : Service() {
         @Volatile
         private var last = TransfersArgs()
 
+        private fun needed(args: TransfersArgs) = args.active > 0 || args.player.isNotEmpty()
+
+        /**
+         * Starts the service for an external player before the player takes
+         * the screen: an app in the background may not start one. The Rust side
+         * stops it once the player is done.
+         */
+        fun playing(context: Context, name: String) {
+            last.player = name
+            update(context, last)
+        }
+
         fun update(context: Context, args: TransfersArgs) {
             last = args
-            if (args.active == 0) {
+            if (!needed(args)) {
                 if (running) context.stopService(Intent(context, TransferService::class.java))
                 return
             }
@@ -63,6 +76,17 @@ class TransferService : Service() {
                 Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
+            if (args.active == 0) {
+                return NotificationCompat.Builder(context, CHANNEL)
+                    .setSmallIcon(android.R.drawable.ic_media_play)
+                    .setContentTitle("Воспроизведение в плеере")
+                    .setContentText(args.player)
+                    .setContentIntent(open)
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .setSilent(true)
+                    .build()
+            }
             val title = when {
                 args.uploads == args.active -> "Загрузка в облако: ${args.active}"
                 args.uploads == 0 -> "Скачивание: ${args.active}"
@@ -99,7 +123,7 @@ class TransferService : Service() {
         }
         running = true
         // Everything finished while the service was starting.
-        if (last.active == 0) stopSelf()
+        if (!needed(last)) stopSelf()
         return START_NOT_STICKY
     }
 

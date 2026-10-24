@@ -5,17 +5,20 @@ use super::{
     RemoteFileInfo, ShareOptions, StorageProvider,
 };
 use crate::client::{
-    build_http_client, download_into, ensure_success, http_error, json_response, retry_transient,
-    send, source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT,
+    build_http_client, download_into, ensure_success, fetch_range, http_error, json_response,
+    retry_transient, send, source_body, upload_timeout, Failure, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::normalize_remote_dir;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH};
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::Deserialize;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 const API: &str = "https://cloud-api.yandex.net/v1/disk/resources";
 const PAGE_SIZE: usize = 1000;
@@ -27,7 +30,13 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct YandexDiskProvider {
     auth: String,
     client: Client,
+    /// The download link of the file being streamed: (path, link, when
+    /// received). Asking for a link for every part would double the requests.
+    range_link: Mutex<Option<(String, String, Instant)>>,
 }
+
+/// Download links live for hours; this keeps well within that.
+const RANGE_LINK_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Deserialize)]
 struct Link {
@@ -87,6 +96,7 @@ impl YandexDiskProvider {
         Ok(Self {
             auth: format!("OAuth {token}"),
             client: build_http_client()?,
+            range_link: Mutex::new(None),
         })
     }
 
@@ -265,6 +275,27 @@ impl StorageProvider for YandexDiskProvider {
             },
         )
         .await
+    }
+
+    async fn read_range(&self, remote_path: &str, start: u64, len: u64) -> Result<Bytes> {
+        let path = normalize_remote_dir(remote_path);
+        let op = format!("yandex: read '{path}'");
+        let cached = self
+            .range_link
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(p, _, at)| *p == path && at.elapsed() < RANGE_LINK_TTL);
+        if let Some((_, link, _)) = cached {
+            match fetch_range(&op, start, len, || async { Ok(self.client.get(&link)) }).await {
+                Ok(data) => return Ok(data),
+                // The link may have expired early: try once more with a new one.
+                Err(err) => debug!("{op}: cached link failed: {err:#}"),
+            }
+        }
+        let link = self.download_link(&path).await?;
+        *self.range_link.lock().unwrap() = Some((path, link.clone(), Instant::now()));
+        fetch_range(&op, start, len, || async { Ok(self.client.get(&link)) }).await
     }
 
     async fn delete(&self, remote_path: &str, _is_dir: bool) -> Result<()> {

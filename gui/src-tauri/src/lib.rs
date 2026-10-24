@@ -3,6 +3,7 @@ mod error;
 mod local;
 mod native;
 mod preview;
+mod stream;
 mod transfers;
 
 use anyhow::Result;
@@ -29,6 +30,7 @@ pub(crate) struct AppState {
     /// Aborts the browser sign-in in progress.
     sign_in_cancel: Mutex<Option<oneshot::Sender<()>>>,
     previews: preview::Previews,
+    streams: stream::Streams,
     tasks: TaskStore,
 }
 
@@ -136,6 +138,7 @@ pub fn run() {
                 transfers,
                 sign_in_cancel: Mutex::new(None),
                 previews: preview::Previews::new(preview_dir),
+                streams: stream::Streams::default(),
             });
             // WorkManager keeps the schedule across restarts; this only
             // repairs it, say after the app data was restored. On desktops
@@ -177,6 +180,10 @@ pub fn run() {
             commands::cloud::preview_progress,
             commands::cloud::preview_cancel,
             commands::cloud::preview_open,
+            commands::cloud::stream_open,
+            commands::cloud::stream_play,
+            commands::cloud::pdf_info,
+            commands::cloud::pdf_page,
             commands::files::download,
             commands::files::upload,
             commands::files::local_conflicts,
@@ -192,6 +199,7 @@ pub fn run() {
             commands::files::clear_transfers,
             commands::app::storage_access,
             commands::app::request_storage_access,
+            commands::app::set_immersive,
             commands::app::check_update,
             commands::backup::backup_tasks,
             commands::backup::backup_save,

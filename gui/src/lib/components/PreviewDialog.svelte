@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { convertFileSrc } from "@tauri-apps/api/core";
   import { api, errorText, type Account, type Entry, type Preview } from "$lib/api";
   import { formatBytes } from "$lib/format";
   import { PREVIEW_CONFIRM_SIZE, TEXT_PREVIEW_MAX, previewKind, runsWhenOpened } from "$lib/preview";
   import { isMobile } from "$lib/platform";
   import Icon from "./Icon.svelte";
+  import PdfPages from "./PdfPages.svelte";
 
   let { account, files, start, onclose }: {
     account: Account;
@@ -24,16 +26,51 @@
   let stalled = $state("");
   /** Large files the user agreed to download. */
   let confirmed = $state(new Set<string>());
+  /** URL of the media file playing while it downloads, or "". */
+  let streamSrc = $state("");
+  /** Media files the cloud cannot stream: they are downloaded whole. */
+  let unstreamable = $state(new Set<string>());
+  /** Why the PDF being shown cannot be drawn on Android, or "". */
+  let pdfError = $state("");
+  /** The webview cannot play the media file: a codec it lacks, say. */
+  let mediaFailed = $state(false);
   let requestSeq = 0;
 
   const entry = $derived(files[index]);
-  const kind = $derived(entry ? previewKind(entry.name) : null);
+  const kind = $derived(entry ? previewKind(entry.name, entry.size) : null);
+  const media = $derived(kind === "video" || kind === "audio");
   const tooLarge = $derived(
     !!entry &&
       ((kind === "text" && entry.size > TEXT_PREVIEW_MAX) ||
-        (entry.size > PREVIEW_CONFIRM_SIZE && !confirmed.has(entry.path))),
+        (entry.size > PREVIEW_CONFIRM_SIZE &&
+          !confirmed.has(entry.path) &&
+          // Streaming fetches only what is played, so it needs no consent;
+          // an external player streams too.
+          kind !== "player" &&
+          (!media || unstreamable.has(entry.path)))),
   );
-  const src = $derived(preview ? convertFileSrc(preview.path) : "");
+  const src = $derived(streamSrc || (preview ? convertFileSrc(preview.path) : ""));
+  /** A streamed video goes to an external player, other files to their program. */
+  const canOpen = $derived(!!preview || (kind === "video" && !!streamSrc) || kind === "player");
+  /** A phone held sideways shows a video alone across the whole screen. */
+  let landscape = $state(false);
+  const immersive = $derived(isMobile && landscape && kind === "video" && !!src);
+
+  $effect(() => {
+    if (!isMobile) return;
+    const query = matchMedia("(orientation: landscape)");
+    const update = () => (landscape = query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  });
+
+  // The system bars go away too; a swipe from the edge brings them back.
+  $effect(() => {
+    if (!immersive) return;
+    api.setImmersive(true).catch(() => {});
+    return () => void api.setImmersive(false).catch(() => {});
+  });
 
   $effect(() => {
     index = start;
@@ -42,10 +79,11 @@
   });
 
   $effect(() => {
-    if (entry && kind && !tooLarge) load(entry);
+    if (entry && kind && !tooLarge) untrack(() => load(entry));
     else {
       requestSeq++;
       preview = null;
+      streamSrc = "";
       loading = false;
       error = "";
     }
@@ -54,10 +92,27 @@
   async function load(item: Entry) {
     const seq = ++requestSeq;
     preview = null;
+    streamSrc = "";
+    pdfError = "";
+    mediaFailed = false;
     error = "";
+    // An external player streams the file itself.
+    if (kind === "player") return;
     loading = true;
     progress = [0, item.size];
     stalled = "";
+    if (media && !unstreamable.has(item.path)) {
+      const url = await api.streamOpen(account.id, item).catch(() => null);
+      if (seq !== requestSeq) return;
+      if (url) {
+        streamSrc = url;
+        loading = false;
+        return;
+      }
+      unstreamable = new Set(unstreamable).add(item.path);
+      // A large file now asks for consent first; the effect shows that.
+      if (item.size > PREVIEW_CONFIRM_SIZE && !confirmed.has(item.path)) return;
+    }
     const started = Date.now();
     const timer = setInterval(async () => {
       const { done, total, attempt, max_attempts } = await api.previewProgress();
@@ -85,7 +140,13 @@
   }
 
   function openExternally() {
-    if (preview) api.previewOpen(preview.path).catch((err) => (error = errorText(err)));
+    if (kind === "player" || (kind === "video" && streamSrc)) playExternally();
+    else if (preview) api.previewOpen(preview.path).catch((err) => (error = errorText(err)));
+  }
+
+  /** VLC and the like: the program set for the type, or the app the user picks on Android. */
+  function playExternally() {
+    if (entry) api.streamPlay(account.id, entry).catch((err) => (error = errorText(err)));
   }
 
   // A horizontal swipe over the picture moves to the next or previous file.
@@ -114,7 +175,14 @@
   }
 </script>
 
-<dialog class="modal" class:phone={isMobile} bind:this={dialog} onclose={onclose} {onkeydown}>
+<dialog
+  class="modal"
+  class:phone={isMobile}
+  class:immersive
+  bind:this={dialog}
+  onclose={onclose}
+  {onkeydown}
+>
   {#if isMobile}
     <!-- On a phone the arrows move to a bar at the bottom, within thumb reach. -->
     <header>
@@ -125,7 +193,7 @@
         <span class="name">{entry?.name}</span>
         <span class="meta">{formatBytes(entry?.size ?? 0)}</span>
       </div>
-      <button class="icon-btn" aria-label="Открыть в другом приложении" onclick={openExternally} disabled={!preview}>
+      <button class="icon-btn" aria-label="Открыть в другом приложении" onclick={openExternally} disabled={!canOpen}>
         <Icon name="external" size={22} />
       </button>
     </header>
@@ -144,7 +212,7 @@
       <button
         class="btn"
         onclick={openExternally}
-        disabled={!preview || runsWhenOpened(entry?.name ?? "")}
+        disabled={!canOpen || runsWhenOpened(entry?.name ?? "")}
         title={runsWhenOpened(entry?.name ?? "")
           ? "Такой файл при открытии запустится как программа"
           : "Открыть в программе, назначенной в системе"}
@@ -177,7 +245,17 @@
       </div>
     {:else if error}
       <p class="message error">{error}</p>
-    {:else if loading || !preview}
+    {:else if kind === "player"}
+      <div class="message">
+        <p>Это видео встроенный плеер не воспроизводит: его покажет VLC или другой видеоплеер.</p>
+        <button class="btn primary" onclick={playExternally}>Открыть в плеере</button>
+      </div>
+    {:else if media && mediaFailed}
+      <div class="message">
+        <p>Встроенный плеер не может воспроизвести этот файл.</p>
+        <button class="btn primary" onclick={playExternally}>Открыть в плеере</button>
+      </div>
+    {:else if loading || !src}
       <div class="message">
         <p>Загрузка… {progress[1] ? Math.floor((progress[0] / progress[1]) * 100) : 0}%</p>
         <div class="bar"><div style:width="{progress[1] ? (progress[0] / progress[1]) * 100 : 0}%"></div></div>
@@ -188,24 +266,34 @@
     {:else if kind === "image"}
       <img {src} alt={entry.name} />
     {:else if kind === "video"}
+      <!-- Android WebView refuses the player's own full screen: turning
+           the phone does it instead. -->
       <!-- svelte-ignore a11y_media_has_caption -->
-      <video {src} controls autoplay></video>
+      <video
+        {src}
+        controls
+        autoplay
+        controlslist={isMobile ? "nofullscreen" : undefined}
+        onerror={() => (mediaFailed = true)}
+      ></video>
     {:else if kind === "audio"}
-      <audio {src} controls autoplay></audio>
+      <audio {src} controls autoplay onerror={() => (mediaFailed = true)}></audio>
+    {:else if kind === "pdf" && isMobile && !pdfError}
+      <PdfPages path={preview!.path} onfail={(err) => (pdfError = err)} />
     {:else if kind === "pdf" && isMobile}
-      <!-- Android WebView cannot show PDF files. -->
+      <!-- A PDF with a password, or one the system cannot read. -->
       <div class="message">
-        <p>PDF откроется в программе для чтения документов.</p>
+        <p>Этот PDF не получается показать здесь: {pdfError}</p>
         <button class="btn primary" onclick={openExternally}>Открыть в другом приложении</button>
       </div>
     {:else if kind === "pdf"}
       <iframe {src} title={entry.name}></iframe>
     {:else if kind === "text"}
       <div class="text">
-        {#if preview.truncated}
+        {#if preview?.truncated}
           <p class="note">Показан первый мегабайт файла.</p>
         {/if}
-        <pre>{preview.text}</pre>
+        <pre>{preview?.text}</pre>
       </div>
     {/if}
   </div>
@@ -303,6 +391,21 @@
     padding: 4px 12px;
     border-top: 1px solid var(--border);
     color: var(--muted);
+  }
+
+  /* Phone held sideways: the video alone on black, as in a player. */
+  dialog.modal.phone.immersive header,
+  dialog.modal.phone.immersive footer {
+    display: none;
+  }
+
+  .immersive .stage {
+    background: #000;
+  }
+
+  .immersive video {
+    width: 100%;
+    height: 100%;
   }
 
   .stage {

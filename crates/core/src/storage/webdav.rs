@@ -5,13 +5,14 @@ use super::{
     StorageProvider,
 };
 use crate::client::{
-    build_http_client, download_into, ensure_success, http_error, send, send_with, source_body,
-    upload_timeout, RetryPolicy, Sink, Source, API_TIMEOUT,
+    build_http_client, download_into, ensure_success, fetch_range, http_error, send, send_with,
+    source_body, upload_timeout, RetryPolicy, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::{encode_component, normalize_remote_dir};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
@@ -284,6 +285,15 @@ impl StorageProvider for WebDavProvider {
             progress,
             || async { Ok(self.request(Method::GET, &url)) },
         )
+        .await
+    }
+
+    async fn read_range(&self, remote_path: &str, start: u64, len: u64) -> Result<Bytes> {
+        let path = normalize_remote_dir(remote_path);
+        let url = self.url_for(&path, false);
+        fetch_range(&format!("webdav: read '{path}'"), start, len, || async {
+            Ok(self.request(Method::GET, &url))
+        })
         .await
     }
 

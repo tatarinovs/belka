@@ -29,7 +29,9 @@ tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-fs = "2"
 reqwest.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread"] }
+bytes.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "net", "io-util"] }
+getrandom = "0.3"
 chrono.workspace = true
 futures-util.workspace = true
 encoding_rs = "0.8"
@@ -42,6 +44,10 @@ jni = "0.21"
 tauri-plugin-window-state = "2"
 trash = "5"
 belka-store = { workspace = true, features = ["keyring"] }
+
+# The program a file type opens with, to give it a stream.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
 
 [dev-dependencies]
 tempfile = "3"

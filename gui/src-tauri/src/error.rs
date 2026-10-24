@@ -155,6 +155,15 @@ const EXACT: &[(&str, &str)] = &[
         "Refusing to delete the root folder",
         "Корневую папку удалить нельзя",
     ),
+    (
+        "The cloud cannot stream this file",
+        "Это облако не отдаёт файлы потоком: скачайте файл",
+    ),
+    (
+        "No player is set for files of this type",
+        "В системе не назначена программа для файлов этого типа",
+    ),
+    ("No app can play the video", "Нет приложения, которое может воспроизвести это видео"),
     ("Cannot access ", "Нет доступа к "),
     ("Cannot open folder ", "Не удаётся открыть папку "),
     ("Invalid name ", "Недопустимое имя "),

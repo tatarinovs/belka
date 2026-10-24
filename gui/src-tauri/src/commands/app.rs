@@ -1,4 +1,4 @@
-//! The app itself: storage access on Android and updates.
+//! The app itself: storage access and the full screen on Android, updates.
 
 use crate::error::CmdResult;
 use crate::native;
@@ -15,6 +15,13 @@ pub fn storage_access(app: tauri::AppHandle) -> bool {
 #[tauri::command]
 pub fn request_storage_access(app: tauri::AppHandle) -> CmdResult<()> {
     Ok(native::request_storage_access(&app)?)
+}
+
+/// Android: hides the system bars while a video fills the screen, or shows
+/// them again.
+#[tauri::command]
+pub fn set_immersive(app: tauri::AppHandle, on: bool) -> CmdResult<()> {
+    Ok(native::immersive(&app, on)?)
 }
 
 #[derive(Serialize)]

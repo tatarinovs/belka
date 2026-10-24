@@ -226,10 +226,15 @@
     cloudTabId = cloudTabs.find((t) => t.id === saved.cloud?.active)?.id ?? cloudTabs[0]?.id ?? null;
     localTabs = saved.local?.tabs?.length ? saved.local.tabs : [{ id: newId(), path: stored(KEY_LOCAL) ?? "" }];
     localTabId = localTabs.find((t) => t.id === saved.local?.active)?.id ?? localTabs[0].id;
+    restored = true;
   }
 
+  /** The tabs are saved only once restored: `loaded` comes first, and the
+   * empty tabs of the start would overwrite the saved ones. */
+  let restored = $state(false);
+
   $effect(() => {
-    if (!loaded) return;
+    if (!restored) return;
     remember(
       KEY_TABS,
       JSON.stringify({

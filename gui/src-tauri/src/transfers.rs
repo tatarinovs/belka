@@ -134,6 +134,8 @@ pub struct Activity {
     /// Progress of the running files.
     done_bytes: u64,
     total_bytes: u64,
+    /// The file an external player is streaming, or "".
+    pub player: String,
 }
 
 pub struct Transfers {

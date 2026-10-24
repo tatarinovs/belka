@@ -178,6 +178,27 @@ pub fn preview_progress(state: State<'_, AppState>) -> preview::PreviewProgress 
 #[tauri::command]
 pub fn preview_cancel(state: State<'_, AppState>) {
     state.previews.cancel();
+    state.streams.close();
+}
+
+/// Starts streaming a cloud media file and returns its URL, or `None` if
+/// it cannot stream and has to be downloaded.
+#[tauri::command]
+pub async fn stream_open(
+    state: State<'_, AppState>,
+    account_id: String,
+    path: String,
+    size: u64,
+) -> CmdResult<Option<String>> {
+    let provider = state.provider(&account_id)?;
+    let path = normalize_remote_dir(&path);
+    match state.streams.open(provider, &path, size).await {
+        Ok(url) => Ok(Some(url)),
+        Err(err) => {
+            tracing::info!("Cannot stream '{path}', downloading instead: {err:#}");
+            Ok(None)
+        }
+    }
 }
 
 /// Opens a cached preview in the program the system associates with it.
@@ -195,4 +216,68 @@ pub fn preview_open(
         .into());
     }
     Ok(native::open_file(&app, &path.to_string_lossy())?)
+}
+
+/// Hands a cloud video to an external player as a stream: the program set
+/// for its type on Windows, the app the user picks on Android.
+#[tauri::command]
+pub async fn stream_play(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    path: String,
+    size: u64,
+) -> CmdResult<()> {
+    let provider = state.provider(&account_id)?;
+    let path = normalize_remote_dir(&path);
+    let url = match state.streams.open_player(provider, &path, size).await {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::info!("Cannot stream '{path}' to a player: {err:#}");
+            return Err(anyhow::anyhow!("The cloud cannot stream this file").into());
+        }
+    };
+    let name = path.rsplit('/').next().unwrap_or_default().to_string();
+    let mime = crate::stream::mime_type(&path);
+    tauri::async_runtime::spawn_blocking(move || native::play_url(&app, &url, mime, &name))
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))??;
+    Ok(())
+}
+
+/// Android: the pages of a cached PDF preview with their sizes.
+#[tauri::command]
+pub async fn pdf_info(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> CmdResult<native::PdfInfo> {
+    let path = state.previews.cached(&path)?;
+    // The plugin answers once the document is read; keep the runtime free.
+    let info = tauri::async_runtime::spawn_blocking(move || native::pdf_info(&app, &path))
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))??;
+    Ok(info)
+}
+
+/// Android: draws page `page` of a cached PDF preview `width` pixels wide
+/// and returns the picture, which is kept next to the preview.
+#[tauri::command]
+pub async fn pdf_page(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    page: u32,
+    width: u32,
+) -> CmdResult<String> {
+    let path = state.previews.cached(&path)?;
+    let width = width.clamp(100, 2400);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".p{page}w{width}.png"));
+    let out = path.with_file_name(name);
+    let picture = out.clone();
+    tauri::async_runtime::spawn_blocking(move || native::pdf_page(&app, &path, page, width, &out))
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))??;
+    Ok(picture.to_string_lossy().into_owned())
 }

@@ -6,7 +6,7 @@
 //! can be transformed on the way (encrypted, decrypted) without temporary files.
 
 use crate::progress::Progress;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -740,10 +740,67 @@ where
     Ok(pos)
 }
 
+/// Reads `len` bytes of remote data from `start` (fewer at the end of the
+/// data) with a `Range` request, retrying network failures. `request` builds
+/// the GET request for every attempt. Fails if the server ignores the range:
+/// streaming cannot fall back to the whole file.
+pub async fn fetch_range<F, Fut>(op: &str, start: u64, len: u64, mut request: F) -> Result<Bytes>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<RequestBuilder>>,
+{
+    ensure!(len > 0, "{op}: empty range");
+    let progress = Progress::new();
+    let mut attempt = 1;
+    loop {
+        match range_attempt(request(), start, len).await {
+            Ok(data) => return Ok(data),
+            Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
+                pause_before_retry(op, &err, attempt, &progress).await;
+            }
+            Err(failure) => return Err(failure.into_inner().context(format!("{op} failed"))),
+        }
+        attempt += 1;
+    }
+}
+
+async fn range_attempt(
+    request: impl Future<Output = Result<RequestBuilder>>,
+    start: u64,
+    len: u64,
+) -> std::result::Result<Bytes, Failure> {
+    let resp = request
+        .await?
+        .header(header::RANGE, format!("bytes={start}-{}", start + len - 1))
+        .timeout(API_TIMEOUT)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status == StatusCode::PARTIAL_CONTENT {
+        if parse_content_range(&resp).is_none_or(|(first, _)| first != start) {
+            return Err(Failure::Fatal(anyhow!(
+                "server returned an unexpected range {:?} for {start}-{}",
+                resp.headers().get(header::CONTENT_RANGE),
+                start + len - 1
+            )));
+        }
+        return Ok(resp.bytes().await?);
+    }
+    if status.is_success() {
+        return Err(Failure::Fatal(anyhow!("server ignores Range requests")));
+    }
+    Err(Failure::from_response(resp, "Download failed").await)
+}
+
 /// Parses `Content-Range: bytes <start>-<end>/<total>` into (start, total).
 fn parse_content_range(resp: &Response) -> Option<(u64, Option<u64>)> {
-    let value = resp.headers().get(header::CONTENT_RANGE)?.to_str().ok()?;
-    let (range, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    content_range(resp.headers().get(header::CONTENT_RANGE)?.to_str().ok()?)
+}
+
+fn content_range(value: &str) -> Option<(u64, Option<u64>)> {
+    // Mail.ru writes `bytes=` as in the request.
+    let value = value.strip_prefix("bytes")?.strip_prefix([' ', '='])?;
+    let (range, total) = value.split_once('/')?;
     let start = range.split_once('-')?.0.trim().parse().ok()?;
     Some((start, total.trim().parse().ok()))
 }
@@ -757,6 +814,15 @@ mod tests {
         assert!(backoff(1) >= Duration::from_secs(1) && backoff(1) < Duration::from_secs(2));
         assert!(backoff(3) >= Duration::from_secs(4));
         assert!(backoff(20) <= Duration::from_millis(30_500));
+    }
+
+    #[test]
+    fn parses_content_ranges() {
+        assert_eq!(content_range("bytes 0-9/100"), Some((0, Some(100))));
+        assert_eq!(content_range("bytes=10-19/100"), Some((10, Some(100))));
+        assert_eq!(content_range("bytes 10-19/*"), Some((10, None)));
+        assert_eq!(content_range("bytes */100"), None);
+        assert_eq!(content_range("items 0-9/100"), None);
     }
 
     #[test]

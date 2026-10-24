@@ -6,8 +6,8 @@ use super::{
     RemoteFileInfo, StorageProvider,
 };
 use crate::client::{
-    build_http_client, bytes_body, download_into, ensure_success, http_error, send, source_body,
-    upload_timeout, Sink, Source, API_TIMEOUT,
+    build_http_client, bytes_body, download_into, ensure_success, fetch_range, http_error, send,
+    source_body, upload_timeout, Sink, Source, API_TIMEOUT,
 };
 use crate::progress::Progress;
 use crate::utils::path::{encode_component, encode_path, normalize_remote_dir};
@@ -714,6 +714,17 @@ impl StorageProvider for S3Provider {
         }
         // The request is signed anew for every attempt.
         download_into(&format!("s3: download '{key}'"), sink, progress, || async {
+            Ok(self.request(Method::GET, Some(&key), &[], EMPTY_SHA256))
+        })
+        .await
+    }
+
+    async fn read_range(&self, remote_path: &str, start: u64, len: u64) -> Result<Bytes> {
+        let key = Self::key_for(remote_path);
+        if key.is_empty() {
+            bail!("Invalid S3 object key for '{remote_path}'");
+        }
+        fetch_range(&format!("s3: read '{key}'"), start, len, || async {
             Ok(self.request(Method::GET, Some(&key), &[], EMPTY_SHA256))
         })
         .await

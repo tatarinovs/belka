@@ -87,6 +87,11 @@ export interface CryptFolder {
   encrypt_names: boolean;
 }
 
+export interface PdfPageSize {
+  width: number;
+  height: number;
+}
+
 /** A cloud file downloaded for preview. */
 export interface Preview {
   /** The cached file. */
@@ -271,6 +276,17 @@ export const api = {
   previewProgress: () =>
     invoke<{ done: number; total: number; attempt: number; max_attempts: number }>("preview_progress"),
   previewCancel: () => invoke<void>("preview_cancel"),
+  /** Starts streaming a media file and returns the URL to play.
+   * `null` if the cloud cannot stream it and it has to be downloaded. */
+  streamOpen: (accountId: string, entry: Entry) =>
+    invoke<string | null>("stream_open", { accountId, path: entry.path, size: entry.size }),
+  /** Hands a video to an external player as a stream. */
+  streamPlay: (accountId: string, entry: Entry) =>
+    invoke<void>("stream_play", { accountId, path: entry.path, size: entry.size }),
+  /** Android: the pages of a cached PDF preview with their sizes in points. */
+  pdfInfo: (path: string) => invoke<{ pages: PdfPageSize[] }>("pdf_info", { path }),
+  /** Android: draws a page of a cached PDF preview; returns the picture file. */
+  pdfPage: (path: string, page: number, width: number) => invoke<string>("pdf_page", { path, page, width }),
   /** Opens a cached preview in the program associated with it. */
   previewOpen: (path: string) => invoke<void>("preview_open", { path }),
   /** Opens a local file in the program associated with it. */
@@ -293,6 +309,8 @@ export const api = {
   storageAccess: () => invoke<boolean>("storage_access"),
   /** Android: opens the system page that grants access to all files. */
   requestStorageAccess: () => invoke<void>("request_storage_access"),
+  /** Android: hides the system bars, or shows them again. */
+  setImmersive: (on: boolean) => invoke<void>("set_immersive", { on }),
   /** The latest release on GitHub if it is newer than this build. */
   checkUpdate: () => invoke<Update | null>("check_update"),
 

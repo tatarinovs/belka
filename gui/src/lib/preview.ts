@@ -1,11 +1,13 @@
-/** What the preview window can show, by file extension. */
-export type PreviewKind = "image" | "video" | "audio" | "pdf" | "text";
+/** What the preview window can show, by file extension. A "player" video
+ * is one the webview cannot play: it goes to an external player. */
+export type PreviewKind = "image" | "video" | "audio" | "pdf" | "text" | "player";
 
 const KINDS: Record<PreviewKind, string[]> = {
   image: ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "ico", "avif"],
   video: ["mp4", "m4v", "webm", "mov", "ogv"],
   audio: ["mp3", "m4a", "aac", "wav", "ogg", "oga", "opus", "flac"],
   pdf: ["pdf"],
+  player: ["mkv", "avi", "m2ts", "mts", "wmv", "flv", "mpg", "mpeg", "vob", "3gp"],
   text: [
     "txt", "md", "log", "csv", "tsv", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf",
     "env", "sql", "html", "htm", "css", "js", "ts", "jsx", "tsx", "svelte", "vue", "py", "rs", "go",
@@ -18,9 +20,14 @@ const BY_EXTENSION = new Map(
   Object.entries(KINDS).flatMap(([kind, exts]) => exts.map((ext) => [ext, kind as PreviewKind])),
 );
 
-export function previewKind(name: string): PreviewKind | null {
+/** `.ts` is TypeScript or an MPEG transport stream: source files are small,
+ * videos large. */
+const TS_VIDEO_MIN = 1024 * 1024;
+
+export function previewKind(name: string, size: number): PreviewKind | null {
   const dot = name.lastIndexOf(".");
   const ext = (dot >= 0 ? name.slice(dot + 1) : name).toLowerCase();
+  if (ext === "ts" && size >= TS_VIDEO_MIN) return "player";
   return BY_EXTENSION.get(ext) ?? null;
 }
 

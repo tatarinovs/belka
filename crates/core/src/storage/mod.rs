@@ -11,6 +11,7 @@ use crate::progress::Progress;
 use crate::utils::path::{join_remote, split_remote};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use std::future::Future;
 use std::path::Path;
@@ -165,6 +166,13 @@ pub trait StorageProvider: Send + Sync {
         let size = self.download_to(remote_path, &mut part, progress).await?;
         part.commit(local_path).await?;
         Ok(size)
+    }
+
+    /// Reads `len` bytes of a file from `start` (fewer at the end of the
+    /// file), so media can play while it downloads. Fails where the cloud
+    /// cannot read a part of a file.
+    async fn read_range(&self, remote_path: &str, _start: u64, _len: u64) -> Result<Bytes> {
+        bail!("{} cannot read a part of '{remote_path}'", self.name())
     }
 
     /// Deletes a file, or a directory with all of its content.

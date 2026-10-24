@@ -2,11 +2,13 @@
 //! generated Android project: access to the shared storage and a foreground
 //! service that keeps transfers going while the app is in the background,
 //! and backups scheduled with WorkManager, which call back into Rust
-//! through JNI ([`jni_api`]).
+//! through JNI ([`jni_api`]). It also hides the system bars for videos and
+//! draws PDF pages, which Android WebView cannot show.
 //! On desktops the commands answer as if everything were allowed.
 
 use crate::transfers::Transfers;
 use belka_store::tasks::Task;
+use std::path::Path;
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime};
 
@@ -46,16 +48,24 @@ mod imp {
             .is_some_and(|g| g.granted)
     }
 
+    fn call<R: Runtime, T: serde::de::DeserializeOwned>(
+        app: &AppHandle<R>,
+        command: &str,
+        payload: impl serde::Serialize,
+    ) -> anyhow::Result<T> {
+        let handle =
+            handle(app).ok_or_else(|| anyhow::anyhow!("The Android plugin is not loaded"))?;
+        handle
+            .run_mobile_plugin::<T>(command, payload)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
     fn run<R: Runtime>(
         app: &AppHandle<R>,
         command: &str,
         payload: impl serde::Serialize,
     ) -> anyhow::Result<()> {
-        let handle =
-            handle(app).ok_or_else(|| anyhow::anyhow!("The Android plugin is not loaded"))?;
-        handle
-            .run_mobile_plugin::<()>(command, payload)
-            .map_err(|err| anyhow::anyhow!("{err}"))
+        call(app, command, payload)
     }
 
     pub fn request_storage_access<R: Runtime>(app: &AppHandle<R>) -> anyhow::Result<()> {
@@ -71,15 +81,76 @@ mod imp {
         run(app, "openFile", Args { path })
     }
 
+    /// Offers the apps that can play `url`, a stream for an external player.
+    pub fn play_url<R: Runtime>(
+        app: &AppHandle<R>,
+        url: &str,
+        mime: &str,
+        title: &str,
+    ) -> anyhow::Result<()> {
+        #[derive(serde::Serialize)]
+        struct Args<'a> {
+            url: &'a str,
+            mime: &'a str,
+            title: &'a str,
+        }
+        run(app, "playUrl", Args { url, mime, title })
+    }
+
+    /// Hides the system bars, or shows them again.
+    pub fn immersive<R: Runtime>(app: &AppHandle<R>, on: bool) -> anyhow::Result<()> {
+        #[derive(serde::Serialize)]
+        struct Args {
+            on: bool,
+        }
+        run(app, "immersive", Args { on })
+    }
+
+    #[derive(serde::Serialize)]
+    struct PdfArgs<'a> {
+        path: &'a str,
+        page: u32,
+        width: u32,
+        out: &'a str,
+    }
+
+    /// The pages of a PDF with their sizes; fails for a PDF with a password.
+    pub fn pdf_info<R: Runtime>(app: &AppHandle<R>, path: &Path) -> anyhow::Result<PdfInfo> {
+        let path = &path.to_string_lossy();
+        let args = PdfArgs {
+            path,
+            page: 0,
+            width: 0,
+            out: "",
+        };
+        call(app, "pdfInfo", args)
+    }
+
+    /// Renders page `page` of a PDF `width` pixels wide into the PNG file `out`.
+    pub fn pdf_page<R: Runtime>(
+        app: &AppHandle<R>,
+        path: &Path,
+        page: u32,
+        width: u32,
+        out: &Path,
+    ) -> anyhow::Result<()> {
+        let (path, out) = (&path.to_string_lossy(), &out.to_string_lossy());
+        run(app, "pdfPage", PdfArgs { path, page, width, out })
+    }
+
     /// Reports the transfer activity to the service once a second, and only
     /// when it changed. The page cannot do it: Android pauses its timers
-    /// in the background.
+    /// in the background. An external player streaming from the app keeps
+    /// the service on too, or Android would freeze the app behind it.
     pub fn watch_transfers<R: Runtime>(app: AppHandle<R>, transfers: Arc<Transfers>) {
         std::thread::spawn(move || {
             let mut last = None;
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let activity = transfers.activity();
+                let mut activity = transfers.activity();
+                if let Some(state) = app.try_state::<crate::AppState>() {
+                    activity.player = state.streams.player_activity().unwrap_or_default();
+                }
                 if last.as_ref() == Some(&activity) {
                     continue;
                 }
@@ -161,6 +232,93 @@ mod imp {
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
+    /// Starts the program the system opens files like `title` with, giving
+    /// it the stream's URL: VLC, MPC-HC and the like play from it.
+    #[cfg(windows)]
+    pub fn play_url<R: Runtime>(
+        _app: &AppHandle<R>,
+        url: &str,
+        _mime: &str,
+        title: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let program = associated_program(title)
+            .context("No player is set for files of this type")?;
+        std::process::Command::new(&program)
+            .arg(url)
+            .spawn()
+            .with_context(|| format!("Cannot start '{}'", program.display()))?;
+        Ok(())
+    }
+
+    /// The program the system opens files like `name` with.
+    #[cfg(windows)]
+    fn associated_program(name: &str) -> Option<std::path::PathBuf> {
+        use windows_sys::Win32::UI::Shell::{AssocQueryStringW, ASSOCF_NONE, ASSOCSTR_EXECUTABLE};
+        let ext = Path::new(name).extension()?.to_str()?;
+        let ext: Vec<u16> = format!(".{ext}").encode_utf16().chain([0]).collect();
+        let verb: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        // SAFETY: the strings end with NUL and `len` is the size of `buf`.
+        let result = unsafe {
+            AssocQueryStringW(
+                ASSOCF_NONE,
+                ASSOCSTR_EXECUTABLE,
+                ext.as_ptr(),
+                verb.as_ptr(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        if result != 0 || len == 0 {
+            return None;
+        }
+        let path = std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize - 1]));
+        path.is_file().then_some(path)
+    }
+
+    #[cfg(all(test, windows))]
+    #[test]
+    fn finds_the_program_of_a_type() {
+        assert!(associated_program("notes.txt").is_some());
+        assert!(associated_program("no-extension").is_none());
+    }
+
+    /// Elsewhere the URL goes to whatever the system opens it with.
+    #[cfg(not(windows))]
+    pub fn play_url<R: Runtime>(
+        app: &AppHandle<R>,
+        url: &str,
+        _mime: &str,
+        _title: &str,
+    ) -> anyhow::Result<()> {
+        use tauri_plugin_opener::OpenerExt;
+        app.opener()
+            .open_url(url, None::<&str>)
+            .map_err(|err| anyhow::anyhow!("{err}"))
+    }
+
+    /// Desktop windows keep their frame.
+    pub fn immersive<R: Runtime>(_app: &AppHandle<R>, _on: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The desktop webview shows PDF files itself.
+    pub fn pdf_info<R: Runtime>(_app: &AppHandle<R>, _path: &Path) -> anyhow::Result<PdfInfo> {
+        anyhow::bail!("PDF pages are drawn by the app only on Android")
+    }
+
+    pub fn pdf_page<R: Runtime>(
+        _app: &AppHandle<R>,
+        _path: &Path,
+        _page: u32,
+        _width: u32,
+        _out: &Path,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("PDF pages are drawn by the app only on Android")
+    }
+
     pub fn watch_transfers<R: Runtime>(_app: AppHandle<R>, _transfers: Arc<Transfers>) {}
 
     pub fn schedule_backups<R: Runtime>(
@@ -177,9 +335,22 @@ mod imp {
 }
 
 pub use imp::{
-    open_file, plugin, request_storage_access, run_backup, schedule_backups, storage_access,
-    watch_transfers,
+    immersive, open_file, pdf_info, pdf_page, play_url, plugin, request_storage_access,
+    run_backup, schedule_backups, storage_access, watch_transfers,
 };
+
+/// The pages of a PDF, as `BelkaPlugin.pdfInfo` returns them.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PdfInfo {
+    pages: Vec<PdfPageSize>,
+}
+
+/// In points.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PdfPageSize {
+    width: f64,
+    height: f64,
+}
 
 /// Entry points of `BackupNative` in the Android project. `BackupWorker`
 /// loads the library itself, so they work while the page is not running.

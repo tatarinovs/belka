@@ -11,6 +11,7 @@ use crate::provider::MAILRU_WEBDAV_URL;
 use crate::utils::path::normalize_remote_dir;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 
@@ -168,6 +169,10 @@ impl StorageProvider for MailruProvider {
         progress: &Progress,
     ) -> Result<u64> {
         self.dav.download_to(remote_path, sink, progress).await
+    }
+
+    async fn read_range(&self, remote_path: &str, start: u64, len: u64) -> Result<Bytes> {
+        self.dav.read_range(remote_path, start, len).await
     }
 
     async fn delete(&self, remote_path: &str, is_dir: bool) -> Result<()> {
