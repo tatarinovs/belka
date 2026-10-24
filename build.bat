@@ -117,12 +117,11 @@ if errorlevel 1 goto ERR_BUILD_ARM64
 
 copy /Y "target\aarch64-unknown-linux-musl\release\belka" "dist\belka-linux-arm64" >nul
 echo [OK] Linux ARM64 binary ready: dist\belka-linux-arm64
-goto ALL_DONE
+rem goto ALL_DONE
 
 REM ---------------------------------------------------------------------
 REM Build Android APK (arm64), signed with the key from
-REM gui\src-tauri\gen\android\keystore.properties. Not part of "all":
-REM it needs Android Studio (JDK, SDK) and the NDK.
+REM gui\src-tauri\gen\android\keystore.properties.
 REM ---------------------------------------------------------------------
 :BUILD_ANDROID
 echo.
