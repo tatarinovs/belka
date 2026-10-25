@@ -411,7 +411,10 @@
   .stage {
     flex: 1;
     display: grid;
+    grid-template-rows: 100%;
+    grid-template-columns: 100%;
     place-items: center;
+    min-width: 0;
     min-height: 0;
     overflow: hidden;
     background: var(--bg);
@@ -421,6 +424,8 @@
   video {
     max-width: 100%;
     max-height: 100%;
+    min-width: 0;
+    min-height: 0;
     object-fit: contain;
   }
 
