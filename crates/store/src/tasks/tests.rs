@@ -236,6 +236,7 @@ fn a_failed_run_is_retried_soon() {
 }
 
 #[tokio::test]
+#[cfg(not(target_os = "android"))]
 async fn a_task_runs_once_at_a_time_across_processes() {
     let settings = tempfile::tempdir().unwrap();
     let photos = tempfile::tempdir().unwrap();

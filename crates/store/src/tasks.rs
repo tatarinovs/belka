@@ -176,9 +176,17 @@ static STORE_LOCK: Mutex<()> = Mutex::new(());
 /// Holds the task list for one read-modify-write, in this process and
 /// against others (the app and `belka task run` from a scheduler).
 struct StoreGuard {
+    #[cfg(not(target_os = "android"))]
     _file: std::fs::File,
     _local: std::sync::MutexGuard<'static, ()>,
 }
+
+/// Holds the inter-process run lock on desktop; on Android the app runs in a
+/// single process and has no CLI, so in-memory synchronization is enough.
+#[cfg(not(target_os = "android"))]
+type RunLock = std::fs::File;
+#[cfg(target_os = "android")]
+type RunLock = ();
 
 /// Tasks in `backups.json`, indexes in `backup-index/<id>.json`.
 pub struct TaskStore {
@@ -198,6 +206,7 @@ impl TaskStore {
         self.dir.join("backup-index").join(format!("{id}.json"))
     }
 
+    #[cfg(not(target_os = "android"))]
     /// Opens (creating it) a file used only for locking.
     fn lock_file(&self, path: &Path) -> Result<std::fs::File> {
         if let Some(dir) = path.parent() {
@@ -214,24 +223,48 @@ impl TaskStore {
 
     fn lock(&self) -> Result<StoreGuard> {
         let local = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let file = self.lock_file(&self.dir.join("backups.lock"))?;
-        file.lock().context("Failed to lock the backup tasks")?;
+        #[cfg(not(target_os = "android"))]
+        {
+            let file = self.lock_file(&self.dir.join("backups.lock"))?;
+            // Advisory file locking is not implemented on all filesystems (e.g.
+            // network shares). In that case in-process synchronization is enough.
+            match file.lock() {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {}
+                Err(err) => return Err(err).context("Failed to lock the backup tasks"),
+            }
+            Ok(StoreGuard {
+                _file: file,
+                _local: local,
+            })
+        }
+        #[cfg(target_os = "android")]
         Ok(StoreGuard {
-            _file: file,
             _local: local,
         })
     }
 
     /// Claims task `id` for a run in any process; `None` if a run holds it.
-    fn claim(&self, id: &str) -> Result<Option<std::fs::File>> {
+    #[cfg(not(target_os = "android"))]
+    fn claim(&self, id: &str) -> Result<Option<RunLock>> {
         let file = self.lock_file(&self.dir.join("backup-index").join(format!("{id}.lock")))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(file)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(err))
+                if err.kind() == std::io::ErrorKind::Unsupported =>
+            {
+                Ok(Some(file))
+            }
             Err(std::fs::TryLockError::Error(err)) => {
                 Err(err).context("Failed to lock the backup task")
             }
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn claim(&self, _id: &str) -> Result<Option<RunLock>> {
+        Ok(Some(()))
     }
 
     pub fn list(&self) -> Result<Vec<Task>> {
