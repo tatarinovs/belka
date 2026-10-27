@@ -281,7 +281,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "belka"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "belka-core"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "belka-gui"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "belka-store"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
