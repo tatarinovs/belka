@@ -6,7 +6,7 @@
 //! so they cannot be created, renamed or deleted here.
 
 use super::{
-    as_md5, plain_names_only, rename_target, AlreadyExists, RemoteFileInfo, ShareOptions,
+    as_md5, plain_names_only, rename_target, AlreadyExists, Quota, RemoteFileInfo, ShareOptions,
     StorageProvider,
 };
 use crate::client::{
@@ -174,6 +174,14 @@ struct File {
 struct Additional {
     size: Option<u64>,
     time: Option<Times>,
+    /// Only for shared folders: the volume they are on.
+    volume_status: Option<VolumeStatus>,
+}
+
+#[derive(Deserialize)]
+struct VolumeStatus {
+    freespace: Option<u64>,
+    totalspace: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -916,6 +924,47 @@ impl StorageProvider for SynologyProvider {
             }
         }
         Ok(plain_names_only(&dir, items))
+    }
+
+    /// The volume of the shared folder `remote_dir` is in. The root lists
+    /// shared folders, which may be on different volumes: no single answer.
+    async fn quota(&self, remote_dir: &str) -> Result<Option<Quota>> {
+        let dir = normalize_remote_dir(remote_dir);
+        let Some(share) = dir.split('/').find(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let share = format!("/{share}");
+        let mut offset = 0;
+        loop {
+            let page: Shares = self
+                .call(
+                    "Failed to read the space of shared folders",
+                    "SYNO.FileStation.List",
+                    2,
+                    "list_share",
+                    &[
+                        ("offset", offset.to_string()),
+                        ("limit", PAGE_SIZE.to_string()),
+                        ("additional", json_list(&["volume_status"])),
+                    ],
+                    API_TIMEOUT,
+                )
+                .await?;
+            let count = page.shares.len();
+            if let Some(found) = page.shares.into_iter().find(|s| s.path == share) {
+                return Ok(found.additional.volume_status.map(|v| {
+                    let used = v
+                        .totalspace
+                        .zip(v.freespace)
+                        .map(|(t, f)| t.saturating_sub(f));
+                    Quota::from_total_used(v.totalspace, used)
+                }));
+            }
+            offset += count;
+            if count == 0 || offset >= page.total {
+                return Ok(None);
+            }
+        }
     }
 
     fn check_share(&self, _options: &ShareOptions) -> Result<()> {

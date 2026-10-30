@@ -481,6 +481,11 @@ impl PartSink {
         file.flush()
             .await
             .with_context(|| format!("Failed to write '{}'", self.path.display()))?;
+        // On the disk before the rename: after a power cut the destination
+        // must hold the whole file, not an empty one.
+        file.sync_all()
+            .await
+            .with_context(|| format!("Failed to write '{}'", self.path.display()))?;
         drop(file);
         let mut delay = Duration::from_millis(100);
         let mut result = tokio::fs::rename(&self.path, dest).await;

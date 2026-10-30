@@ -17,6 +17,8 @@ export interface Entry {
   is_dir: boolean;
   size: number;
   modified: string | null;
+  /** Cloud files only, where the cloud keeps a content hash. */
+  md5?: string | null;
   /** Local virtual root only. */
   icon?: "drive" | "place";
   /** Stored encrypted: the row gets a lock, the text is its tooltip. */
@@ -26,6 +28,13 @@ export interface Entry {
 }
 
 export type RemoteEntry = Entry;
+
+/** Mirrors `Quota` from the core crate; `null` where the cloud does not tell. */
+export interface Quota {
+  total: number | null;
+  used: number | null;
+  free: number | null;
+}
 
 export interface Crumb {
   name: string;
@@ -59,7 +68,7 @@ export type TransferCounts = Record<TransferState, number>;
 /** Mirrors `TransferView` from the GUI backend. */
 export interface Transfer {
   id: number;
-  direction: "upload" | "download";
+  direction: "upload" | "download" | "copy";
   account_id: string;
   account_name: string;
   name: string;
@@ -68,6 +77,8 @@ export interface Transfer {
   remote_dir: string;
   state: TransferState;
   error?: string;
+  /** Done without sending anything: the other side had the same file. */
+  unchanged: boolean;
   done: number;
   total: number;
   /** Above 1 while network failures are retried. */
@@ -224,13 +235,26 @@ export const api = {
     invoke<{ added: number; skipped: number }>("import_accounts", { path, password }),
   listDir: (accountId: string, path: string) =>
     invoke<RemoteEntry[]>("list_dir", { accountId, path }),
+  /** The space of the cloud holding `path`; null where the cloud does not tell. */
+  cloudQuota: (accountId: string, path: string) =>
+    invoke<Quota | null>("cloud_quota", { accountId, path }),
 
-  /** Resolves to the number of queued files. */
+  /** Resolves to the number of queued files. Files the folder already has
+   * with the same content are not downloaded again. */
   download: (accountId: string, items: Entry[], localDir: string) =>
     invoke<number>("download", {
       accountId,
-      items: items.map(({ path, is_dir, size }) => ({ path, is_dir, size })),
+      items: items.map(({ path, is_dir, size, modified, md5 }) => ({ path, is_dir, size, modified, md5 })),
       localDir,
+    }),
+  /** Copies cloud items into a folder of the same or another cloud.
+   * Resolves to the number of queued files. */
+  cloudCopy: (accountId: string, items: Entry[], targetAccountId: string, targetDir: string) =>
+    invoke<number>("cloud_copy", {
+      accountId,
+      items: items.map(({ path, is_dir, size, modified, md5 }) => ({ path, is_dir, size, modified, md5 })),
+      targetAccountId,
+      targetDir,
     }),
   /** Resolves to the number of queued files. */
   upload: (accountId: string, localPaths: string[], remoteDir: string) =>

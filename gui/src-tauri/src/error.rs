@@ -25,11 +25,17 @@ impl Serialize for CmdError {
     }
 }
 
+/// Separates the explanation from the original message; the page splits
+/// the text here to show the original under "Подробнее".
+pub const DETAIL_MARK: &str = ". Подробности: ";
+
 /// Russian text for the messages users meet. A known message of the app is
 /// replaced; for network and HTTP failures an explanation goes first and the
-/// original stays as the detail.
+/// original stays as the detail, after [`DETAIL_MARK`]. Names in quotes are
+/// not looked at, so a file called `network.txt` does not make a failure
+/// look like a network one.
 pub fn translate(msg: &str) -> String {
-    let lower = msg.to_lowercase();
+    let lower = without_quoted(msg).to_lowercase();
     for (needle, text) in EXACT {
         if let Some(rest) = msg.strip_prefix(needle) {
             return format!("{text}{}", quotes(rest));
@@ -58,11 +64,11 @@ pub fn translate(msg: &str) -> String {
     } else if has_any(&lower, &["certificate", "tls handshake", "invalid peer"]) {
         Some("Ошибка защищённого соединения: сертификат сервера не принят")
     } else if lower.contains("http 401") {
-        Some("Неверный логин, пароль или токен: войдите заново")
+        Some("Облако не принимает логин, пароль или токен: откройте настройки аккаунта и войдите заново")
     } else if lower.contains("http 403") {
         Some("Доступ запрещён")
     } else if lower.contains("http 404") {
-        Some("Не найдено")
+        Some("Не найдено: возможно, файл уже переместили или удалили. Обновите список")
     } else if has_any(
         &lower,
         &[
@@ -93,9 +99,36 @@ pub fn translate(msg: &str) -> String {
         None
     };
     match reason {
-        Some(reason) => format!("{reason}. Подробности: {msg}"),
+        Some(reason) => format!("{reason}{DETAIL_MARK}{msg}"),
         None => msg.to_string(),
     }
+}
+
+/// `msg` without the names in quotes: `'…'` as the core quotes paths, and
+/// `«…»`. An apostrophe inside a word ("doesn't", "O'Brien") is not a quote.
+fn without_quoted(msg: &str) -> String {
+    let chars: Vec<char> = msg.chars().collect();
+    let mut out = String::with_capacity(msg.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let opens = c == '«' || (c == '\'' && (i == 0 || !chars[i - 1].is_alphanumeric()));
+        if opens {
+            let close = if c == '«' { '»' } else { '\'' };
+            let end = (i + 1..chars.len()).find(|&j| {
+                chars[j] == close
+                    && (close == '»' || chars.get(j + 1).is_none_or(|next| !next.is_alphanumeric()))
+            });
+            if let Some(end) = end {
+                out.push_str("''");
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Messages of the app that start with a fixed text; the rest (usually a
@@ -126,6 +159,10 @@ const EXACT: &[(&str, &str)] = &[
         "Облачный аккаунт задачи удалён",
     ),
     ("Nothing to upload", "Нечего загружать"),
+    (
+        "A folder cannot be copied into itself",
+        "Папку нельзя скопировать в саму себя",
+    ),
     (
         "Files of this type run as programs when opened",
         "Файлы этого типа при открытии запускаются как программы; чтобы изучить такой файл, скачайте его",
@@ -202,6 +239,9 @@ fn known(msg: &str) -> Option<String> {
             quotes(path)
         ));
     }
+    if let Some(name) = between(msg, "", " is in this folder already") {
+        return Some(format!("{} уже лежит в этой папке", quotes(name)));
+    }
     if let Some(path) = between(msg, "", " is not a folder") {
         return Some(format!("{} — не папка", quotes(path)));
     }
@@ -265,7 +305,24 @@ mod tests {
         let msg = "Cannot connect to WebDAV: webdav: PROPFIND: request failed: error sending request: tcp connect error";
         assert!(translate(msg).starts_with("Нет связи с сервером"));
         assert!(translate(msg).ends_with(msg));
-        assert!(translate("Upload failed: HTTP 401 Unauthorized").starts_with("Неверный логин"));
+        assert!(
+            translate("Upload failed: HTTP 401 Unauthorized").starts_with("Облако не принимает")
+        );
         assert_eq!(translate("something new"), "something new");
+    }
+
+    #[test]
+    fn quoted_names_are_not_reasons() {
+        let msg = "'D:\\Network\\token timed out.txt' changed while it was being uploaded";
+        assert_eq!(translate(msg), msg);
+        assert_eq!(
+            translate("Failed to upload 'O'Brien quota.txt': HTTP 507 Insufficient Storage"),
+            "В облаке не хватает места. Подробности: \
+             Failed to upload 'O'Brien quota.txt': HTTP 507 Insufficient Storage"
+        );
+        assert_eq!(
+            without_quoted("doesn't exist: «a 'b'» and 'c'"),
+            "doesn't exist: '' and ''"
+        );
     }
 }

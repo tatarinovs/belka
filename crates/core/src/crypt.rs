@@ -540,7 +540,9 @@ fn eme(aes: &Aes256, tweak: &[u8; 16], data: &mut [u8], encrypt: bool) {
     }
 
     let mut blocks: Vec<[u8; 16]> = data
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .zip(&table)
         .map(|(p, l)| {
             let mut pp = xor(l, p);
@@ -566,7 +568,13 @@ fn eme(aes: &Aes256, tweak: &[u8; 16], data: &mut [u8], encrypt: bool) {
     }
     blocks[0] = first;
 
-    for ((out, block), l) in data.chunks_exact_mut(16).zip(&mut blocks).zip(&table) {
+    for ((out, block), l) in data
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(&mut blocks)
+        .zip(&table)
+    {
         transform(block);
         out.copy_from_slice(&xor(block, l));
     }

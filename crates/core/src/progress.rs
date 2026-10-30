@@ -43,12 +43,16 @@ impl Progress {
 
     /// Takes back bytes counted for data that is sent again.
     pub fn sub(&self, bytes: u64) {
-        let _ = self
-            .inner
-            .done
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |done| {
-                Some(done.saturating_sub(bytes))
-            });
+        let done = &self.inner.done;
+        let mut current = done.load(Ordering::Relaxed);
+        while let Err(actual) = done.compare_exchange_weak(
+            current,
+            current.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = actual;
+        }
     }
 
     pub fn set_total(&self, bytes: u64) {

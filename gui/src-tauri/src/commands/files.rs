@@ -2,14 +2,18 @@
 //! queuing uploads and downloads, and managing the queue.
 
 use crate::error::CmdResult;
-use crate::transfers::{Direction, Spec, TransferList};
+use crate::transfers::{CopyFrom, Direction, Spec, TransferList};
 use crate::{local, native, AppState};
 use anyhow::{bail, Context, Result};
-use belka_core::sync::{self, Filter};
-use belka_core::utils::path::{join_remote, normalize_remote_dir, sanitize_file_name, unique_path};
-use belka_core::StorageProvider;
+use belka_core::sync::{self, Filter, RemoteListing};
+use belka_core::utils::path::{
+    join_remote, normalize_remote_dir, sanitize_file_name, split_remote, unique_path,
+};
+use belka_core::{RemoteFileInfo, StorageProvider};
+use chrono::{DateTime, Utc};
+use futures_util::stream::{self, StreamExt};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tauri::State;
 
@@ -37,11 +41,30 @@ pub async fn local_delete(paths: Vec<String>) -> CmdResult<()> {
     Ok(deleted?)
 }
 
+/// A cloud item as the page has it from the listing.
 #[derive(Deserialize)]
 pub struct RemoteItem {
     path: String,
     is_dir: bool,
     size: u64,
+    #[serde(default)]
+    md5: Option<String>,
+    #[serde(default)]
+    modified: Option<DateTime<Utc>>,
+}
+
+impl RemoteItem {
+    fn into_info(self) -> RemoteFileInfo {
+        let path = normalize_remote_dir(&self.path);
+        RemoteFileInfo {
+            name: split_remote(&path).1,
+            path,
+            is_dir: self.is_dir,
+            size: self.size,
+            md5: self.md5,
+            modified: self.modified,
+        }
+    }
 }
 
 /// Queues downloads of files and whole folders into `local_dir`.
@@ -56,50 +79,69 @@ pub async fn download(
     let provider = state.provider(&account_id)?;
     let account_name = state.account(&account_id)?.name;
     let files = expand_download(&*provider, items, Path::new(&local_dir)).await?;
-    for (remote, local, size) in &files {
+    let count = files.len();
+    for (remote, local) in files {
         let spec = Spec {
             direction: Direction::Download,
             account_id: account_id.clone(),
             account_name: account_name.clone(),
-            local: local.clone(),
-            remote: remote.clone(),
-            size: *size,
+            local,
+            remote: remote.path.clone(),
+            size: remote.size,
+            known: Some(remote),
+            from: None,
         };
         state.transfers.enqueue(spec, provider.clone());
     }
-    Ok(files.len())
+    Ok(count)
 }
 
 /// Lists every file under the selected items, mapping cloud names to safe
 /// local names. Folders are created locally right away, so empty ones survive.
+/// Folders of one level are listed in parallel; the names are assigned in
+/// listing order all the same, so `a (2).txt` is always the same file.
 async fn expand_download(
     provider: &dyn StorageProvider,
     items: Vec<RemoteItem>,
     local_dir: &Path,
-) -> Result<Vec<(String, PathBuf, u64)>> {
+) -> Result<Vec<(RemoteFileInfo, PathBuf)>> {
     let mut files = Vec::new();
     let mut taken = HashSet::new();
-    let mut dirs = VecDeque::new();
+    let mut level = Vec::new();
     for item in items {
-        let name = item.path.rsplit('/').next().unwrap_or_default();
-        let local = unique_path(local_dir.join(sanitize_file_name(name)), &mut taken);
+        let item = item.into_info();
+        let local = unique_path(local_dir.join(sanitize_file_name(&item.name)), &mut taken);
         if item.is_dir {
-            dirs.push_back((normalize_remote_dir(&item.path), local));
+            level.push((item.path, local));
         } else {
-            files.push((normalize_remote_dir(&item.path), local, item.size));
+            files.push((item, local));
         }
     }
-    while let Some((remote, local)) = dirs.pop_front() {
-        std::fs::create_dir_all(&local)
-            .with_context(|| format!("Failed to create '{}'", local.display()))?;
-        for entry in provider.list_dir(&remote).await? {
-            let path = unique_path(local.join(sanitize_file_name(&entry.name)), &mut taken);
-            if entry.is_dir {
-                dirs.push_back((entry.path, path));
-            } else {
-                files.push((entry.path, path, entry.size));
+    while !level.is_empty() {
+        for (_, local) in &level {
+            tokio::fs::create_dir_all(local)
+                .await
+                .with_context(|| format!("Failed to create '{}'", local.display()))?;
+        }
+        // Owned paths: a stream over references trips the `Send` checks.
+        let remotes: Vec<String> = level.iter().map(|(remote, _)| remote.clone()).collect();
+        let listings: Vec<Result<Vec<RemoteFileInfo>>> = stream::iter(remotes)
+            .map(|remote| async move { provider.list_dir(&remote).await })
+            .buffered(sync::DEFAULT_PARALLEL)
+            .collect()
+            .await;
+        let mut next = Vec::new();
+        for ((_, local), listing) in level.iter().zip(listings) {
+            for entry in listing? {
+                let path = unique_path(local.join(sanitize_file_name(&entry.name)), &mut taken);
+                if entry.is_dir {
+                    next.push((entry.path, path));
+                } else {
+                    files.push((entry, path));
+                }
             }
         }
+        level = next;
     }
     Ok(files)
 }
@@ -117,8 +159,9 @@ pub async fn upload(
     let account_name = state.account(&account_id)?.name;
     let remote_dir = normalize_remote_dir(&remote_dir);
     let paths: Vec<PathBuf> = local_paths.into_iter().map(PathBuf::from).collect();
+    let target = remote_dir.clone();
     let (files, empty_dirs) =
-        tauri::async_runtime::spawn_blocking(move || expand_upload(&paths, &remote_dir))
+        tauri::async_runtime::spawn_blocking(move || expand_upload(&paths, &target))
             .await
             .context("Failed to scan local files")??;
 
@@ -128,18 +171,80 @@ pub async fn upload(
             .ensure_dir(&account_id, dir, &*provider)
             .await?;
     }
-    for (local, remote) in &files {
+    let targets: Vec<&str> = files.iter().map(|(_, remote)| remote.as_str()).collect();
+    let mut existing = existing_targets(&*provider, &remote_dir, &targets).await;
+    let count = files.len();
+    for (local, remote) in files {
         let spec = Spec {
             direction: Direction::Upload,
             account_id: account_id.clone(),
             account_name: account_name.clone(),
-            local: local.clone(),
-            remote: remote.clone(),
+            local,
+            known: existing.remove(&remote),
+            remote,
             size: 0,
+            from: None,
         };
         state.transfers.enqueue(spec, provider.clone());
     }
-    Ok(files.len())
+    Ok(count)
+}
+
+/// The cloud files already at the targets of `files`, so that identical
+/// ones are not uploaded again. Only the folders under names `remote_dir`
+/// already has are listed: anything under a new name is new. Nothing is
+/// known if `remote_dir` cannot be listed.
+async fn existing_targets(
+    provider: &dyn StorageProvider,
+    remote_dir: &str,
+    targets: &[&str],
+) -> HashMap<String, RemoteFileInfo> {
+    let top = match provider.list_dir(remote_dir).await {
+        Ok(top) => top,
+        Err(err) => {
+            tracing::debug!("Cannot list '{remote_dir}' ({err:#}); uploading everything");
+            return HashMap::new();
+        }
+    };
+    let taken: HashSet<String> = top.iter().map(|item| item.path.clone()).collect();
+    let mut found: HashMap<String, RemoteFileInfo> = top
+        .into_iter()
+        .filter(|item| !item.is_dir)
+        .map(|item| (item.path.clone(), item))
+        .collect();
+    // `a/b/c.txt` for `/Backup/a/b/c.txt` under `/Backup`.
+    let relative = |remote: &str| {
+        remote
+            .strip_prefix(remote_dir.trim_end_matches('/'))
+            .unwrap_or(remote)
+            .trim_start_matches('/')
+            .to_string()
+    };
+    let nested: Vec<String> = targets
+        .iter()
+        .map(|remote| relative(remote))
+        .filter(|rel| {
+            rel.split_once('/')
+                .is_some_and(|(top, _)| taken.contains(&join_remote(remote_dir, top)))
+        })
+        .collect();
+    if nested.is_empty() {
+        return found;
+    }
+    let listing = RemoteListing::new(
+        provider,
+        remote_dir,
+        nested.iter().map(String::as_str),
+        sync::DEFAULT_PARALLEL,
+    )
+    .await;
+    for rel in &nested {
+        let path = join_remote(remote_dir, rel);
+        if let Some(item) = listing.listed(&path).filter(|item| !item.is_dir) {
+            found.insert(path, item.clone());
+        }
+    }
+    found
 }
 
 /// Local files with their remote paths, plus remote folders that contain no files.
@@ -189,6 +294,138 @@ fn expand_upload(paths: &[PathBuf], remote_dir: &str) -> Result<UploadPlan> {
         bail!("Nothing to upload");
     }
     Ok((files, empty_dirs))
+}
+
+/// Queues copies of cloud files and whole folders of account `account_id`
+/// into folder `target_dir` of account `target_account_id`, which may be
+/// the same one. Returns the number of queued files.
+#[tauri::command]
+pub async fn cloud_copy(
+    state: State<'_, AppState>,
+    account_id: String,
+    items: Vec<RemoteItem>,
+    target_account_id: String,
+    target_dir: String,
+) -> CmdResult<usize> {
+    let source = state.provider(&account_id)?;
+    let target = state.provider(&target_account_id)?;
+    let source_name = state.account(&account_id)?.name;
+    let target_name = state.account(&target_account_id)?.name;
+    let target_dir = normalize_remote_dir(&target_dir);
+    let items: Vec<RemoteFileInfo> = items.into_iter().map(RemoteItem::into_info).collect();
+    if account_id == target_account_id {
+        check_copy_target(&items, &target_dir)?;
+    }
+
+    let (files, empty_dirs) = expand_copy(&*source, items, &target_dir).await?;
+    for dir in &empty_dirs {
+        state
+            .transfers
+            .ensure_dir(&target_account_id, dir, &*target)
+            .await?;
+    }
+    let targets: Vec<&str> = files.iter().map(|(_, to)| to.as_str()).collect();
+    let mut existing = existing_targets(&*target, &target_dir, &targets).await;
+    let count = files.len();
+    for (file, to) in files {
+        let spec = Spec {
+            direction: Direction::Copy,
+            account_id: target_account_id.clone(),
+            account_name: target_name.clone(),
+            local: PathBuf::new(),
+            known: existing.remove(&to),
+            remote: to,
+            size: file.size,
+            from: Some(CopyFrom {
+                account_id: account_id.clone(),
+                account_name: source_name.clone(),
+                file,
+            }),
+        };
+        state
+            .transfers
+            .enqueue_copy(spec, target.clone(), source.clone());
+    }
+    Ok(count)
+}
+
+/// Inside one cloud: nothing goes into the folder it is in already (it
+/// would replace itself), and no folder into itself.
+fn check_copy_target(items: &[RemoteFileInfo], target_dir: &str) -> Result<()> {
+    for item in items {
+        let prefix = format!("{}/", item.path.trim_end_matches('/'));
+        if item.is_dir && (target_dir == item.path || target_dir.starts_with(&prefix)) {
+            bail!("A folder cannot be copied into itself");
+        }
+        if split_remote(&item.path).0 == target_dir {
+            bail!("'{}' is in this folder already", item.name);
+        }
+    }
+    Ok(())
+}
+
+/// Lists every file under the selected cloud items with the path it gets
+/// under `target_dir`, plus the target folders that stay empty. Names stay
+/// as they are; equal ones (Google Drive allows them) get numbers.
+async fn expand_copy(
+    provider: &dyn StorageProvider,
+    items: Vec<RemoteFileInfo>,
+    target_dir: &str,
+) -> Result<(Vec<(RemoteFileInfo, String)>, Vec<String>)> {
+    let mut files = Vec::new();
+    let mut empty = Vec::new();
+    let mut taken = HashSet::new();
+    let mut level = Vec::new();
+    for item in items {
+        let to = unique_remote(join_remote(target_dir, &item.name), &mut taken);
+        if item.is_dir {
+            level.push((item.path, to));
+        } else {
+            files.push((item, to));
+        }
+    }
+    while !level.is_empty() {
+        // Owned paths: a stream over references trips the `Send` checks.
+        let remotes: Vec<String> = level.iter().map(|(remote, _)| remote.clone()).collect();
+        let listings: Vec<Result<Vec<RemoteFileInfo>>> = stream::iter(remotes)
+            .map(|remote| async move { provider.list_dir(&remote).await })
+            .buffered(sync::DEFAULT_PARALLEL)
+            .collect()
+            .await;
+        let mut next = Vec::new();
+        for ((_, to_dir), listing) in level.iter().zip(listings) {
+            let listing = listing?;
+            if listing.is_empty() {
+                empty.push(to_dir.clone());
+            }
+            for entry in listing {
+                let to = unique_remote(join_remote(to_dir, &entry.name), &mut taken);
+                if entry.is_dir {
+                    next.push((entry.path, to));
+                } else {
+                    files.push((entry, to));
+                }
+            }
+        }
+        level = next;
+    }
+    Ok((files, empty))
+}
+
+/// `path`, or `name (2).ext` and so on if an earlier call took it.
+fn unique_remote(path: String, taken: &mut HashSet<String>) -> String {
+    if taken.insert(path.clone()) {
+        return path;
+    }
+    let (dir, name) = split_remote(&path);
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name.as_str(), ""),
+    };
+    (2..)
+        .map(|n| join_remote(&dir, &format!("{stem} ({n}){ext}")))
+        .find(|candidate| taken.insert(candidate.clone()))
+        .expect("an unused name exists")
 }
 
 /// Which of `names` already exist in the local folder `dir`.
@@ -263,7 +500,12 @@ pub fn retry_transfer(state: State<'_, AppState>, id: u64) -> CmdResult<()> {
         return Ok(());
     };
     let provider = state.provider(&spec.account_id)?;
-    state.transfers.retry(id, provider);
+    let source = spec
+        .from
+        .as_ref()
+        .map(|from| state.provider(&from.account_id))
+        .transpose()?;
+    state.transfers.retry(id, provider, source);
     Ok(())
 }
 
@@ -291,5 +533,31 @@ mod tests {
         let remotes: Vec<&str> = files.iter().map(|(_, r)| r.as_str()).collect();
         assert_eq!(remotes, ["/Backup/note.txt", "/Backup/photos/2024/a.jpg"]);
         assert_eq!(empty, ["/Backup/photos/empty"]);
+    }
+
+    #[test]
+    fn copies_stay_out_of_themselves() {
+        let item = |path: &str, is_dir: bool| RemoteFileInfo {
+            name: split_remote(path).1,
+            path: path.into(),
+            is_dir,
+            size: 0,
+            md5: None,
+            modified: None,
+        };
+        let photos = [item("/Photos", true)];
+        assert!(check_copy_target(&photos, "/Photos").is_err());
+        assert!(check_copy_target(&photos, "/Photos/2024").is_err());
+        assert!(
+            check_copy_target(&photos, "/").is_err(),
+            "already in the root"
+        );
+        assert!(check_copy_target(&photos, "/Photos 2").is_ok());
+        assert!(check_copy_target(&[item("/a/x.txt", false)], "/a").is_err());
+        assert!(check_copy_target(&[item("/a/x.txt", false)], "/b").is_ok());
+
+        let mut taken = HashSet::new();
+        assert_eq!(unique_remote("/d/a.txt".into(), &mut taken), "/d/a.txt");
+        assert_eq!(unique_remote("/d/a.txt".into(), &mut taken), "/d/a (2).txt");
     }
 }

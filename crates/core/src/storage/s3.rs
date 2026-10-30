@@ -42,6 +42,8 @@ const PARALLEL_PARTS: usize = 3;
 const PARALLEL_COPIES: usize = 8;
 /// The most keys DeleteObjects accepts in one request.
 const DELETE_BATCH: usize = 1000;
+/// The largest object CopyObject takes; larger ones need a copy in parts.
+const MAX_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Server-side copies of large objects can take a while.
 const COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -749,6 +751,15 @@ impl StorageProvider for S3Provider {
     }
 
     /// S3 has no rename: objects are copied to the new key, then deleted.
+    async fn server_copy(&self, file: &RemoteFileInfo, to: &str) -> Result<bool> {
+        let (from, to) = (Self::key_for(&file.path), Self::key_for(to));
+        if file.size > MAX_COPY_SIZE || from.is_empty() || to.is_empty() {
+            return Ok(false);
+        }
+        self.copy_object(&from, &to).await?;
+        Ok(true)
+    }
+
     async fn rename(&self, remote_path: &str, new_name: &str, is_dir: bool) -> Result<()> {
         let from = Self::key_for(remote_path);
         if from.is_empty() {

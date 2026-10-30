@@ -2,7 +2,7 @@
 //! own API, which accepts the same app password.
 
 use super::webdav::WebDavProvider;
-use super::{plain_links_only, RemoteFileInfo, ShareOptions, StorageProvider, TokenCache};
+use super::{plain_links_only, Quota, RemoteFileInfo, ShareOptions, StorageProvider, TokenCache};
 use crate::client::{
     build_http_client, ensure_success, json_response, send, Sink, Source, API_TIMEOUT,
 };
@@ -12,7 +12,7 @@ use crate::utils::path::normalize_remote_dir;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 
 const TOKEN_URL: &str = "https://o2.mail.ru/token";
@@ -94,38 +94,51 @@ impl MailruProvider {
         Ok((access_token, token.expires_in))
     }
 
-    /// Calls a method of the cloud API with form parameters.
-    async fn call(
-        &self,
-        op: &str,
-        method: &str,
-        form: &[(&str, &str)],
-    ) -> Result<reqwest::Response> {
+    /// Sends an API request with the access token, with retries. The API
+    /// rejects a token that is no longer valid with 401 or 403: it is
+    /// dropped and the request is sent once more with a new one.
+    async fn send_authed<F>(&self, op: &str, mut build: F) -> Result<Response>
+    where
+        F: FnMut(&str) -> RequestBuilder,
+    {
         let token = self.access_token().await?;
+        let resp = send(op, || Ok(build(&token))).await?;
+        if !matches!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Ok(resp);
+        }
+        tracing::debug!("{op}: the access token was rejected; signing in again");
+        self.token.invalidate(&token).await;
+        let token = self.access_token().await?;
+        send(op, || Ok(build(&token))).await
+    }
+
+    /// Calls a method of the cloud API with form parameters.
+    async fn call(&self, op: &str, method: &str, form: &[(&str, &str)]) -> Result<Response> {
         let url = format!("{API}{method}");
-        send(op, || {
-            Ok(self
-                .client
+        self.send_authed(op, |token| {
+            self.client
                 .post(&url)
-                .query(&[("access_token", token.as_str())])
+                .query(&[("access_token", token)])
                 .form(form)
-                .timeout(API_TIMEOUT))
+                .timeout(API_TIMEOUT)
         })
         .await
     }
 
     /// The public link id of the item, if it is shared.
     async fn weblink(&self, path: &str) -> Result<Option<String>> {
-        let token = self.access_token().await?;
         let url = format!("{API}/file");
-        let resp = send("mailru: get info", || {
-            Ok(self
-                .client
-                .get(&url)
-                .query(&[("access_token", token.as_str()), ("home", path)])
-                .timeout(API_TIMEOUT))
-        })
-        .await?;
+        let resp = self
+            .send_authed("mailru: get info", |token| {
+                self.client
+                    .get(&url)
+                    .query(&[("access_token", token), ("home", path)])
+                    .timeout(API_TIMEOUT)
+            })
+            .await?;
         if resp.status() == StatusCode::NOT_FOUND {
             bail!("'{path}' does not exist");
         }
@@ -151,6 +164,42 @@ impl StorageProvider for MailruProvider {
 
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {
         self.dav.get_file_info(remote_path).await
+    }
+
+    /// WebDAV where it reports the space, else the cloud API, which needs
+    /// an app password with full access; without one the space is unknown.
+    async fn quota(&self, remote_dir: &str) -> Result<Option<Quota>> {
+        if let Some(quota) = self.dav.dav_quota(remote_dir).await? {
+            return Ok(Some(quota));
+        }
+        #[derive(Deserialize)]
+        struct Space {
+            bytes_total: Option<u64>,
+            bytes_used: Option<u64>,
+        }
+        let url = format!("{API}/user/space");
+        let space = async {
+            let resp = self
+                .send_authed("mailru: space", |token| {
+                    self.client
+                        .get(&url)
+                        .query(&[("access_token", token)])
+                        .timeout(API_TIMEOUT)
+                })
+                .await?;
+            json_response::<Envelope<Space>>(resp, "Failed to read Mail.ru Cloud space").await
+        }
+        .await;
+        match space {
+            Ok(space) => Ok(Some(Quota::from_total_used(
+                space.body.bytes_total,
+                space.body.bytes_used,
+            ))),
+            Err(err) => {
+                tracing::debug!("Mail.ru Cloud space is unknown: {err:#}");
+                Ok(None)
+            }
+        }
     }
 
     async fn upload(

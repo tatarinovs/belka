@@ -129,7 +129,7 @@ pub fn run() {
             // On Android the file is in the app's private folder; desktops
             // use the keyring, which the CLI shares.
             let secrets = Secrets::system_or(app.path().app_data_dir()?.join("secrets.json"));
-            let transfers = Transfers::new();
+            let transfers = Transfers::new(app.path().app_cache_dir()?.join("copy"));
             native::watch_transfers(app.handle().clone(), transfers.clone());
             app.manage(AppState {
                 tasks: TaskStore::new(&config_dir),
@@ -171,6 +171,7 @@ pub fn run() {
             commands::accounts::export_accounts,
             commands::accounts::import_accounts,
             commands::cloud::list_dir,
+            commands::cloud::cloud_quota,
             commands::cloud::cloud_mkdir,
             commands::cloud::cloud_rename,
             commands::cloud::cloud_delete,
@@ -186,6 +187,7 @@ pub fn run() {
             commands::cloud::pdf_page,
             commands::files::download,
             commands::files::upload,
+            commands::files::cloud_copy,
             commands::files::local_conflicts,
             commands::files::list_local,
             commands::files::local_open,

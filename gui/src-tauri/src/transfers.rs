@@ -1,13 +1,17 @@
-//! The transfer queue: uploads and downloads run as background tasks, at most
+//! The transfer queue: uploads, downloads and copies between clouds run as
+//! background tasks, at most
 //! [`MAX_PARALLEL`] at a time. The frontend polls [`Transfers::list`] and reads
 //! progress counters directly, so running transfers never block on the UI.
 //! A queue can hold thousands of files, so the page gets the running ones,
 //! the head of the queue and the latest finished ones, plus counts of all.
 
+use crate::error::translate;
 use anyhow::{Context, Result};
 use belka_core::client::MAX_ATTEMPTS;
+use belka_core::storage::copy::copy_file;
+use belka_core::sync::{self, LocalFile};
 use belka_core::utils::path::split_remote;
-use belka_core::{Progress, StorageProvider};
+use belka_core::{Progress, RemoteFileInfo, StorageProvider};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -27,6 +31,8 @@ const SHOWN_FINISHED: usize = 100;
 pub enum Direction {
     Upload,
     Download,
+    /// From one cloud folder to another, in the same cloud or another one.
+    Copy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -55,6 +61,21 @@ pub struct Spec {
     pub remote: String,
     /// Known in advance for downloads (from the listing); 0 if unknown.
     pub size: u64,
+    /// The cloud file: for a download the one to fetch, for an upload or a
+    /// copy the one already at the target. A file the other side already
+    /// holds with the same data is not sent again.
+    pub known: Option<RemoteFileInfo>,
+    /// For a copy, where it comes from; `account_id` and `remote` are where
+    /// it goes, `local` is not used.
+    pub from: Option<CopyFrom>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CopyFrom {
+    pub account_id: String,
+    pub account_name: String,
+    /// The file to copy, as listed.
+    pub file: RemoteFileInfo,
 }
 
 struct Job {
@@ -65,21 +86,43 @@ struct Job {
     handle: Option<JoinHandle<()>>,
     /// Order in which transfers finished; 0 while active.
     finished: u64,
+    /// Done without sending anything: the other side had the same file.
+    unchanged: bool,
 }
 
 impl Job {
     fn view(&self) -> TransferView {
         let (remote_dir, name) = split_remote(&self.spec.remote);
+        // Kept as the core wrote it, for the log; the page gets Russian.
+        let status = match &self.status {
+            Status::Failed { error } => Status::Failed {
+                error: translate(error),
+            },
+            status => status.clone(),
+        };
+        // A copy names both clouds, and the source where a download has
+        // the local file.
+        let (account_name, local_path) = match &self.spec.from {
+            Some(from) => (
+                format!("{} → {}", from.account_name, self.spec.account_name),
+                format!("{}: {}", from.account_name, from.file.path),
+            ),
+            None => (
+                self.spec.account_name.clone(),
+                self.spec.local.display().to_string(),
+            ),
+        };
         TransferView {
             id: self.id,
             direction: self.spec.direction,
             account_id: self.spec.account_id.clone(),
-            account_name: self.spec.account_name.clone(),
+            account_name,
             name,
-            local_path: self.spec.local.display().to_string(),
+            local_path,
             remote_path: self.spec.remote.clone(),
             remote_dir,
-            status: self.status.clone(),
+            status,
+            unchanged: self.unchanged,
             done: self.progress.done(),
             total: self.progress.total(),
             attempt: self.progress.attempt(),
@@ -100,6 +143,7 @@ pub struct TransferView {
     remote_dir: String,
     #[serde(flatten)]
     status: Status,
+    unchanged: bool,
     done: u64,
     total: u64,
     /// Above 1 while network failures are retried.
@@ -147,20 +191,48 @@ pub struct Transfers {
     /// is serialized so parallel uploads never create the same folder twice
     /// (Google Drive would happily make duplicates).
     ensured: tokio::sync::Mutex<HashSet<(String, String)>>,
+    /// Where copies from a cloud that cannot read parts of files wait
+    /// between download and upload. Emptied on start.
+    temp_dir: PathBuf,
+    temp_seq: AtomicU64,
 }
 
 impl Transfers {
-    pub fn new() -> Arc<Self> {
+    pub fn new(temp_dir: PathBuf) -> Arc<Self> {
+        // Left by copies that were running when the app closed.
+        let _ = std::fs::remove_dir_all(&temp_dir);
         Arc::new(Self {
             jobs: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             finished_seq: AtomicU64::new(1),
             slots: Arc::new(Semaphore::new(MAX_PARALLEL)),
             ensured: tokio::sync::Mutex::new(HashSet::new()),
+            temp_dir,
+            temp_seq: AtomicU64::new(1),
         })
     }
 
     pub fn enqueue(self: &Arc<Self>, spec: Spec, provider: Arc<dyn StorageProvider>) -> u64 {
+        self.enqueue_with(spec, provider, None)
+    }
+
+    /// Queues a copy: `target` is the provider of `spec.account_id`,
+    /// `source` the one of `spec.from`.
+    pub fn enqueue_copy(
+        self: &Arc<Self>,
+        spec: Spec,
+        target: Arc<dyn StorageProvider>,
+        source: Arc<dyn StorageProvider>,
+    ) -> u64 {
+        self.enqueue_with(spec, target, Some(source))
+    }
+
+    fn enqueue_with(
+        self: &Arc<Self>,
+        spec: Spec,
+        provider: Arc<dyn StorageProvider>,
+        source: Option<Arc<dyn StorageProvider>>,
+    ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let progress = Progress::new();
         progress.set_total(spec.size);
@@ -171,8 +243,9 @@ impl Transfers {
             progress: progress.clone(),
             handle: None,
             finished: 0,
+            unchanged: false,
         });
-        self.start(id, spec, progress, provider);
+        self.start(id, spec, progress, provider, source);
         id
     }
 
@@ -182,23 +255,26 @@ impl Transfers {
         spec: Spec,
         progress: Progress,
         provider: Arc<dyn StorageProvider>,
+        source: Option<Arc<dyn StorageProvider>>,
     ) {
         let this = self.clone();
         let handle = spawn(async move {
             let _slot = this.slots.clone().acquire_owned().await;
-            if !this.update(id, Status::Running) {
+            if !this.update(id, Status::Running, false) {
                 return;
             }
-            let status = match this.execute(&spec, &*provider, &progress).await {
-                Ok(()) => Status::Done,
+            let result = this
+                .execute(&spec, &*provider, source.as_ref(), &progress)
+                .await;
+            let (status, unchanged) = match result {
+                Ok(sent) => (Status::Done, !sent),
                 Err(err) => {
                     tracing::warn!("Transfer of '{}' failed: {err:#}", spec.remote);
-                    Status::Failed {
-                        error: format!("{err:#}"),
-                    }
+                    let error = format!("{err:#}");
+                    (Status::Failed { error }, false)
                 }
             };
-            this.update(id, status);
+            this.update(id, status, unchanged);
         });
         if let Some(job) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
             job.handle = Some(handle);
@@ -207,7 +283,7 @@ impl Transfers {
 
     /// Moves an active job to `status`; returns false if it is no longer active
     /// (cancelled meanwhile), so a late result never overrides a cancellation.
-    fn update(&self, id: u64, status: Status) -> bool {
+    fn update(&self, id: u64, status: Status, unchanged: bool) -> bool {
         let mut jobs = self.jobs.lock().unwrap();
         match jobs.iter_mut().find(|j| j.id == id) {
             Some(job) if job.status.is_active() => {
@@ -215,18 +291,22 @@ impl Transfers {
                     job.finished = self.finished_seq.fetch_add(1, Ordering::Relaxed);
                 }
                 job.status = status;
+                job.unchanged = unchanged;
                 true
             }
             _ => false,
         }
     }
 
+    /// Runs a transfer. Returns false when nothing had to be sent: the
+    /// other side already had the same file.
     async fn execute(
         &self,
         spec: &Spec,
         provider: &dyn StorageProvider,
+        source: Option<&Arc<dyn StorageProvider>>,
         progress: &Progress,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         tracing::debug!(
             "{:?} '{}' <-> '{}' ({})",
             spec.direction,
@@ -234,6 +314,14 @@ impl Transfers {
             spec.local.display(),
             spec.account_name
         );
+        if self.is_unchanged(spec, provider).await {
+            tracing::info!("  [=] Unchanged: {}", spec.remote);
+            // Same size on both sides.
+            let size = spec.known.as_ref().map_or(0, |k| k.size);
+            progress.set_total(size);
+            progress.set_done(size);
+            return Ok(false);
+        }
         match spec.direction {
             Direction::Download => {
                 if let Some(dir) = spec.local.parent() {
@@ -252,8 +340,65 @@ impl Transfers {
                     .upload_file(&spec.local, &spec.remote, progress)
                     .await?;
             }
+            Direction::Copy => {
+                let (Some(from), Some(source)) = (&spec.from, source) else {
+                    anyhow::bail!("The source of the copy is unknown");
+                };
+                let (dir, _) = split_remote(&spec.remote);
+                self.ensure_dir(&spec.account_id, &dir, provider).await?;
+                tokio::fs::create_dir_all(&self.temp_dir)
+                    .await
+                    .with_context(|| format!("Failed to create '{}'", self.temp_dir.display()))?;
+                let temp = self.temp_dir.join(format!(
+                    "copy-{}",
+                    self.temp_seq.fetch_add(1, Ordering::Relaxed)
+                ));
+                let same_storage = from.account_id == spec.account_id;
+                let method = copy_file(
+                    source,
+                    &from.file,
+                    provider,
+                    &spec.remote,
+                    same_storage,
+                    &temp,
+                    progress,
+                )
+                .await?;
+                tracing::info!("  [+] Copied {} ({method:?})", spec.remote);
+            }
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether the target already holds the file, compared the way backups
+    /// compare: size, then MD5 or the date. A failed comparison means "send".
+    async fn is_unchanged(&self, spec: &Spec, provider: &dyn StorageProvider) -> bool {
+        let Some(remote) = &spec.known else {
+            return false;
+        };
+        let result = match spec.direction {
+            Direction::Download => sync::local_has(remote, &spec.local).await,
+            Direction::Upload => {
+                let Ok(meta) = tokio::fs::metadata(&spec.local).await else {
+                    return false;
+                };
+                let local = LocalFile {
+                    path: spec.local.clone(),
+                    relative: String::new(),
+                    size: meta.len(),
+                    modified: meta.modified().ok(),
+                };
+                sync::cloud_has(provider, remote, &local, false).await
+            }
+            Direction::Copy => match &spec.from {
+                Some(from) => Ok(same_content(&from.file, remote)),
+                None => return false,
+            },
+        };
+        result.unwrap_or_else(|err| {
+            tracing::debug!("Cannot compare '{}': {err:#}", spec.remote);
+            false
+        })
     }
 
     pub async fn ensure_dir(
@@ -335,7 +480,7 @@ impl Transfers {
         let mut activity = Activity::default();
         for job in jobs.iter().filter(|j| j.status.is_active()) {
             activity.active += 1;
-            if job.spec.direction == Direction::Upload {
+            if job.spec.direction != Direction::Download {
                 activity.uploads += 1;
             }
             if job.status == Status::Running {
@@ -377,7 +522,7 @@ impl Transfers {
     }
 
     /// Requeues a failed or cancelled transfer. Returns its spec so the
-    /// caller can resolve the provider, or `None` if there is nothing to retry.
+    /// caller can resolve the providers, or `None` if there is nothing to retry.
     pub fn retry_spec(&self, id: u64) -> Option<Spec> {
         let jobs = self.jobs.lock().unwrap();
         jobs.iter()
@@ -385,7 +530,13 @@ impl Transfers {
             .map(|j| j.spec.clone())
     }
 
-    pub fn retry(self: &Arc<Self>, id: u64, provider: Arc<dyn StorageProvider>) {
+    /// `source` is the provider of the copy's source; `None` for others.
+    pub fn retry(
+        self: &Arc<Self>,
+        id: u64,
+        provider: Arc<dyn StorageProvider>,
+        source: Option<Arc<dyn StorageProvider>>,
+    ) {
         let (spec, progress) = {
             let mut jobs = self.jobs.lock().unwrap();
             let Some(job) = jobs
@@ -396,16 +547,30 @@ impl Transfers {
             };
             job.status = Status::Queued;
             job.finished = 0;
+            job.unchanged = false;
             job.progress.set_done(0);
             job.progress.set_attempt(1);
             (job.spec.clone(), job.progress.clone())
         };
-        self.start(id, spec, progress, provider);
+        self.start(id, spec, progress, provider, source);
     }
 
     /// Removes every finished transfer (done, failed or cancelled) from the list.
     pub fn clear_finished(&self) {
         self.jobs.lock().unwrap().retain(|j| j.status.is_active());
+    }
+}
+
+/// Whether two cloud files hold the same data: the same size, and the same
+/// MD5 where both clouds keep one, else the same date (copies keep it).
+fn same_content(a: &RemoteFileInfo, b: &RemoteFileInfo) -> bool {
+    if a.is_dir || b.is_dir || a.size != b.size {
+        return false;
+    }
+    match (&a.md5, &b.md5, a.modified, b.modified) {
+        (Some(x), Some(y), _, _) => x.eq_ignore_ascii_case(y),
+        (_, _, Some(x), Some(y)) => (x - y).num_seconds().abs() <= 2,
+        _ => false,
     }
 }
 
@@ -423,17 +588,49 @@ mod tests {
                 local: PathBuf::from("x"),
                 remote: format!("/f{id}"),
                 size: 0,
+                known: None,
+                from: None,
             },
             status,
             progress: Progress::new(),
             handle: None,
             finished,
+            unchanged: false,
         }
     }
 
     #[test]
+    fn copies_compare_by_md5_then_date() {
+        let file = |size: u64, md5: Option<&str>, secs: Option<i64>| RemoteFileInfo {
+            name: "a".into(),
+            path: "/a".into(),
+            is_dir: false,
+            size,
+            md5: md5.map(str::to_string),
+            modified: secs.and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
+        };
+        assert!(same_content(
+            &file(5, Some("AB"), None),
+            &file(5, Some("ab"), None)
+        ));
+        assert!(!same_content(
+            &file(5, Some("ab"), Some(0)),
+            &file(5, Some("cd"), Some(0))
+        ));
+        assert!(same_content(
+            &file(5, None, Some(100)),
+            &file(5, Some("ab"), Some(101))
+        ));
+        assert!(!same_content(
+            &file(5, None, Some(100)),
+            &file(6, None, Some(100))
+        ));
+        assert!(!same_content(&file(5, None, None), &file(5, None, None)));
+    }
+
+    #[test]
     fn list_sends_the_head_of_a_long_queue() {
-        let transfers = Transfers::new();
+        let transfers = Transfers::new(std::env::temp_dir().join("belka-test-copy"));
         {
             let mut jobs = transfers.jobs.lock().unwrap();
             // 150 finished in reverse order, so the latest are the first ones.

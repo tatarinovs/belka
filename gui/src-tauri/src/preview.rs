@@ -1,6 +1,7 @@
 //! Preview of cloud files. A file is downloaded into the app cache once and
 //! shown by the page through the asset protocol. The cache is cleared on
-//! start, and starting a preview cancels the one still downloading.
+//! start and kept under [`CACHE_LIMIT`], and starting a preview cancels the
+//! one still downloading.
 
 use anyhow::{bail, Context, Result};
 use belka_core::client::MAX_ATTEMPTS;
@@ -11,10 +12,14 @@ use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 use tokio::sync::oneshot;
 
 /// Text files are shown up to this size.
 const TEXT_LIMIT: u64 = 1024 * 1024;
+/// The cache drops the previews used longest ago above this size. A few
+/// videos from a cloud that cannot stream would otherwise fill the disk.
+const CACHE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 pub struct Previews {
     dir: PathBuf,
@@ -85,7 +90,9 @@ impl Previews {
         text: bool,
     ) -> Result<Preview> {
         let local = self.cache_path(&item);
-        if !local.exists() {
+        if local.exists() {
+            touch(&local);
+        } else {
             let (cancel, cancelled) = oneshot::channel();
             let progress = Progress::new();
             // Replacing the sender cancels the preview still downloading.
@@ -100,6 +107,8 @@ impl Previews {
                 _ = cancelled => bail!("Preview cancelled"),
             }
             mark_from_internet(&local);
+            let (dir, keep) = (self.dir.clone(), local.clone());
+            tauri::async_runtime::spawn_blocking(move || trim(&dir, &keep, CACHE_LIMIT));
         }
         let (text, truncated) = if text {
             let (text, truncated) = read_text(&local)?;
@@ -167,6 +176,47 @@ fn mark_from_internet(path: &Path) {
 #[cfg(not(windows))]
 fn mark_from_internet(_path: &Path) {}
 
+/// Marks a cached preview as just used, so [`trim`] keeps it longest.
+fn touch(path: &Path) {
+    let touched = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    if let Err(err) = touched {
+        tracing::debug!("Cannot mark '{}' as used: {err}", path.display());
+    }
+}
+
+/// Deletes the files of `dir` used longest ago until the rest fit in
+/// `limit`. `keep`, the preview being shown, stays even if it alone is
+/// larger. Files that another program holds open stay too.
+fn trim(dir: &Path, keep: &Path, limit: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|m| m.is_file())?;
+            Some((meta.modified().ok()?, meta.len(), entry.path()))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, len, _)| len).sum();
+    files.sort();
+    for (_, len, path) in files {
+        if total <= limit {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => total -= len,
+            Err(err) => tracing::debug!("Cannot drop preview '{}': {err}", path.display()),
+        }
+    }
+}
+
 fn read_text(path: &Path) -> Result<(String, bool)> {
     let mut data = Vec::new();
     std::fs::File::open(path)
@@ -200,6 +250,30 @@ mod tests {
         let cp1251 = dir.path().join("b.txt");
         std::fs::write(&cp1251, [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]).unwrap();
         assert_eq!(read_text(&cp1251).unwrap().0, "Привет");
+    }
+
+    #[test]
+    fn trim_drops_the_oldest_previews() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = |name: &str, age_secs: u64| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, [0u8; 100]).unwrap();
+            let time = SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+            path
+        };
+        let oldest = file("a.mp4", 300);
+        let kept = file("b.mp4", 200);
+        let newest = file("c.mp4", 100);
+        trim(tmp.path(), &kept, 150);
+        assert!(!oldest.exists());
+        assert!(kept.exists(), "the preview being shown stays");
+        assert!(!newest.exists());
     }
 
     #[test]

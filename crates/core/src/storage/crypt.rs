@@ -2,7 +2,7 @@
 //! encrypted, like an rclone crypt remote. Data is encrypted while it is
 //! uploaded and decrypted while it is downloaded, without temporary files.
 
-use super::{check_name, is_plain_name, RemoteFileInfo, StorageProvider};
+use super::{check_name, is_plain_name, Quota, RemoteFileInfo, StorageProvider};
 use crate::client::{Sink, Source};
 use crate::crypt::{decrypted_size, Cipher, CryptConfig, DecryptSink, EncryptedSource};
 use crate::progress::Progress;
@@ -119,6 +119,22 @@ impl StorageProvider for CryptProvider {
 
     fn listed_dates_are_upload_times(&self) -> bool {
         self.inner.listed_dates_are_upload_times()
+    }
+
+    async fn quota(&self, remote_dir: &str) -> Result<Option<Quota>> {
+        self.inner.quota(&self.inner_dir(remote_dir)).await
+    }
+
+    /// The encrypted data is copied as is: its key does not depend on the
+    /// name, so it decrypts under the new name too.
+    async fn server_copy(&self, file: &RemoteFileInfo, to: &str) -> Result<bool> {
+        let inner = RemoteFileInfo {
+            path: self.inner_file(&file.path),
+            size: crate::crypt::encrypted_size(file.size),
+            md5: None,
+            ..file.clone()
+        };
+        self.inner.server_copy(&inner, &self.inner_file(to)).await
     }
 
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {

@@ -23,6 +23,12 @@
     shareWithOptions?(entries: Entry[]): void;
     /** Closes access by link. */
     unshare?(entries: Entry[]): Promise<void>;
+    /** Remembers items to paste into another folder (Ctrl+C). */
+    copyItems?(entries: Entry[]): void;
+    /** The menu item for pasting, or null while nothing is remembered. */
+    pasteLabel?(): string | null;
+    /** Copies the remembered items into `folder` (Ctrl+V). */
+    paste?(folder: string): void;
   }
 </script>
 
@@ -49,6 +55,7 @@
     dropLabel,
     leading,
     actions,
+    trailing,
     ops,
     copyLabel,
     canCopy = false,
@@ -77,6 +84,8 @@
     dropLabel?: string;
     leading?: Snippet;
     actions?: Snippet;
+    /** Shown at the right of the status line. */
+    trailing?: Snippet;
     ops?: PaneOps;
     /** Context menu label for copying the selection to the other pane. */
     copyLabel?: string;
@@ -130,14 +139,17 @@
   const sorted = $derived.by(() => {
     const dir = sortAsc ? 1 : -1;
     const byName = (a: Entry, b: Entry) => collator.compare(a.name, b.name);
+    // Parsed once, not in every comparison of a folder with thousands of files.
+    const times = new Map(
+      sortKey === "modified" ? entries.map((e) => [e, e.modified ? Date.parse(e.modified) : 0]) : [],
+    );
     const compare = (a: Entry, b: Entry) => {
       // The virtual root keeps its own order (places, then drives).
       if (a.icon || b.icon) return 0;
       if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
       let result = 0;
       if (sortKey === "size") result = a.size - b.size;
-      else if (sortKey === "modified")
-        result = (a.modified ? Date.parse(a.modified) : 0) - (b.modified ? Date.parse(b.modified) : 0);
+      else if (sortKey === "modified") result = (times.get(a) ?? 0) - (times.get(b) ?? 0);
       return (result || byName(a, b)) * dir;
     };
     return [...entries].sort(compare);
@@ -345,6 +357,11 @@
       for (const e of sorted) selected.add(e.path);
     } else if (ctrl && event.key.toLowerCase() === "r") {
       reload();
+    } else if (ctrl && event.code === "KeyC" && ops?.copyItems) {
+      const items = selectedEntries.filter((e) => !e.icon);
+      if (items.length) ops.copyItems(items);
+    } else if (ctrl && event.code === "KeyV" && ops?.paste) {
+      if (modifiable) ops.paste(path);
     } else if (ctrl && event.shiftKey && event.key.toLowerCase() === "n") {
       newFolder();
     } else {
@@ -494,6 +511,14 @@
         disabled: !canCopy,
         action: oncopy,
       });
+    }
+    const { copyItems, paste } = ops ?? {};
+    const pasteLabel = ops?.pasteLabel?.() ?? null;
+    if (picked.length && copyItems) {
+      items.push({ label: "Копировать", icon: "copy", shortcut: "Ctrl+C", action: () => copyItems(picked) });
+    }
+    if (paste && pasteLabel) {
+      items.push({ label: pasteLabel, shortcut: "Ctrl+V", disabled: !modifiable, action: () => paste(path) });
     }
     if (items.length) items.push("separator");
     const { share, shareWithOptions, unshare } = ops ?? {};
@@ -679,7 +704,8 @@
   </div>
 
   <footer>
-    <span>{opBusy || (loading ? "Загрузка списка…" : summary)}</span>
+    <span class="status">{opBusy || (loading ? "Загрузка списка…" : summary)}</span>
+    {@render trailing?.()}
   </footer>
 </section>
 
@@ -812,6 +838,9 @@
     height: 28px;
     cursor: default;
     user-select: none;
+    /* Rows out of sight are not laid out: folders with thousands of files. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 28px;
   }
 
   .row:hover {
@@ -920,9 +949,20 @@
   }
 
   footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    min-width: 0;
     padding: 4px 12px;
     border-top: 1px solid var(--border);
     color: var(--muted);
     font-size: 12px;
+  }
+
+  .status {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

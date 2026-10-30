@@ -1,7 +1,7 @@
 //! Generic WebDAV (RFC 4918): Nextcloud, ownCloud, Synology, Mail.ru Cloud, etc.
 
 use super::{
-    as_md5, base_name, create_dirs, parse_http_date, rename_target, Mkdir, RemoteFileInfo,
+    as_md5, base_name, create_dirs, parse_http_date, rename_target, Mkdir, Quota, RemoteFileInfo,
     StorageProvider,
 };
 use crate::client::{
@@ -29,6 +29,15 @@ const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <D:getcontentlength/>
     <D:getetag/>
     <D:getlastmodified/>
+  </D:prop>
+</D:propfind>"#;
+
+/// RFC 4331 quota properties.
+const QUOTA_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:">
+  <D:prop>
+    <D:quota-available-bytes/>
+    <D:quota-used-bytes/>
   </D:prop>
 </D:propfind>"#;
 
@@ -113,11 +122,47 @@ impl WebDavProvider {
     }
 
     fn propfind(&self, url: &str, depth: &'static str) -> RequestBuilder {
+        self.propfind_with(url, depth, PROPFIND_BODY)
+    }
+
+    fn propfind_with(&self, url: &str, depth: &'static str, body: &'static str) -> RequestBuilder {
         self.request(Method::from_bytes(b"PROPFIND").expect("valid method"), url)
             .header("Depth", depth)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
-            .body(PROPFIND_BODY)
+            .body(body)
             .timeout(API_TIMEOUT)
+    }
+
+    /// The space of the collection `remote_dir`, from the RFC 4331
+    /// properties. `None` where the server does not report them.
+    pub async fn dav_quota(&self, remote_dir: &str) -> Result<Option<Quota>> {
+        let dir = normalize_remote_dir(remote_dir);
+        let url = self.url_for(&dir, true);
+        let policy = RetryPolicy {
+            retry_server_errors: !self.errors_mean_missing,
+            ..RetryPolicy::default()
+        };
+        let resp = send_with("webdav: PROPFIND quota", policy, || {
+            Ok(self.propfind_with(&url, "0", QUOTA_BODY))
+        })
+        .await?;
+        if !resp.status().is_success() {
+            debug!(
+                "The server reports no quota for '{dir}': HTTP {}",
+                resp.status()
+            );
+            return Ok(None);
+        }
+        let xml = resp
+            .text()
+            .await
+            .context("Failed to read PROPFIND response")?;
+        let quota = parse_multistatus(&xml)?
+            .into_iter()
+            .next()
+            .map(|e| Quota::from_free_used(e.quota_free, e.quota_used))
+            .filter(|q| !q.is_empty());
+        Ok(quota)
     }
 
     /// Maps an `href` from a multistatus response to a normalized remote path.
@@ -205,6 +250,35 @@ impl StorageProvider for WebDavProvider {
         }
 
         create_dirs(&dir, |path| self.mkcol(path)).await
+    }
+
+    async fn quota(&self, remote_dir: &str) -> Result<Option<Quota>> {
+        self.dav_quota(remote_dir).await
+    }
+
+    async fn server_copy(&self, file: &RemoteFileInfo, to: &str) -> Result<bool> {
+        let (from, to) = (normalize_remote_dir(&file.path), normalize_remote_dir(to));
+        let (source, destination) = (self.url_for(&from, false), self.url_for(&to, false));
+        let resp = send("webdav: COPY", || {
+            Ok(self
+                .request(Method::from_bytes(b"COPY").expect("valid method"), &source)
+                .header("Destination", &destination)
+                .header("Overwrite", "T")
+                // The server copies the data: as long as an upload may take.
+                .timeout(upload_timeout(file.size)))
+        })
+        .await?;
+        match resp.status() {
+            StatusCode::CREATED | StatusCode::NO_CONTENT | StatusCode::OK => Ok(true),
+            // The server does not copy: the data goes through the app.
+            StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::NOT_IMPLEMENTED
+            | StatusCode::BAD_GATEWAY => {
+                debug!("The server does not copy '{from}': HTTP {}", resp.status());
+                Ok(false)
+            }
+            _ => Err(http_error(resp, format!("Failed to copy '{from}'")).await),
+        }
     }
 
     async fn get_file_info(&self, remote_path: &str) -> Result<Option<RemoteFileInfo>> {
@@ -375,6 +449,8 @@ struct DavEntry {
     size: Option<u64>,
     etag: Option<String>,
     modified: Option<String>,
+    quota_free: Option<u64>,
+    quota_used: Option<u64>,
 }
 
 #[derive(Default)]
@@ -477,6 +553,8 @@ fn close_element(
                     e.size = e.size.or(ps.props.size);
                     e.etag = e.etag.take().or(ps.props.etag);
                     e.modified = e.modified.take().or(ps.props.modified);
+                    e.quota_free = e.quota_free.or(ps.props.quota_free);
+                    e.quota_used = e.quota_used.or(ps.props.quota_used);
                 }
             }
         }
@@ -513,6 +591,9 @@ fn set_text(
         ("getcontentlength", Some(ps)) => ps.props.size = text.trim().parse().ok(),
         ("getetag", Some(ps)) => ps.props.etag = Some(text.trim().to_string()),
         ("getlastmodified", Some(ps)) => ps.props.modified = Some(text.trim().to_string()),
+        // Nextcloud uses negative values for "unknown" and "unlimited".
+        ("quota-available-bytes", Some(ps)) => ps.props.quota_free = text.trim().parse().ok(),
+        ("quota-used-bytes", Some(ps)) => ps.props.quota_used = text.trim().parse().ok(),
         _ => {}
     }
 }
@@ -573,6 +654,35 @@ mod tests {
         assert_eq!(
             root.href_to_remote("/Upload/a%2Bb.txt").as_deref(),
             Some("/Upload/a+b.txt")
+        );
+    }
+
+    #[test]
+    fn parses_quota() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/</d:href>
+    <d:propstat><d:prop><d:quota-available-bytes>750</d:quota-available-bytes>
+    <d:quota-used-bytes>250</d:quota-used-bytes></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+</d:response><d:response><d:href>/u/</d:href>
+    <d:propstat><d:prop><d:quota-available-bytes>-3</d:quota-available-bytes>
+    <d:quota-used-bytes>10</d:quota-used-bytes></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+</d:response></d:multistatus>"#;
+        let entries = parse_multistatus(xml).unwrap();
+        let quota = |e: &DavEntry| Quota::from_free_used(e.quota_free, e.quota_used);
+        assert_eq!(
+            quota(&entries[0]),
+            Quota {
+                total: Some(1000),
+                used: Some(250),
+                free: Some(750)
+            }
+        );
+        assert_eq!(
+            quota(&entries[1]),
+            Quota {
+                total: None,
+                used: Some(10),
+                free: None
+            }
         );
     }
 

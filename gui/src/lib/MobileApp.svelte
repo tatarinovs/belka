@@ -19,7 +19,7 @@
     type Listing,
     type Update,
   } from "$lib/api";
-  import { baseName, formatBytes, formatDate, plural } from "$lib/format";
+  import { baseName, formatBytes, formatDate, parentPath, plural } from "$lib/format";
   import { ANDROID_DOWNLOADS } from "$lib/platform";
   import { accounts as accountStore } from "$lib/accounts.svelte";
   import { cloudListing as listCloud, describe } from "$lib/cloud";
@@ -33,6 +33,7 @@
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
   import ShareDialog from "$lib/components/ShareDialog.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
+  import QuotaMeter from "$lib/components/QuotaMeter.svelte";
 
   type Mode = "cloud" | "local";
   type SortKey = "name" | "modified" | "size";
@@ -40,6 +41,8 @@
   type Pick =
     | { kind: "download"; account: Account; items: Entry[] }
     | { kind: "upload"; paths: string[] }
+    /** Cloud items going to a folder of the same or another cloud. */
+    | { kind: "copy"; account: Account; items: Entry[] }
     | { kind: "backupLocal" }
     | { kind: "backupRemote" };
   type SheetItem =
@@ -107,7 +110,11 @@
   const collator = new Intl.Collator("ru", { numeric: true, sensitivity: "base" });
 
   const sorted = $derived.by(() => {
-    const time = (e: Entry) => (e.modified ? Date.parse(e.modified) : 0);
+    // Parsed once, not in every comparison of a folder with thousands of photos.
+    const times = new Map(
+      sortKey === "modified" ? entries.map((e) => [e, e.modified ? Date.parse(e.modified) : 0]) : [],
+    );
+    const time = (e: Entry) => times.get(e) ?? 0;
     return [...entries].sort((a, b) => {
       // The phone's root keeps its own order (folders, then drives).
       if (a.icon || b.icon) return 0;
@@ -118,7 +125,20 @@
       return result || collator.compare(a.name, b.name);
     });
   });
+  /** Row keys that survive resorting. Google Drive allows several items
+   * with the same name in a folder, so repeated paths get a counter. */
+  const rowKeys = $derived.by(() => {
+    const seen = new Map<string, number>();
+    return sorted.map((e) => {
+      const n = seen.get(e.path) ?? 0;
+      seen.set(e.path, n + 1);
+      return n ? `${e.path}\u0000${n}` : e.path;
+    });
+  });
   const selectedEntries = $derived(sorted.filter((e) => selected.has(e.path)));
+  /** Bumped when the free space of the cloud may have changed. */
+  let quotaVersion = $state(0);
+  let quotaTimer: ReturnType<typeof setTimeout> | undefined;
   const selecting = $derived(selected.size > 0);
 
   const title = $derived.by(() => {
@@ -272,14 +292,21 @@
     show("cloud");
   }
 
+  function startCopy() {
+    const items = selectedEntries.filter((e) => !e.icon);
+    if (!account || !items.length) return;
+    pick = { kind: "copy", account, items };
+    selected.clear();
+  }
+
   function cancelPick() {
     if (!pick) return;
     if (pick.kind === "backupLocal" || pick.kind === "backupRemote") {
       pick = null;
       return;
     }
-    const back: Mode = pick.kind === "download" ? "cloud" : "local";
-    if (pick.kind === "download") accountId = pick.account.id;
+    const back: Mode = pick.kind === "upload" ? "local" : "cloud";
+    if (pick.kind !== "upload") accountId = pick.account.id;
     pick = null;
     show(back);
   }
@@ -299,8 +326,29 @@
       pick = null;
       return;
     }
-    busy = current.kind === "download" ? "Подготовка скачивания…" : "Подготовка загрузки…";
+    busy =
+      current.kind === "download"
+        ? "Подготовка скачивания…"
+        : current.kind === "copy"
+          ? "Подготовка копирования…"
+          : "Подготовка загрузки…";
     try {
+      if (current.kind === "copy") {
+        if (!account) return;
+        if (current.account.id === account.id && current.items.some((e) => parentPath(e.path) === dir)) {
+          showToast("Это та же папка: откройте другую", true);
+          return;
+        }
+        const existing = new Set(entries.map((e) => e.name.toLowerCase()));
+        const conflicts = current.items.map((e) => e.name).filter((n) => existing.has(n.toLowerCase()));
+        if (conflicts.length && !(await confirmReplace(conflicts, "В этой папке облака"))) return;
+        const count = await api.cloudCopy(current.account.id, current.items, account.id, dir);
+        showToast(`Копирование: ${plural(count, "файл", "файла", "файлов")}`);
+        transfers.kick();
+        // Stays in the folder the files go to.
+        pick = null;
+        return;
+      }
       if (current.kind === "download") {
         const conflicts = await api.localConflicts(dir, current.items.map((e) => e.name));
         if (conflicts.length && !(await confirmReplace(conflicts, "В этой папке"))) return;
@@ -475,6 +523,9 @@
       list.push({ label: "Автобэкап этой папки", icon: "clock", action: () => backupFolder(single) });
     }
     list.push({ label: "Переименовать", disabled: !single, action: () => single && rename(single) });
+    if (mode === "cloud" && items.length) {
+      list.push({ label: "Копировать в другую папку или облако", icon: "copy", action: startCopy });
+    }
     if (mode === "cloud" && def?.share) {
       if (def.shareOptions) list.push({ label: "Ссылка с паролем или сроком", icon: "link", action: () => (sharing = items) });
       list.push({
@@ -623,7 +674,11 @@
       });
 
     const offFinished = transfers.onFinished((t) => {
-      if (mode === "cloud" && t.direction === "upload" && t.account_id === accountId && t.remote_dir === path) {
+      if (t.direction !== "download" && t.account_id === accountId) {
+        clearTimeout(quotaTimer);
+        quotaTimer = setTimeout(() => quotaVersion++, 2000);
+      }
+      if (mode === "cloud" && t.direction !== "download" && t.account_id === accountId && t.remote_dir === path) {
         reloadSoon();
       } else if (mode === "local" && t.direction === "download" && path && t.local_path.startsWith(path + "/")) {
         reloadSoon();
@@ -708,7 +763,7 @@
     {/if}
   </header>
 
-  {#if !pick || pick.kind === "upload" || pick.kind === "backupRemote"}
+  {#if !pick || pick.kind === "upload" || pick.kind === "copy" || pick.kind === "backupRemote"}
     <nav class="tabs">
       <button
         class:active={mode === "cloud"}
@@ -730,11 +785,20 @@
     </nav>
   {/if}
 
+  {#if mode === "cloud" && account && atRoot && !pick}
+    <div class="space"><QuotaMeter {account} {path} version={quotaVersion} /></div>
+  {/if}
+
   {#if pick}
     <div class="pick">
-      <Icon name={pick.kind === "download" ? "download" : pick.kind === "upload" ? "upload" : "clock"} size={18} />
+      <Icon
+        name={pick.kind === "download" ? "download" : pick.kind === "upload" ? "upload" : pick.kind === "copy" ? "copy" : "clock"}
+        size={18}
+      />
       <span>
-        {#if pick.kind === "download"}
+        {#if pick.kind === "copy"}
+          Откройте папку в любом облаке, куда скопировать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
+        {:else if pick.kind === "download"}
           Откройте папку на телефоне, куда скачать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
         {:else if pick.kind === "backupLocal"}
           Откройте папку на телефоне, которую нужно копировать в облако
@@ -781,7 +845,7 @@
       {#if error}
         <div class="error banner">{error}</div>
       {/if}
-      {#each sorted as entry, i (`${i}:${entry.path}`)}
+      {#each sorted as entry, i (rowKeys[i])}
         {@const isSelected = selected.has(entry.path)}
         <button
           class="row"
@@ -828,7 +892,10 @@
         onclick={confirmPick}
         disabled={!!busy || loading || !path || (mode === "local" && !storageOk) || (mode === "cloud" && !account)}
       >
-        {#if pick.kind === "download" || pick.kind === "upload"}
+        {#if pick.kind === "copy"}
+          <Icon name="copy" size={18} />
+          Копировать сюда
+        {:else if pick.kind === "download" || pick.kind === "upload"}
           <Icon name={pick.kind === "download" ? "download" : "upload"} size={18} />
           {pick.kind === "download" ? "Скачать сюда" : "Загрузить сюда"}
         {:else}
@@ -1133,6 +1200,12 @@
     }
   }
 
+  .space {
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+
   .list {
     flex: 1;
     min-height: 0;
@@ -1160,6 +1233,9 @@
     -webkit-user-select: none;
     -webkit-touch-callout: none;
     -webkit-tap-highlight-color: transparent;
+    /* Rows out of sight are not laid out: camera folders hold thousands. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 60px;
   }
 
   .row:active {

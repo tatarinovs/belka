@@ -2,7 +2,7 @@
 
 use super::{
     as_md5, create_dirs, parse_rfc3339, plain_links_only, plain_names_only, rename_target, Mkdir,
-    RemoteFileInfo, ShareOptions, StorageProvider,
+    Quota, RemoteFileInfo, ShareOptions, StorageProvider,
 };
 use crate::client::{
     build_http_client, download_into, ensure_success, fetch_range, http_error, json_response,
@@ -20,6 +20,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+const DISK_API: &str = "https://cloud-api.yandex.net/v1/disk/";
 const API: &str = "https://cloud-api.yandex.net/v1/disk/resources";
 const PAGE_SIZE: usize = 1000;
 const ITEM_FIELDS: &str = "name,path,type,size,md5,modified";
@@ -212,6 +213,50 @@ impl YandexDiskProvider {
 impl StorageProvider for YandexDiskProvider {
     fn name(&self) -> &str {
         "Yandex Disk"
+    }
+
+    async fn server_copy(&self, file: &RemoteFileInfo, to: &str) -> Result<bool> {
+        let (from, to) = (normalize_remote_dir(&file.path), normalize_remote_dir(to));
+        let resp = send("yandex: copy", || {
+            Ok(self.api(Method::POST, "/copy").query(&[
+                ("from", from.as_str()),
+                ("path", to.as_str()),
+                ("overwrite", "true"),
+            ]))
+        })
+        .await?;
+        match resp.status() {
+            StatusCode::CREATED => Ok(true),
+            StatusCode::ACCEPTED => {
+                // Large files are copied asynchronously.
+                let link: Link = resp.json().await.context("Invalid copy response")?;
+                self.wait_for_operation(&link.href).await?;
+                Ok(true)
+            }
+            _ => Err(http_error(resp, format!("Failed to copy '{from}'")).await),
+        }
+    }
+
+    async fn quota(&self, _remote_dir: &str) -> Result<Option<Quota>> {
+        #[derive(Deserialize)]
+        struct Disk {
+            total_space: Option<u64>,
+            used_space: Option<u64>,
+        }
+        let resp = send("yandex: disk info", || {
+            Ok(self
+                .client
+                .get(DISK_API)
+                .header(AUTHORIZATION, &self.auth)
+                .query(&[("fields", "total_space,used_space")])
+                .timeout(API_TIMEOUT))
+        })
+        .await?;
+        let disk: Disk = json_response(resp, "Failed to read Yandex Disk space").await?;
+        Ok(Some(Quota::from_total_used(
+            disk.total_space,
+            disk.used_space,
+        )))
     }
 
     async fn ensure_dir(&self, remote_dir: &str) -> Result<()> {

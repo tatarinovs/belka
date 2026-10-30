@@ -330,6 +330,12 @@ impl RemoteListing {
         listing
     }
 
+    /// The cloud file at `path` as listed, without asking the cloud: `None`
+    /// also when its folder could not be listed.
+    pub fn listed(&self, path: &str) -> Option<&RemoteFileInfo> {
+        self.items.get(path)
+    }
+
     /// The cloud file at `path`, from the listing or asked directly.
     pub async fn info(
         &self,

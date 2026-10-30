@@ -5,7 +5,13 @@
   import { isMobile } from "$lib/platform";
   import { formatBytes } from "$lib/format";
   import { transfers } from "$lib/transfers.svelte";
-  import Icon from "./Icon.svelte";
+  import Icon, { type IconName } from "./Icon.svelte";
+
+  const DIRECTIONS: Record<Transfer["direction"], { icon: IconName; title: string }> = {
+    upload: { icon: "upload", title: "Загрузка в облако" },
+    download: { icon: "download", title: "Скачивание" },
+    copy: { icon: "copy", title: "Копирование в облаке или между облаками" },
+  };
 
   let collapsed = $state(false);
 
@@ -44,7 +50,7 @@
         return parts.join(" · ");
       }
       case "done":
-        return `Готово · ${formatBytes(t.total || t.done)}`;
+        return `${t.unchanged ? "Без изменений" : "Готово"} · ${formatBytes(t.total || t.done)}`;
       case "cancelled":
         return "Отменено";
       case "failed":
@@ -75,8 +81,8 @@
       <ul>
         {#each transfers.items as t (t.id)}
           <li class={t.state}>
-            <span class="dir" title={t.direction === "upload" ? "Загрузка в облако" : "Скачивание"}>
-              <Icon name={t.direction === "upload" ? "upload" : "download"} size={14} />
+            <span class="dir" title={DIRECTIONS[t.direction].title}>
+              <Icon name={DIRECTIONS[t.direction].icon} size={14} />
             </span>
             <div class="main">
               <div class="line">

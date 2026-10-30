@@ -4,7 +4,7 @@
 use crate::error::CmdResult;
 use crate::{native, preview, AppState};
 use anyhow::{Context, Result};
-use belka_core::storage::{check_name, rename_target, ShareOptions};
+use belka_core::storage::{check_name, rename_target, Quota, ShareOptions};
 use belka_core::utils::path::{join_remote, normalize_remote_dir};
 use belka_core::RemoteFileInfo;
 use chrono::NaiveDate;
@@ -20,6 +20,18 @@ pub async fn list_dir(
 ) -> CmdResult<Vec<RemoteFileInfo>> {
     let provider = state.provider(&account_id)?;
     Ok(provider.list_dir(&normalize_remote_dir(&path)).await?)
+}
+
+/// The space of the cloud that holds `path`: the account, or the volume of
+/// a NAS share. `None` where the cloud does not tell.
+#[tauri::command]
+pub async fn cloud_quota(
+    state: State<'_, AppState>,
+    account_id: String,
+    path: String,
+) -> CmdResult<Option<Quota>> {
+    let provider = state.provider(&account_id)?;
+    Ok(provider.quota(&normalize_remote_dir(&path)).await?)
 }
 
 /// Creates folder `name` in `parent` and returns its path.

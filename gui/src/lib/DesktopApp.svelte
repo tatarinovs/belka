@@ -10,7 +10,7 @@
   import { explainError } from "$lib/errors";
   import { remember, stored } from "$lib/storage";
   import { dnd, paneAt } from "$lib/dnd.svelte";
-  import { baseName } from "$lib/format";
+  import { baseName, parentPath } from "$lib/format";
   import { providerDef } from "$lib/providers";
   import { transfers } from "$lib/transfers.svelte";
   import AccountList from "$lib/components/AccountList.svelte";
@@ -21,6 +21,7 @@
   import BackupScreen from "$lib/components/BackupScreen.svelte";
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
+  import QuotaMeter from "$lib/components/QuotaMeter.svelte";
   import ShareDialog from "$lib/components/ShareDialog.svelte";
   import ShortcutsDialog from "$lib/components/ShortcutsDialog.svelte";
   import Icon from "$lib/components/Icon.svelte";
@@ -56,7 +57,12 @@
   let about = $state(false);
   let shortcuts = $state(false);
   let notice = $state("");
+  const explainedNotice = $derived(explainError(notice));
   let busy = $state("");
+  /** Bumped when the free space of the open cloud may have changed. */
+  let quotaVersion = $state(0);
+  /** Cloud items "Копировать" remembered, to paste into a folder of any cloud. */
+  let clipboard = $state<{ account: Account; items: Entry[] } | null>(null);
   /** A message about a finished action, hidden after a while. */
   let info = $state("");
   let infoTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,7 +120,34 @@
       ...(providerDef(account.kind).shareOptions && {
         shareWithOptions: (items) => (sharing = items),
       }),
+      copyItems: (items) => {
+        clipboard = { account, items };
+        showInfo(`Скопировано: ${describe(items)}. Откройте папку в любом облаке и нажмите Ctrl+V.`);
+      },
+      pasteLabel: () => {
+        if (!clipboard) return null;
+        const { items } = clipboard;
+        return items.length === 1 ? `Вставить «${items[0].name}»` : `Вставить (${items.length})`;
+      },
+      paste: (folder) => pasteInto(account, folder),
     };
+  }
+
+  /** Copies what "Копировать" remembered into `folder` of `target`. */
+  async function pasteInto(target: Account, folder: string) {
+    const from = clipboard;
+    if (!from || !cloudPane) return;
+    if (from.account.id === target.id && from.items.some((e) => parentPath(e.path) === folder)) {
+      notice = "Скопированное уже лежит в этой папке: откройте другую.";
+      return;
+    }
+    const existing = new Set(cloudPane.getEntries().map((e) => e.name.toLowerCase()));
+    const conflicts = from.items.map((e) => e.name).filter((n) => existing.has(n.toLowerCase()));
+    await run("Подготовка копирования…", async () => {
+      if (conflicts.length && !(await confirmReplace(conflicts, "В этой папке облака"))) return;
+      await api.cloudCopy(from.account.id, from.items, target.id, folder);
+      transfers.kick();
+    });
   }
 
   const localOps: PaneOps = {
@@ -376,6 +409,7 @@
     clearTimeout(reloadTimers[pane]);
     reloadTimers[pane] = setTimeout(() => {
       (pane === "cloud" ? cloudPane : localPane)?.reload();
+      if (pane === "cloud") quotaVersion++;
     }, 500);
   }
 
@@ -395,7 +429,7 @@
       });
 
     const offFinished = transfers.onFinished((t) => {
-      if (t.direction === "upload" && t.account_id === selectedId && t.remote_dir === cloudPath) {
+      if (t.direction !== "download" && t.account_id === selectedId && t.remote_dir === cloudPath) {
         reloadSoon("cloud");
       } else if (t.direction === "download" && localPath && isInside(t.local_path, localPath)) {
         reloadSoon("local");
@@ -512,6 +546,9 @@
                 onremove={remove}
               />
             {/snippet}
+            {#snippet trailing()}
+              <QuotaMeter account={selected} path={cloudPath} version={quotaVersion} />
+            {/snippet}
             {#snippet actions()}
               <button
                 class="btn primary arrow"
@@ -613,8 +650,8 @@
   {#if notice || busy || info}
     <div class="notice" class:error={!!notice} role={notice ? "alert" : "status"}>
       <span>
-        {notice ? explainError(notice).summary : busy || info}
-        {#if notice && explainError(notice).detail}
+        {notice ? explainedNotice.summary : busy || info}
+        {#if notice && explainedNotice.detail}
           <details><summary>Подробнее</summary>{notice}</details>
         {/if}
       </span>

@@ -1,3 +1,4 @@
+pub mod copy;
 pub mod crypt;
 pub mod google;
 pub mod mailru;
@@ -27,6 +28,33 @@ pub struct RemoteFileInfo {
     /// Lowercase hex MD5, set only when the provider guarantees it is a content hash.
     pub md5: Option<String>,
     pub modified: Option<DateTime<Utc>>,
+}
+
+/// Space in a cloud. A field is `None` where the cloud does not tell it:
+/// many have no limit, S3 says nothing at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Quota {
+    pub total: Option<u64>,
+    pub used: Option<u64>,
+    pub free: Option<u64>,
+}
+
+impl Quota {
+    /// From the size and the space used; free is what is left.
+    pub fn from_total_used(total: Option<u64>, used: Option<u64>) -> Self {
+        let free = total.zip(used).map(|(t, u)| t.saturating_sub(u));
+        Self { total, used, free }
+    }
+
+    /// From the free and the used space; the size is their sum.
+    pub fn from_free_used(free: Option<u64>, used: Option<u64>) -> Self {
+        let total = free.zip(used).map(|(f, u)| f + u);
+        Self { total, used, free }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total.is_none() && self.used.is_none() && self.free.is_none()
+    }
 }
 
 impl RemoteFileInfo {
@@ -173,6 +201,21 @@ pub trait StorageProvider: Send + Sync {
     /// cannot read a part of a file.
     async fn read_range(&self, remote_path: &str, _start: u64, _len: u64) -> Result<Bytes> {
         bail!("{} cannot read a part of '{remote_path}'", self.name())
+    }
+
+    /// Copies `file` to `to` in this same storage without the data leaving
+    /// the cloud, replacing what is at `to`; the parent folder exists.
+    /// Returns false where the cloud cannot (or not this file): the caller
+    /// then copies the data itself, see [`copy::copy_file`].
+    async fn server_copy(&self, _file: &RemoteFileInfo, _to: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The space of the storage that holds `remote_dir`: the whole account
+    /// for most clouds, the volume of the shared folder on a Synology NAS.
+    /// `None` where the cloud does not tell.
+    async fn quota(&self, _remote_dir: &str) -> Result<Option<Quota>> {
+        Ok(None)
     }
 
     /// Deletes a file, or a directory with all of its content.
@@ -341,6 +384,16 @@ impl TokenCache {
         let expires_at = Instant::now() + Duration::from_secs(lifetime.unwrap_or(3600));
         *cached = Some((token.clone(), expires_at));
         Ok(token)
+    }
+
+    /// Forgets `stale`, which the cloud rejected before it was due to
+    /// expire (revoked, or the password changed), unless another request
+    /// has already replaced it. The next [`TokenCache::get`] fetches a new one.
+    pub async fn invalidate(&self, stale: &str) {
+        let mut cached = self.0.lock().await;
+        if cached.as_ref().is_some_and(|(token, _)| token == stale) {
+            *cached = None;
+        }
     }
 }
 
