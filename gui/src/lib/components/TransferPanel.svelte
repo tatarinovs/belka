@@ -1,6 +1,7 @@
 <script lang="ts">
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { api, type Transfer } from "$lib/api";
+  import { explainError } from "$lib/errors";
   import { isMobile } from "$lib/platform";
   import { formatBytes } from "$lib/format";
   import { transfers } from "$lib/transfers.svelte";
@@ -47,7 +48,7 @@
       case "cancelled":
         return "Отменено";
       case "failed":
-        return t.error ?? "Ошибка";
+        return explainError(t.error ?? "").summary || "Ошибка";
     }
   }
 </script>
@@ -82,24 +83,24 @@
                 <span class="name" title={`${t.account_name}: ${t.remote_path}\n${t.local_path}`}>{t.name}</span>
                 <span class="account">{t.account_name}</span>
               </div>
-              <div class="bar"><div style:width="{percent(t)}%"></div></div>
+              <div class="bar" role="progressbar" aria-label={t.name} aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(t)}><div style:width="{percent(t)}%"></div></div>
               <div class="detail" title={t.state === "failed" ? t.error : undefined}>{detail(t)}</div>
             </div>
             <div class="row-actions">
               {#if t.state === "queued" || t.state === "running"}
-                <button class="icon-btn" title="Отменить" onclick={() => transfers.cancel(t.id)}>
+                <button class="icon-btn" title="Отменить" aria-label="Отменить передачу" onclick={() => transfers.cancel(t.id)}>
                   <Icon name="close" size={14} />
                 </button>
               {:else if t.state === "failed" || t.state === "cancelled"}
-                <button class="icon-btn" title="Повторить" onclick={() => transfers.retry(t.id)}>
+                <button class="icon-btn" title="Повторить" aria-label="Повторить передачу" onclick={() => transfers.retry(t.id)}>
                   <Icon name="retry" size={14} />
                 </button>
               {:else if t.direction === "download" && isMobile}
-                <button class="icon-btn" title="Открыть" onclick={() => api.localOpen(t.local_path).catch(() => {})}>
+                <button class="icon-btn" title="Открыть" aria-label="Открыть файл" onclick={() => api.localOpen(t.local_path).catch(() => {})}>
                   <Icon name="file" size={14} />
                 </button>
               {:else if t.direction === "download"}
-                <button class="icon-btn" title="Показать в папке" onclick={() => revealItemInDir(t.local_path)}>
+                <button class="icon-btn" title="Показать в папке" aria-label="Показать в папке" onclick={() => revealItemInDir(t.local_path)}>
                   <Icon name="reveal" size={14} />
                 </button>
               {/if}
@@ -230,7 +231,7 @@
   .account {
     flex: none;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
 
   .bar {
@@ -260,7 +261,7 @@
   .detail {
     overflow: hidden;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
     font-variant-numeric: tabular-nums;
     text-overflow: ellipsis;
     white-space: nowrap;

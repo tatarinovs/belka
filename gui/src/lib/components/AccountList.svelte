@@ -92,7 +92,7 @@
     justify-content: space-between;
     padding: 10px 8px 6px 14px;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -148,7 +148,7 @@
 
   .kind {
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
 
   .badge {

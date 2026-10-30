@@ -97,6 +97,7 @@
           <button
             class="close"
             title="Закрыть вкладку (Ctrl+W)"
+            aria-label="Закрыть вкладку"
             tabindex="-1"
             onpointerdown={(e) => e.stopPropagation()}
             onclick={() => onclose(tab.id)}
@@ -107,7 +108,7 @@
       </div>
     {/each}
   </div>
-  <button class="icon-btn new" title="Новая вкладка (Ctrl+T)" onclick={onnew}>
+  <button class="icon-btn new" title="Новая вкладка (Ctrl+T)" aria-label="Новая вкладка" onclick={onnew}>
     <Icon name="plus" size={14} />
   </button>
 </div>
@@ -212,7 +213,7 @@
     width: 18px;
     height: 16px;
     border-radius: 4px;
-    font-size: 9px;
+    font-size: 10px;
   }
 
 </style>

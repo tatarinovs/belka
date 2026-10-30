@@ -512,7 +512,7 @@
     margin: 0;
     padding: 8px 10px;
     border-radius: 6px;
-    background: color-mix(in srgb, #e0a43a 18%, transparent);
+    background: color-mix(in srgb, var(--folder) 18%, transparent);
     font-size: 12px;
   }
 
@@ -599,6 +599,6 @@
   .note {
     flex: 1;
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
   }
 </style>

@@ -7,6 +7,7 @@
   import { api, errorText, type Account, type BackupTask, type Entry } from "$lib/api";
   import { accounts as accountStore } from "$lib/accounts.svelte";
   import { cloudListing, describe } from "$lib/cloud";
+  import { explainError } from "$lib/errors";
   import { remember, stored } from "$lib/storage";
   import { dnd, paneAt } from "$lib/dnd.svelte";
   import { baseName } from "$lib/format";
@@ -21,6 +22,7 @@
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
   import PreviewDialog from "$lib/components/PreviewDialog.svelte";
   import ShareDialog from "$lib/components/ShareDialog.svelte";
+  import ShortcutsDialog from "$lib/components/ShortcutsDialog.svelte";
   import Icon from "$lib/components/Icon.svelte";
   import TabBar, { type Tab } from "$lib/components/TabBar.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
@@ -52,6 +54,7 @@
   let backups = $state(false);
   let backupDraft = $state<BackupTask | null>(null);
   let about = $state(false);
+  let shortcuts = $state(false);
   let notice = $state("");
   let busy = $state("");
   /** A message about a finished action, hidden after a while. */
@@ -98,8 +101,9 @@
       deletePrompt: (items) =>
         `Удалить ${describe(items)} из облака «${account.name}»?
 
-Файлы удаляются безвозвратно, минуя корзину облака.`,
+Файлы удаляются безвозвратно, минуя корзину облака. Отменить это нельзя.`,
       deleteLabel: "Удалить",
+      confirmLabel: "Удалить навсегда",
       ...(providerDef(account.kind).share && {
         share: async (items) => showLinks(await api.cloudShare(account.id, items)),
         unshare: async (items) => {
@@ -120,6 +124,7 @@
     remove: (items) => api.localDelete(items.map((e) => e.path)),
     deletePrompt: (items) => `Переместить ${describe(items)} в корзину?`,
     deleteLabel: "Удалить",
+    confirmLabel: "В корзину",
     reveal: (path) => revealItemInDir(path),
   };
 
@@ -421,11 +426,19 @@
   });
 </script>
 
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== "F1") return;
+    e.preventDefault();
+    shortcuts = true;
+  }}
+/>
+
 <main>
   <header class="appbar">
     <button
       class="tool"
-      title="Подключённые облака: добавить, настроить, изменить порядок, импорт и экспорт"
+      title="Подключённые облака"
       onclick={() => (managing = true)}
     >
       <Icon name="cloud" /> Аккаунты
@@ -588,11 +601,25 @@
     </div>
   </div>
 
+  <div class="hints" aria-hidden="true">
+    <span><kbd>F2</kbd> Переименовать</span>
+    <span><kbd>F5</kbd> Копировать в другую панель</span>
+    <span><kbd>F7</kbd> Новая папка</span>
+    <span><kbd>Del</kbd> Удалить</span>
+    <span><kbd>Tab</kbd> Другая панель</span>
+    <span><kbd>F1</kbd> Все клавиши</span>
+  </div>
+
   {#if notice || busy || info}
-    <div class="notice" class:error={!!notice}>
-      <span>{notice || busy || info}</span>
+    <div class="notice" class:error={!!notice} role={notice ? "alert" : "status"}>
+      <span>
+        {notice ? explainError(notice).summary : busy || info}
+        {#if notice && explainError(notice).detail}
+          <details><summary>Подробнее</summary>{notice}</details>
+        {/if}
+      </span>
       {#if notice || info}
-        <button class="icon-btn" title="Скрыть" onclick={() => (notice = info = "")}>
+        <button class="icon-btn" title="Скрыть" aria-label="Скрыть сообщение" onclick={() => (notice = info = "")}>
           <Icon name="close" size={14} />
         </button>
       {/if}
@@ -665,6 +692,8 @@
 />
 
 <AboutDialog open={about} onclose={() => (about = false)} />
+
+<ShortcutsDialog open={shortcuts} onclose={() => (shortcuts = false)} />
 
 <AccountDialog
   open={adding || editing !== null}
@@ -763,6 +792,40 @@
 
   .notice.error {
     border-radius: 0;
+  }
+
+  .notice details {
+    margin-top: 2px;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .notice summary {
+    cursor: pointer;
+  }
+
+  /* Keys that work in the panes, always in sight. */
+  .hints {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 16px;
+    padding: 3px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--sidebar);
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .hints kbd {
+    margin-right: 4px;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
   }
 
   .welcome {

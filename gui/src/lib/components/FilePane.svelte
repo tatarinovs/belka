@@ -13,6 +13,8 @@
     /** Confirmation text for deleting `entries`. */
     deletePrompt(entries: Entry[]): string;
     deleteLabel: string;
+    /** The confirmation button; says what will happen to the items. Defaults to `deleteLabel`. */
+    confirmLabel?: string;
     /** Shows the item (or the open folder) in the system file manager. */
     reveal?(path: string): void;
     /** Opens access by link and copies the links; set where the cloud supports it. */
@@ -29,6 +31,7 @@
   import { ask } from "@tauri-apps/plugin-dialog";
   import { SvelteSet } from "svelte/reactivity";
   import { errorText, type Listing } from "$lib/api";
+  import { explainError } from "$lib/errors";
   import { dnd, paneAt } from "$lib/dnd.svelte";
   import { formatBytes, formatDate } from "$lib/format";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
@@ -377,6 +380,7 @@
     event.preventDefault();
   }
 
+  const explained = $derived(explainError(error));
   const modifiable = $derived(!!ops && listing !== null && ops.canModify(path));
 
   async function operation(label: string, action: () => Promise<void>) {
@@ -449,7 +453,7 @@
     const confirmed = await ask(ops.deletePrompt(items), {
       title: "Удаление",
       kind: "warning",
-      okLabel: ops.deleteLabel,
+      okLabel: ops.confirmLabel ?? ops.deleteLabel,
       cancelLabel: "Отмена",
     });
     if (!confirmed) return;
@@ -540,6 +544,10 @@
     menu = { x: event.clientX, y: event.clientY, items };
   }
 
+  function ariaSort(key: SortKey) {
+    return sortKey === key ? (sortAsc ? "ascending" : "descending") : "none";
+  }
+
   function sortMark(key: SortKey) {
     return sortKey === key ? (sortAsc ? " ▲" : " ▼") : "";
   }
@@ -556,10 +564,10 @@
 <section data-pane={id} class:active onpointerdowncapture={onactivate} onfocusin={onactivate}>
   <div class="toolbar">
     {@render leading?.()}
-    <button class="icon-btn" title="Вверх (Backspace)" onclick={goUp} disabled={listing?.parent == null}>
+    <button class="icon-btn" title="Вверх (Backspace)" aria-label="Вверх" onclick={goUp} disabled={listing?.parent == null}>
       <Icon name="up" />
     </button>
-    <button class="icon-btn" title="Обновить (Ctrl+R)" onclick={reload}>
+    <button class="icon-btn" title="Обновить (Ctrl+R)" aria-label="Обновить" onclick={reload}>
       <Icon name="refresh" />
     </button>
 
@@ -580,7 +588,10 @@
   </div>
 
   {#if error}
-    <div class="error banner">{error}</div>
+    <div class="error banner" role="alert">
+      {explained.summary}
+      {#if explained.detail}<details><summary>Подробнее</summary>{explained.detail}</details>{/if}
+    </div>
   {/if}
 
   <div
@@ -593,9 +604,9 @@
     bind:this={grid}
   >
     <div class="head" role="row">
-      <button role="columnheader" tabindex="-1" onclick={() => sortBy("name")}>Имя{sortMark("name")}</button>
-      <button role="columnheader" tabindex="-1" class="num" onclick={() => sortBy("size")}>Размер{sortMark("size")}</button>
-      <button role="columnheader" tabindex="-1" onclick={() => sortBy("modified")}>Изменён{sortMark("modified")}</button>
+      <button role="columnheader" tabindex="-1" aria-sort={ariaSort("name")} onclick={() => sortBy("name")}>Имя{sortMark("name")}</button>
+      <button role="columnheader" tabindex="-1" class="num" aria-sort={ariaSort("size")} onclick={() => sortBy("size")}>Размер{sortMark("size")}</button>
+      <button role="columnheader" tabindex="-1" aria-sort={ariaSort("modified")} onclick={() => sortBy("modified")}>Изменён{sortMark("modified")}</button>
     </div>
 
     <div class="body" class:dim={loading} role="presentation" oncontextmenu={(e) => openMenu(e, null)}>
@@ -862,7 +873,7 @@
     padding: 1px;
     border-radius: 50%;
     background: var(--surface);
-    color: #455a64;
+    color: var(--crypt);
   }
 
   .row.selected .lock {
@@ -870,7 +881,7 @@
   }
 
   .ico[data-kind="dir"] {
-    color: #e0a43a;
+    color: var(--folder);
   }
 
   .ico[data-kind="place"],

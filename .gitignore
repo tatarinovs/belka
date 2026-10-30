@@ -50,6 +50,7 @@ tmp_downloads/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+.claude/
 *.swp
 *~
 .DS_Store

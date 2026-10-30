@@ -670,7 +670,14 @@
   }
 </script>
 
-<svelte:window {onpopstate} />
+<svelte:window
+  {onpopstate}
+  onkeydown={(e) => {
+    if (e.key !== "Escape") return;
+    if (prompt) closePrompt(null);
+    else if (sheet) sheet = null;
+  }}
+/>
 
 <main>
   <header class="bar">
@@ -1029,8 +1036,8 @@
   }
 
   .tool.small {
-    width: 32px;
-    height: 32px;
+    width: 40px;
+    height: 40px;
   }
 
   .tool:active:not(:disabled) {
@@ -1178,7 +1185,7 @@
   }
 
   .ico[data-kind="dir"] {
-    color: #e0a43a;
+    color: var(--folder);
   }
 
   .ico[data-kind="place"],
@@ -1204,7 +1211,7 @@
     padding: 1px;
     border-radius: 50%;
     background: var(--surface);
-    color: #455a64;
+    color: var(--crypt);
   }
 
   .text {
@@ -1272,8 +1279,8 @@
   }
 
   .btn.small {
-    height: 32px;
-    border-radius: 16px;
+    height: 40px;
+    border-radius: 20px;
   }
 
   .empty .btn.big {

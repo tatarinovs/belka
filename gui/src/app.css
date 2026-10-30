@@ -3,7 +3,7 @@
   --surface: #ffffff;
   --sidebar: #eef0f3;
   --text: #1c2026;
-  --muted: #69707c;
+  --muted: #5d6471;
   --border: #dde1e6;
   --hover: #e7eaef;
   --selected: #dbe7fb;
@@ -13,8 +13,10 @@
   --success: #1e8e3e;
   --danger: #c4372b;
   --danger-bg: #fdecea;
+  --folder: #e0a43a;
+  --crypt: #455a64;
   --focus: #2463d6;
-  --shadow: 0 10px 40px rgb(15 23 42 / 0.18);
+  --shadow: 0 8px 24px rgb(15 23 42 / 0.16);
 
   color-scheme: light;
   font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -40,8 +42,10 @@
     --success: #4cc06a;
     --danger: #f07167;
     --danger-bg: #3a1f1d;
+    --folder: #e8b04f;
+    --crypt: #90a4ae;
     --focus: #6a9cf5;
-    --shadow: 0 10px 40px rgb(0 0 0 / 0.5);
+    --shadow: 0 8px 24px rgb(0 0 0 / 0.45);
 
     color-scheme: dark;
   }
@@ -132,6 +136,16 @@ button {
   cursor: default;
 }
 
+.error summary {
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.error details {
+  margin-top: 2px;
+  font-size: 12px;
+}
+
 .error {
   padding: 8px 10px;
   border-radius: 6px;
@@ -190,6 +204,17 @@ button {
 [data-kind="s3"] { --kind-color: #c77700; }
 [data-kind="synology"] { --kind-color: #2f6f9f; }
 [data-kind="crypt"] { --kind-color: #455a64; }
+
+/* Endless progress stripes and spinners stop; state changes still show. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-iteration-count: 1 !important;
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 
 /* The phone layout: shared components (dialogs, the transfer list) get
    larger text and touch-sized controls. `:root.mobile` outweighs the
