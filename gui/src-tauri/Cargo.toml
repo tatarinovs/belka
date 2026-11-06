@@ -47,6 +47,7 @@ belka-store = { workspace = true, features = ["keyring"] }
 
 # The program a file type opens with, to give it a stream.
 [target.'cfg(windows)'.dependencies]
+tempfile = "3"
 tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-single-instance = "2"
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }

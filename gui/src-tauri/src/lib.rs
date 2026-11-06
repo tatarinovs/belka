@@ -7,6 +7,9 @@ mod stream;
 mod transfers;
 #[cfg(target_os = "windows")]
 mod tray;
+mod ui_state;
+#[cfg(target_os = "windows")]
+mod webview_cache;
 
 use anyhow::Result;
 use belka_core::storage::crypt::CryptProvider;
@@ -107,6 +110,17 @@ pub fn run() {
         .with(filter)
         .init();
 
+    #[allow(unused_mut)]
+    let mut context = tauri::generate_context!();
+    #[cfg(target_os = "windows")]
+    let webview_cache = Arc::new(Mutex::new(None::<tempfile::TempDir>));
+    #[cfg(target_os = "windows")]
+    let webview_cache_setup = webview_cache.clone();
+    #[cfg(target_os = "windows")]
+    {
+        // Build the window in setup with a disposable InPrivate profile.
+        context.config_mut().app.windows[0].create = false;
+    }
     let builder = tauri::Builder::default();
     #[cfg(target_os = "windows")]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
@@ -129,15 +143,17 @@ pub fn run() {
             )
             .build(),
     );
-    builder
+    let app = builder
         .on_window_event(|_window, _event| {
             #[cfg(target_os = "windows")]
             if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
                 tray::close(_window, api);
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             let config_dir = app.path().app_config_dir()?;
+            let ui_state = ui_state::UiState::new(&config_dir)?;
+            app.manage(ui_state);
             let preview_dir = app.path().app_cache_dir()?.join("preview");
             // On Android the file is in the app's private folder; desktops
             // use the keyring, which the CLI shares.
@@ -153,6 +169,16 @@ pub fn run() {
                 previews: preview::Previews::new(preview_dir),
                 streams: stream::Streams::default(),
             });
+            #[cfg(target_os = "windows")]
+            {
+                // Allocate only after the single-instance check, so repeated
+                // launches do not leave unused temporary directories behind.
+                let cache = tempfile::Builder::new()
+                    .prefix("belka-webview-")
+                    .tempdir()?;
+                webview_cache::create_window(app, cache.path())?;
+                *webview_cache_setup.lock().unwrap() = Some(cache);
+            }
             #[cfg(target_os = "windows")]
             if let Err(err) = tray::install(app.handle()) {
                 // A failed tray setup must leave a normal, closable window.
@@ -179,6 +205,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ui_state::load_ui_state,
+            ui_state::remember_ui_state,
             commands::app::app_ready,
             commands::accounts::list_accounts,
             commands::accounts::add_account,
@@ -232,6 +260,37 @@ pub fn run() {
             commands::backup::backup_run,
             commands::backup::backup_cancel
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application");
+    #[cfg(target_os = "windows")]
+    {
+        // App::run exits the process directly and skips destructors. Returning
+        // from the event loop lets WebView2 close before removing its profile.
+        let mut closing_webviews = false;
+        let code = app.run_return(move |app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let windows = app.webview_windows();
+                if !closing_webviews && !windows.is_empty() {
+                    // Dropping the event loop alone leaves COM handles alive.
+                    // Destroy WebViews while it is still processing messages;
+                    // destroying the last window requests exit again.
+                    closing_webviews = true;
+                    api.prevent_exit();
+                    for window in windows.into_values() {
+                        if let Err(err) = window.destroy() {
+                            tracing::warn!("Cannot close browser window: {err}");
+                            app.exit(1);
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(cache) = webview_cache.lock().unwrap().take() {
+            webview_cache::cleanup(cache.path());
+            drop(cache);
+        }
+        std::process::exit(code);
+    }
+    #[cfg(not(target_os = "windows"))]
+    app.run(|_, _| {});
 }
