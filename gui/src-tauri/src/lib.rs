@@ -5,6 +5,8 @@ mod native;
 mod preview;
 mod stream;
 mod transfers;
+#[cfg(target_os = "windows")]
+mod tray;
 
 use anyhow::Result;
 use belka_core::storage::crypt::CryptProvider;
@@ -105,7 +107,12 @@ pub fn run() {
         .with(filter)
         .init();
 
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        tray::show(app);
+    }));
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -123,6 +130,12 @@ pub fn run() {
             .build(),
     );
     builder
+        .on_window_event(|_window, _event| {
+            #[cfg(target_os = "windows")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
+                tray::close(_window, api);
+            }
+        })
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let preview_dir = app.path().app_cache_dir()?.join("preview");
@@ -140,6 +153,11 @@ pub fn run() {
                 previews: preview::Previews::new(preview_dir),
                 streams: stream::Streams::default(),
             });
+            #[cfg(target_os = "windows")]
+            if let Err(err) = tray::install(app.handle()) {
+                // A failed tray setup must leave a normal, closable window.
+                tracing::warn!("Cannot create the tray icon: {err:#}");
+            }
             // WorkManager keeps the schedule across restarts; this only
             // repairs it, say after the app data was restored. On desktops
             // the app runs due tasks itself while it is open.
@@ -151,6 +169,9 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     if !window.is_visible().unwrap_or(true) {
+                        #[cfg(target_os = "windows")]
+                        tray::show_when_ready(window.app_handle());
+                        #[cfg(not(target_os = "windows"))]
                         let _ = window.show();
                     }
                 });
@@ -158,6 +179,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::app::app_ready,
             commands::accounts::list_accounts,
             commands::accounts::add_account,
             commands::accounts::add_crypt_folder,

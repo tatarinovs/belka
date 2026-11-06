@@ -498,6 +498,11 @@ pub fn is_running(id: &str) -> bool {
     with_running(|running| running.contains_key(id))
 }
 
+/// Tasks running in this process, including ones removed from the task list.
+pub fn running_ids() -> Vec<String> {
+    with_running(|running| running.keys().cloned().collect())
+}
+
 /// Stops a run; what it uploaded so far stays remembered.
 pub fn cancel(id: &str) {
     with_running(|running| {

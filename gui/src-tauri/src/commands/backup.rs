@@ -90,6 +90,10 @@ pub fn backup_cancel(id: String) {
 /// Runs a task in the app's own runtime.
 fn spawn_run(app: tauri::AppHandle, id: String) {
     tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "windows")]
+        if crate::tray::exiting(&app) {
+            return;
+        }
         let state = app.state::<AppState>();
         let provider = |account: &str| state.provider(account);
         if let Err(err) = tasks::run(&state.tasks, &id, &provider).await {
@@ -105,6 +109,10 @@ pub fn start_scheduler(app: tauri::AppHandle) {
         // Give the window time to appear before the first run.
         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
         loop {
+            #[cfg(target_os = "windows")]
+            if crate::tray::exiting(&app) {
+                return;
+            }
             let now = chrono::Utc::now();
             let due: Vec<String> = app
                 .state::<AppState>()

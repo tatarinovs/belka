@@ -15,7 +15,7 @@ use belka_core::{Progress, RemoteFileInfo, StorageProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::async_runtime::{spawn, JoinHandle};
 use tokio::sync::Semaphore;
@@ -208,6 +208,7 @@ pub struct Activity {
 }
 
 pub struct Transfers {
+    closing: AtomicBool,
     jobs: Mutex<Vec<Job>>,
     next_id: AtomicU64,
     finished_seq: AtomicU64,
@@ -227,6 +228,7 @@ impl Transfers {
         // Left by copies that were running when the app closed.
         let _ = std::fs::remove_dir_all(&temp_dir);
         Arc::new(Self {
+            closing: AtomicBool::new(false),
             jobs: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             finished_seq: AtomicU64::new(1),
@@ -261,7 +263,11 @@ impl Transfers {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let progress = Progress::new();
         progress.set_total(spec.size);
-        self.jobs.lock().unwrap().push(Job {
+        let mut jobs = self.jobs.lock().unwrap();
+        if self.closing.load(Ordering::Acquire) {
+            return 0;
+        }
+        jobs.push(Job {
             id,
             spec: spec.clone(),
             status: Status::Queued,
@@ -270,6 +276,7 @@ impl Transfers {
             finished: 0,
             unchanged: false,
         });
+        drop(jobs);
         self.start(id, spec, progress, provider, source);
         id
     }
@@ -588,6 +595,24 @@ impl Transfers {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn active_count(&self) -> usize {
+        self.jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| j.status.is_active())
+            .count()
+    }
+
+    /// Stop accepting jobs before cancelling, including scans still preparing
+    /// their upload plans while the user confirms exiting.
+    #[cfg(target_os = "windows")]
+    pub fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.cancel_all();
+    }
+
     /// Requeues a failed or cancelled transfer. Returns its spec so the
     /// caller can resolve the providers, or `None` if there is nothing to retry.
     pub fn retry_spec(&self, id: u64) -> Option<Spec> {
@@ -606,6 +631,9 @@ impl Transfers {
     ) -> bool {
         let (spec, progress) = {
             let mut jobs = self.jobs.lock().unwrap();
+            if self.closing.load(Ordering::Acquire) {
+                return false;
+            }
             let Some(job) = jobs
                 .iter_mut()
                 .find(|j| j.id == id && !j.status.is_active() && j.status != Status::Done)
@@ -747,6 +775,27 @@ mod tests {
             .view_items
             .unwrap();
         assert_eq!(cancelled.iter().map(|j| j.id).collect::<Vec<_>>(), [151]);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn shutdown_cancels_active_jobs_and_preserves_finished_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transfers = Transfers::new(tmp.path().join("copy"));
+        {
+            let mut jobs = transfers.jobs.lock().unwrap();
+            jobs.push(job(1, Status::Queued, 0));
+            jobs.push(job(2, Status::Running, 0));
+            jobs.push(job(3, Status::Done, 1));
+        }
+        assert_eq!(transfers.active_count(), 2);
+        transfers.shutdown();
+        transfers.shutdown();
+        assert!(transfers.closing.load(Ordering::Acquire));
+        assert_eq!(transfers.active_count(), 0);
+        let list = transfers.list();
+        assert_eq!(list.counts.cancelled, 2);
+        assert_eq!(list.counts.done, 1);
     }
 
     #[test]

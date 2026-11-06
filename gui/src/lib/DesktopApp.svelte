@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
   import { api, errorText, newBackupTask, type Account, type BackupTask, type Entry } from "$lib/api";
@@ -465,7 +464,7 @@
       .finally(async () => {
         // The window starts hidden so the user never sees a blank webview.
         await tick();
-        getCurrentWindow().show();
+        api.appReady().catch((err) => (notice = errorText(err)));
       });
 
     const offFinished = transfers.onFinished((t) => {

@@ -5,6 +5,21 @@ use crate::native;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// The frontend is drawn. On Windows a close made during startup stays hidden.
+#[tauri::command]
+pub fn app_ready(app: tauri::AppHandle) -> CmdResult<()> {
+    #[cfg(target_os = "windows")]
+    crate::tray::show_when_ready(&app);
+    #[cfg(not(target_os = "windows"))]
+    {
+        use tauri::Manager;
+        if let Some(window) = app.get_webview_window("main") {
+            window.show().map_err(anyhow::Error::from)?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the app may browse the shared storage; always on desktops.
 #[tauri::command]
 pub fn storage_access(app: tauri::AppHandle) -> bool {

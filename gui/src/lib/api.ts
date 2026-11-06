@@ -203,6 +203,7 @@ export function newBackupTask(local: string, accountId: string, remote = ""): Ba
 }
 
 export const api = {
+  appReady: () => invoke<void>("app_ready"),
   listAccounts: () => invoke<Account[]>("list_accounts"),
   addAccount: (name: string, config: ProviderConfig) =>
     invoke<Account>("add_account", { name, config }),
