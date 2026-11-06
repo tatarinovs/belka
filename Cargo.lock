@@ -363,6 +363,7 @@ dependencies = [
  "tracing-subscriber",
  "trash",
  "windows-sys 0.61.2",
+ "winreg",
 ]
 
 [[package]]

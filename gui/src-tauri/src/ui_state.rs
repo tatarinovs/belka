@@ -27,6 +27,23 @@ impl UiState {
         })
     }
 
+    pub fn close_to_tray(&self) -> bool {
+        self.values
+            .lock()
+            .unwrap()
+            .get("desktop.closeToTray")
+            .is_some_and(|v| v == "true")
+    }
+
+    pub fn set_close_to_tray(&self, enabled: bool) -> Result<()> {
+        let mut current = self.values.lock().unwrap();
+        let mut next = current.clone();
+        next.insert("desktop.closeToTray".into(), enabled.to_string());
+        self.save(&next)?;
+        *current = next;
+        Ok(())
+    }
+
     fn save(&self, values: &Values) -> Result<()> {
         std::fs::create_dir_all(self.file.parent().unwrap())?;
         let temporary = self.file.with_extension("json.tmp");
@@ -53,6 +70,18 @@ pub fn remember_ui_state(state: State<'_, UiState>, key: String, value: String) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_to_tray_preference_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = UiState::new(dir.path()).unwrap();
+        assert!(!state.close_to_tray());
+        state.set_close_to_tray(true).unwrap();
+        let state = UiState::new(dir.path()).unwrap();
+        assert!(state.close_to_tray());
+        state.set_close_to_tray(false).unwrap();
+        assert!(!UiState::new(dir.path()).unwrap().close_to_tray());
+    }
 
     #[test]
     fn settings_survive_browser_profile_disposal() {

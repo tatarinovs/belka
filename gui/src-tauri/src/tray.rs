@@ -1,4 +1,4 @@
-//! Windows window lifetime: close hides, only explicit exit stops the app.
+//! Windows window lifetime and graceful shutdown.
 use crate::AppState;
 use anyhow::Result;
 use belka_store::tasks;
@@ -51,6 +51,14 @@ pub fn close(window: &tauri::Window, api: &tauri::CloseRequestApi) {
         return;
     }
     api.prevent_close();
+    if !window
+        .app_handle()
+        .state::<crate::ui_state::UiState>()
+        .close_to_tray()
+    {
+        request_exit(window.app_handle());
+        return;
+    }
     match window.hide() {
         Ok(()) => {
             if let Some(state) = window.app_handle().try_state::<TrayState>() {

@@ -3,6 +3,7 @@ mod error;
 mod local;
 mod native;
 mod preview;
+mod settings;
 mod stream;
 mod transfers;
 #[cfg(target_os = "windows")]
@@ -205,6 +206,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            settings::get_desktop_settings,
+            settings::set_close_to_tray,
+            settings::set_autostart,
             ui_state::load_ui_state,
             ui_state::remember_ui_state,
             commands::app::app_ready,

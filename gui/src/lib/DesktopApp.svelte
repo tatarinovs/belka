@@ -16,6 +16,7 @@
   import AccountMenu from "$lib/components/AccountMenu.svelte";
   import AccountDialog from "$lib/components/AccountDialog.svelte";
   import AboutDialog from "$lib/components/AboutDialog.svelte";
+  import SettingsDialog from "$lib/components/SettingsDialog.svelte";
   import AccountsDialog from "$lib/components/AccountsDialog.svelte";
   import BackupScreen from "$lib/components/BackupScreen.svelte";
   import FilePane, { type PaneOps } from "$lib/components/FilePane.svelte";
@@ -57,6 +58,7 @@
   let backups = $state(false);
   let backupDraft = $state<BackupTask | null>(null);
   let about = $state(false);
+  let settings = $state(false);
   let shortcuts = $state(false);
   let savedLocations = $state(false);
   let notice = $state("");
@@ -516,15 +518,12 @@
     >
       <Icon name="cloud" /> Аккаунты
     </button>
-    <button class="tool" title="Регулярное копирование папок компьютера в облако" onclick={() => (backups = true)}>
-      <Icon name="clock" /> Автобэкап
-    </button>
     <button class="tool" title="Избранные папки и сохранённые пары панелей" onclick={() => (savedLocations = true)}>
       <Icon name="star" /> Избранное
     </button>
     <span class="spacer"></span>
-    <button class="tool" onclick={() => (about = true)}>
-      <Icon name="info" /> О приложении
+    <button class="tool" onclick={() => (settings = true)}>
+      <Icon name="settings" /> Настройки
     </button>
   </header>
 
@@ -774,6 +773,9 @@
   onimported={importedAccounts}
 />
 
+{#if settings}
+  <SettingsDialog onclose={() => (settings = false)} onbackup={() => (backups = true)} onabout={() => (about = true)} />
+{/if}
 <AboutDialog open={about} onclose={() => (about = false)} />
 
 <SavedLocations open={savedLocations} {accounts}
