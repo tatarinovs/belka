@@ -123,6 +123,13 @@ enum UploadState {
     Incomplete(u64),
 }
 
+fn unique_child(mut files: Vec<DriveFile>, name: &str) -> Result<Option<DriveFile>> {
+    if files.len() > 1 {
+        bail!("Google Drive has several items named '{name}' in this folder; rename duplicates in Google Drive before using this path");
+    }
+    Ok(files.pop())
+}
+
 /// Escapes a value for use inside single quotes in a Drive `q` expression.
 fn escape_query(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
@@ -269,7 +276,7 @@ impl GoogleDriveProvider {
             Some(false) => q.push_str(&format!(" and mimeType != '{FOLDER_MIME}'")),
             None => {}
         }
-        Ok(self.query_files(&q, Some(1)).await?.into_iter().next())
+        unique_child(self.query_files(&q, Some(2)).await?, name)
     }
 
     /// Resolves a folder path to its id, optionally creating missing folders.
@@ -628,6 +635,9 @@ async fn classify_upload_response(resp: Response) -> Result<UploadState, Failure
 
 #[async_trait]
 impl StorageProvider for GoogleDriveProvider {
+    fn supports_create_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "Google Drive"
     }
@@ -970,6 +980,22 @@ impl StorageProvider for GoogleDriveProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambiguous_names_never_select_an_arbitrary_object() {
+        let file = |id: &str| {
+            serde_json::from_value::<DriveFile>(json!({"id":id,"name":"same.txt"})).unwrap()
+        };
+        assert!(unique_child(vec![], "same.txt").unwrap().is_none());
+        assert_eq!(
+            unique_child(vec![file("one")], "same.txt")
+                .unwrap()
+                .unwrap()
+                .id,
+            "one"
+        );
+        assert!(unique_child(vec![file("one"), file("two")], "same.txt").is_err());
+    }
 
     #[test]
     fn escapes_query_values() {

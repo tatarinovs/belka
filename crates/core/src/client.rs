@@ -16,9 +16,10 @@ use std::fmt::Display;
 use std::future::Future;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
 pub const USER_AGENT: &str = concat!("belka/", env!("CARGO_PKG_VERSION"));
@@ -449,27 +450,40 @@ pub trait Sink: Send {
     async fn reset(&mut self) -> Result<()>;
 }
 
-/// Writes into `<dest>.belka.part`, which replaces `dest` on [`PartSink::commit`].
+/// Writes into an exclusively created temporary file next to `dest`, which
+/// replaces `dest` on [`PartSink::commit`].
 /// The partial file is removed when the sink is dropped without committing,
 /// which is how a cancelled download cleans up. A complete download that
-/// cannot be moved into place stays there. The suffix is unusual so that a
-/// real file such as `video.mkv.part` next to `video.mkv` is never taken.
+/// cannot be moved into place stays there. Each sink owns only the file it
+/// created, including when another transfer targets the same destination.
 pub struct PartSink {
     path: PathBuf,
     file: Option<tokio::fs::File>,
     len: u64,
     committed: bool,
+    owned: bool,
 }
 
 impl PartSink {
     pub fn new(dest: &Path) -> Self {
-        let mut name = dest.file_name().unwrap_or_default().to_os_string();
-        name.push(".belka.part");
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Keep the temporary component short even when the destination name
+        // already uses the filesystem's full name-length allowance.
+        let name = format!(
+            ".belka-{}-{}-{}.part",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
         Self {
             path: dest.with_file_name(name),
             file: None,
             len: 0,
             committed: false,
+            owned: false,
         }
     }
 
@@ -539,11 +553,20 @@ impl Sink for PartSink {
     }
 
     async fn reset(&mut self) -> Result<()> {
-        self.file = None;
-        let file = tokio::fs::File::create(&self.path)
-            .await
-            .with_context(|| format!("Failed to create '{}'", self.path.display()))?;
-        self.file = Some(file);
+        if let Some(file) = &mut self.file {
+            file.set_len(0).await?;
+            file.seek(SeekFrom::Start(0)).await?;
+        } else {
+            // Open synchronously so cancellation cannot happen between file
+            // creation and taking ownership of it. Payload I/O stays async.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)
+                .with_context(|| format!("Failed to create '{}'", self.path.display()))?;
+            self.owned = true;
+            self.file = Some(tokio::fs::File::from_std(file));
+        }
         self.len = 0;
         Ok(())
     }
@@ -553,7 +576,7 @@ impl Drop for PartSink {
     fn drop(&mut self) {
         // Windows cannot delete a file that is still open.
         self.file = None;
-        if !self.committed {
+        if self.owned && !self.committed {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -581,7 +604,7 @@ impl Sink for MemorySink {
 }
 
 /// Downloads into `dest` with retries; see [`download_into`]. Data goes to
-/// `<dest>.part`, which replaces `dest` only once complete.
+/// a unique temporary file, which replaces `dest` only once complete.
 pub async fn download<F, Fut>(op: &str, dest: &Path, progress: &Progress, request: F) -> Result<u64>
 where
     F: FnMut() -> Fut,
@@ -634,8 +657,14 @@ where
     // A failure after new data does not use up an attempt, so a long
     // download survives a flaky connection as long as it moves on.
     let mut furthest = 0;
+    let mut version = DownloadVersion::default();
     loop {
-        match download_attempt(sink, progress, request(), &check).await {
+        // Without a strong validator a partial response cannot safely be
+        // combined with a later version, even if the sizes happen to match.
+        if sink.position() > 0 && version.etag.is_none() {
+            sink.reset().await?;
+        }
+        match download_attempt(sink, progress, request(), &check, &mut version).await {
             Ok(size) => return Ok(size),
             Err(Failure::Transient(err)) if attempt < MAX_ATTEMPTS => {
                 if sink.position() > furthest {
@@ -650,11 +679,18 @@ where
     }
 }
 
+#[derive(Default)]
+struct DownloadVersion {
+    etag: Option<header::HeaderValue>,
+    total: Option<u64>,
+}
+
 async fn download_attempt<C>(
     sink: &mut dyn Sink,
     progress: &Progress,
     request: impl Future<Output = Result<RequestBuilder>>,
     check: &C,
+    version: &mut DownloadVersion,
 ) -> std::result::Result<u64, Failure>
 where
     C: Fn(&Response, Option<u64>) -> std::result::Result<(), Failure>,
@@ -663,6 +699,9 @@ where
     let mut req = request.await?;
     if offset > 0 {
         req = req.header(header::RANGE, format!("bytes={offset}-"));
+        if let Some(etag) = &version.etag {
+            req = req.header(header::IF_RANGE, etag);
+        }
     }
     let started = std::time::Instant::now();
     let mut resp = match tokio::time::timeout(API_TIMEOUT, req.send()).await {
@@ -683,22 +722,43 @@ where
         resp.content_length()
             .map_or_else(|| "unknown".to_string(), |n| n.to_string())
     );
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .filter(|value| {
+            value
+                .to_str()
+                .is_ok_and(|s| s.starts_with('"') && s.ends_with('"'))
+        })
+        .cloned();
     let (mut pos, expected) = if offset > 0 && status == StatusCode::PARTIAL_CONTENT {
         match parse_content_range(&resp) {
-            Some((start, total)) if start == offset => (offset, total),
+            Some((start, total))
+                if start == offset
+                    && version.etag == etag
+                    && version.etag.is_some()
+                    && version.total == total =>
+            {
+                (offset, total)
+            }
             _ => {
                 // Not the range we asked for: start over.
                 sink.reset().await?;
+                *version = DownloadVersion::default();
                 return Err(Failure::Transient(anyhow!(
                     "server returned an unexpected range"
                 )));
             }
         }
-    } else if status.is_success() {
+    } else if status.is_success() && status != StatusCode::PARTIAL_CONTENT {
         // A full response: either a fresh start or the server ignored Range.
         if offset > 0 {
             sink.reset().await?;
         }
+        *version = DownloadVersion {
+            etag,
+            total: resp.content_length(),
+        };
         (0, resp.content_length())
     } else if offset > 0 && status == StatusCode::RANGE_NOT_SATISFIABLE {
         sink.reset().await?;

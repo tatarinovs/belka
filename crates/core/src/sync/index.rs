@@ -18,9 +18,8 @@ pub struct Index {
 struct Data {
     /// Where the files were backed up to. An index made for another target
     /// says nothing about this one and is dropped on load.
-    #[serde(default)]
     target: String,
-    files: HashMap<String, (u64, i64)>,
+    files: HashMap<String, (u64, u64, u32)>,
     /// Files backed up under another name, because theirs was taken in the
     /// cloud by a different file: relative path -> relative cloud path.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -68,7 +67,7 @@ impl Index {
 
     /// The file is backed up as it is now.
     pub fn is_current(&self, file: &LocalFile) -> bool {
-        self.data.files.get(&file.relative) == Some(&file.stamp())
+        file.modified.is_some() && self.data.files.get(&file.relative) == Some(&file.stamp())
     }
 
     /// The file was backed up at some point, maybe in another version.

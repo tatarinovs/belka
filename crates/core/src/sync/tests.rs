@@ -20,6 +20,7 @@ pub(crate) struct FakeCloud {
     /// Files someone else writes while `upload_new` is on its way there:
     /// it then fails with `AlreadyExists`, like on Synology.
     pub sneak_in: Mutex<HashMap<String, Vec<u8>>>,
+    pub no_create_only: bool,
 }
 
 fn md5_hex(data: &[u8]) -> String {
@@ -68,6 +69,9 @@ impl FakeCloud {
 
 #[async_trait]
 impl StorageProvider for FakeCloud {
+    fn supports_create_only(&self) -> bool {
+        !self.no_create_only
+    }
     fn name(&self) -> &str {
         "fake"
     }
@@ -149,6 +153,61 @@ fn write(root: &Path, relative: &str, data: &[u8]) {
     let path = root.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, data).unwrap();
+}
+
+#[tokio::test]
+async fn extra_folders_preserve_nested_include_and_hidden_protections() {
+    let cloud = FakeCloud::default();
+    for path in [
+        "/B/old/keep.dat",
+        "/B/old/gone.txt",
+        "/B/hidden/.private",
+        "/B/hidden/gone.txt",
+    ] {
+        cloud.put(path, b"x");
+    }
+    let filter = Filter::new(&["*.txt".into()], &[], true);
+    delete_extra(&cloud, &LocalTree::default(), "/B", &filter, false)
+        .await
+        .unwrap();
+    let files = cloud.files.lock().unwrap();
+    assert!(files.contains_key("/B/old/keep.dat"));
+    assert!(files.contains_key("/B/hidden/.private"));
+    assert!(!files.contains_key("/B/old/gone.txt"));
+    assert!(!files.contains_key("/B/hidden/gone.txt"));
+}
+
+#[tokio::test]
+async fn unsafe_create_backends_get_unique_stable_backup_names() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "photo.jpg", b"one");
+    let tree = scan(dir.path(), &Filter::all()).unwrap();
+    let cloud = FakeCloud {
+        no_create_only: true,
+        ..FakeCloud::default()
+    };
+    let a = Mutex::new(Index::load(dir.path().join("a.json"), "a"));
+    let b = Mutex::new(Index::load(dir.path().join("b.json"), "b"));
+    let opts = UploadOptions {
+        keep_both: true,
+        ..UploadOptions::default()
+    };
+    upload(&cloud, &tree, "/B", Some(&a), &opts, &())
+        .await
+        .unwrap();
+    upload(&cloud, &tree, "/B", Some(&b), &opts, &())
+        .await
+        .unwrap();
+    let first = a.lock().unwrap().cloud_path("photo.jpg").to_string();
+    let second = b.lock().unwrap().cloud_path("photo.jpg").to_string();
+    assert_ne!(first, second);
+    assert!(first.ends_with(".jpg"));
+    assert_eq!(cloud.files.lock().unwrap().len(), 2);
+    let summary = upload(&cloud, &tree, "/B", Some(&a), &opts, &())
+        .await
+        .unwrap();
+    assert_eq!(summary.unchanged, 1);
+    assert_eq!(a.lock().unwrap().cloud_path("photo.jpg"), first);
 }
 
 fn relatives(tree: &LocalTree) -> Vec<&str> {

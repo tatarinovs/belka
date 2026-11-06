@@ -4,9 +4,15 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
+    "core:app:allow-version",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
     "core:window:allow-show",
-    "opener:default",
-    "dialog:default"
+    "opener:allow-open-url",
+    "opener:allow-default-urls",
+    "opener:allow-reveal-item-in-dir",
+    "dialog:allow-message",
+    "dialog:allow-open",
+    "dialog:allow-save"
   ]
 }

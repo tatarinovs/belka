@@ -13,10 +13,10 @@ use belka_core::sync::{self, LocalFile};
 use belka_core::utils::path::split_remote;
 use belka_core::{Progress, RemoteFileInfo, StorageProvider};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use tauri::async_runtime::{spawn, JoinHandle};
 use tokio::sync::Semaphore;
 
@@ -213,6 +213,7 @@ pub struct Transfers {
     next_id: AtomicU64,
     finished_seq: AtomicU64,
     slots: Arc<Semaphore>,
+    destinations: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Remote folders already created, as (account id, path). Folder creation
     /// is serialized so parallel uploads never create the same folder twice
     /// (Google Drive would happily make duplicates).
@@ -233,6 +234,7 @@ impl Transfers {
             next_id: AtomicU64::new(1),
             finished_seq: AtomicU64::new(1),
             slots: Arc::new(Semaphore::new(MAX_PARALLEL)),
+            destinations: Mutex::new(HashMap::new()),
             ensured: tokio::sync::Mutex::new(HashSet::new()),
             temp_dir,
             temp_seq: AtomicU64::new(1),
@@ -260,13 +262,15 @@ impl Transfers {
         provider: Arc<dyn StorageProvider>,
         source: Option<Arc<dyn StorageProvider>>,
     ) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let progress = Progress::new();
         progress.set_total(spec.size);
         let mut jobs = self.jobs.lock().unwrap();
         if self.closing.load(Ordering::Acquire) {
             return 0;
         }
+        // IDs and insertion order advance under the same lock, including
+        // concurrent producers. Lookups can therefore use binary search.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         jobs.push(Job {
             id,
             spec: spec.clone(),
@@ -308,7 +312,7 @@ impl Transfers {
             };
             this.update(id, status, unchanged);
         });
-        if let Some(job) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
+        if let Some(job) = job_mut(&mut self.jobs.lock().unwrap(), id) {
             job.handle = Some(handle);
         }
     }
@@ -317,7 +321,7 @@ impl Transfers {
     /// (cancelled meanwhile), so a late result never overrides a cancellation.
     fn update(&self, id: u64, status: Status, unchanged: bool) -> bool {
         let mut jobs = self.jobs.lock().unwrap();
-        match jobs.iter_mut().find(|j| j.id == id) {
+        match job_mut(&mut jobs, id) {
             Some(job) if job.status.is_active() => {
                 if !status.is_active() {
                     job.finished = self.finished_seq.fetch_add(1, Ordering::Relaxed);
@@ -339,6 +343,21 @@ impl Transfers {
         source: Option<&Arc<dyn StorageProvider>>,
         progress: &Progress,
     ) -> Result<bool> {
+        let key = match spec.direction {
+            Direction::Download => format!("local:{}", local_destination_key(&spec.local)?),
+            _ => format!("cloud:{}:{}", spec.account_id, spec.remote),
+        };
+        let destination = {
+            let mut locks = self.destinations.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks
+                .get(&key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        };
+        let _destination = destination.lock().await;
         tracing::debug!(
             "{:?} '{}' <-> '{}' ({})",
             spec.direction,
@@ -572,7 +591,7 @@ impl Transfers {
     /// the provider call, which cleans up partial data.
     pub fn cancel(&self, id: u64) {
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.iter_mut().find(|j| j.id == id && j.status.is_active()) {
+        if let Some(job) = job_mut(&mut jobs, id).filter(|j| j.status.is_active()) {
             job.status = Status::Cancelled;
             job.finished = self.finished_seq.fetch_add(1, Ordering::Relaxed);
             if let Some(handle) = job.handle.take() {
@@ -634,9 +653,8 @@ impl Transfers {
             if self.closing.load(Ordering::Acquire) {
                 return false;
             }
-            let Some(job) = jobs
-                .iter_mut()
-                .find(|j| j.id == id && !j.status.is_active() && j.status != Status::Done)
+            let Some(job) = job_mut(&mut jobs, id)
+                .filter(|j| !j.status.is_active() && j.status != Status::Done)
             else {
                 return false;
             };
@@ -657,6 +675,48 @@ impl Transfers {
     }
 }
 
+fn job_mut(jobs: &mut [Job], id: u64) -> Option<&mut Job> {
+    let index = jobs.binary_search_by_key(&id, |job| job.id).ok()?;
+    jobs.get_mut(index)
+}
+
+fn local_destination_key(path: &Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut parent = absolute
+        .parent()
+        .context("Destination has no parent")?
+        .to_path_buf();
+    let mut missing = vec![absolute
+        .file_name()
+        .context("Destination has no name")?
+        .to_os_string()];
+    // Resolve the existing ancestor so creating a parent does not change
+    // the lock key (including Windows' canonical path prefix and junctions).
+    while !parent.exists() {
+        missing.push(
+            parent
+                .file_name()
+                .context("Destination has no existing ancestor")?
+                .to_os_string(),
+        );
+        parent.pop();
+    }
+    let mut resolved = std::fs::canonicalize(parent)?;
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    let key = resolved.to_string_lossy().into_owned();
+    Ok(if cfg!(windows) {
+        key.to_lowercase()
+    } else {
+        key
+    })
+}
+
 /// Whether two cloud files hold the same data: the same size, and the same
 /// MD5 where both clouds keep one, else the same date (copies keep it).
 fn same_content(a: &RemoteFileInfo, b: &RemoteFileInfo) -> bool {
@@ -673,6 +733,15 @@ fn same_content(a: &RemoteFileInfo, b: &RemoteFileInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destination_lock_survives_parent_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("new/sub/file.txt");
+        let before = local_destination_key(&dest).unwrap();
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        assert_eq!(before, local_destination_key(&dest).unwrap());
+    }
 
     fn job(id: u64, status: Status, finished: u64) -> Job {
         Job {

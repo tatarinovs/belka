@@ -56,3 +56,5 @@ tmp_downloads/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+docs/*.md

@@ -82,6 +82,13 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    // Opt-in for APKs downloaded directly: a smaller archive, with native
+    // libraries extracted at installation. Default packaging stays mmap-able.
+    if (providers.gradleProperty("belkaCompressNative").orNull == "true") {
+        packaging {
+            jniLibs.useLegacyPackaging = true
+        }
+    }
 }
 
 kotlin {

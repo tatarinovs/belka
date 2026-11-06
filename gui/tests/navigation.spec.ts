@@ -41,7 +41,9 @@ test.beforeEach(async ({ page }) => {
           }
           case "list_local": return {
             path: args.path ?? "", parent: args.path ? "" : null,
-            crumbs: args.path ? [{ name: "Folder", path: args.path }] : [],
+            crumbs: (args.path ?? "").split("/").filter(Boolean).map((name, i, parts) => ({
+              name, path: `${args.path?.startsWith("/") ? "/" : ""}${parts.slice(0, i + 1).join("/")}`,
+            })),
             entries: args.path ? entries(args.path) : [{ name: "Local disk", path: "/Folder", is_dir: true, size: 0, modified: null, icon: "drive" }],
           };
           case "cloud_copy": case "download": case "upload":
@@ -74,6 +76,45 @@ test.afterEach(async ({ page }) => {
 
 const pane = (page: Page, side = "cloud") => page.locator(`[data-pane="${side === "cloud" ? "left" : side === "local" ? "right" : side}"]`);
 const grid = (page: Page, side = "cloud") => pane(page, side).getByRole("grid");
+
+for (const kind of ["local", "cloud"] as const) {
+  test(`long ${kind} breadcrumbs stay separated and show the current folder after resizing`, async ({ page }) => {
+    const names = ["PROJECT", "belka", "target", "gui-final-smoke-profile", "local", "ui-download-" + "long-name-".repeat(20)];
+    const target = `${kind === "local" ? "D:/" : "/"}${names.join("/")}`;
+    await grid(page).focus();
+    await page.keyboard.press("Control+l");
+    await pane(page).getByLabel("Путь к папке", { exact: true }).fill(target);
+    await page.keyboard.press("Enter");
+    const crumbs = pane(page).getByRole("navigation", { name: "Путь", exact: true });
+    await expect(crumbs.getByRole("button").last()).toHaveText(names.at(-1)!);
+    await expect(crumbs.getByRole("button").last()).toHaveAttribute("title", target);
+    for (const width of [1440, 900, 1280]) {
+      await page.setViewportSize({ width, height: 800 });
+      await expect.poll(() => crumbs.evaluate((nav) => {
+        const bounds = nav.getBoundingClientRect();
+        const items = [...nav.children];
+        const last = items.at(-1)!.getBoundingClientRect();
+        return {
+          scrollable: nav.scrollWidth > nav.clientWidth,
+          currentVisible: last.left >= bounds.left - 1 && last.right <= bounds.right + 1,
+          separated: items.every((item, i) => !i || item.getBoundingClientRect().left >= items[i - 1].getBoundingClientRect().right),
+          arrowsIntact: [...nav.querySelectorAll(":scope > svg")].every((svg) => svg.getBoundingClientRect().width === 12),
+          textContained: [...nav.querySelectorAll("button span")].every((span) => {
+            const box = span.getBoundingClientRect();
+            const button = span.parentElement!.getBoundingClientRect();
+            return box.width === 0 || (box.left >= button.left && box.right <= button.right + 1 && getComputedStyle(span).overflow === "hidden");
+          }),
+        };
+      })).toEqual({ scrollable: true, currentVisible: true, separated: true, arrowsIntact: true, textContained: true });
+      await expect(pane(page).getByLabel("Обновить", { exact: true })).toBeInViewport();
+    }
+    // Ancestors remain reachable by keyboard even when scrolled out of view.
+    await crumbs.getByRole("button").first().focus();
+    await expect(crumbs.getByRole("button").first()).toBeInViewport();
+    await page.keyboard.press("Enter");
+    await expect(pane(page).locator('.row[data-path="cloud://one/"]')).toBeVisible();
+  });
+}
 
 async function expectKeyboard(page: Page, side = "cloud") {
   await expect(grid(page, side)).toBeFocused();

@@ -291,6 +291,21 @@ impl AccountStore {
         }
 
         let added = new.len();
+        // A same-id base in this store takes precedence over the export.
+        // Validate the resulting graph too, before any credentials are written.
+        for saved in &new {
+            if saved.account.kind == CRYPT_KIND {
+                let folder: CryptFolder = serde_json::from_str(&saved.secret)?;
+                let base = accounts
+                    .iter()
+                    .chain(new.iter().map(|s| &s.account))
+                    .find(|a| a.id == folder.base)
+                    .context("The base account is missing")?;
+                if base.kind == CRYPT_KIND {
+                    bail!("An encrypted folder cannot be placed inside another one");
+                }
+            }
+        }
         let mut written = Vec::new();
         let result = new.iter().try_for_each(|saved| {
             self.secrets.set(&saved.account.id, &saved.secret)?;
@@ -343,7 +358,6 @@ impl AccountSource for AccountStore {
 #[derive(Serialize, Deserialize)]
 pub struct Backup {
     accounts: Vec<SavedAccount>,
-    #[serde(default)]
     oauth_apps: Vec<SavedOAuthApp>,
 }
 
@@ -365,29 +379,39 @@ impl Backup {
     /// Opens the bytes of a `.belka` file.
     pub fn open(file: &[u8], password: &str) -> Result<Self> {
         let data = belka_core::crypt::unseal(password, file)?;
-        let mut backup: Self = serde_json::from_slice(&data).context("The file is damaged")?;
+        let backup: Self = serde_json::from_slice(&data).context("The file is damaged")?;
         backup.check()?;
-        for saved in &mut backup.accounts {
-            if saved.account.kind == CRYPT_KIND {
-                let folder: CryptFolder = serde_json::from_str(&saved.secret)?;
-                saved.account.crypt = Some(CryptLocation {
-                    base: folder.base,
-                    root: folder.root,
-                });
-            }
-        }
         Ok(backup)
     }
 
     /// Every entry must be readable before anything is used.
     fn check(&self) -> Result<()> {
+        let ids: std::collections::HashSet<_> =
+            self.accounts.iter().map(|s| &s.account.id).collect();
+        if ids.len() != self.accounts.len() {
+            bail!("The export contains duplicate account IDs");
+        }
         for SavedAccount { account, secret } in &self.accounts {
             let corrupted = || format!("The settings of account «{}» are corrupted", account.name);
             if account.name.trim().is_empty() || account.id.is_empty() {
                 bail!(corrupted());
             }
             if account.kind == CRYPT_KIND {
-                serde_json::from_str::<CryptFolder>(secret).with_context(corrupted)?;
+                let folder = serde_json::from_str::<CryptFolder>(secret).with_context(corrupted)?;
+                if folder.config.password.is_empty() {
+                    bail!(corrupted());
+                }
+
+                let base = self
+                    .accounts
+                    .iter()
+                    .find(|saved| saved.account.id == folder.base)
+                    .with_context(|| {
+                        format!("The base account of «{}» is missing", account.name)
+                    })?;
+                if base.account.kind == CRYPT_KIND {
+                    bail!("An encrypted folder cannot be placed inside another one");
+                }
             } else {
                 let config: ProviderConfig =
                     serde_json::from_str(secret).with_context(corrupted)?;
@@ -453,6 +477,19 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_crypt_graph_before_import() {
+        let secret =
+            serde_json::json!({"base":"loop", "root":"/", "password":"test", "encrypt_names":true})
+                .to_string();
+        let data = serde_json::json!({"accounts":[{"id":"loop", "name":"Loop", "kind":"crypt", "crypt":{"base":"loop","root":"/"}, "secret":secret}], "oauth_apps":[]}).to_string();
+        let backup: Backup = serde_json::from_str(&data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountStore::new(dir.path(), Secrets::memory());
+        assert!(store.import(backup).is_err());
+        assert!(store.list().unwrap().is_empty());
+    }
 
     fn webdav(url: &str) -> ProviderConfig {
         ProviderConfig::Webdav {

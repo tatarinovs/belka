@@ -62,11 +62,10 @@ export function tabItem(tab: BrowserTab, accounts: Account[]): Tab {
     badge: account ? providerDef(account.kind).short : undefined };
 }
 
-/** Restore only universal panes. Older sessions start at the combined root. */
+/** Restore saved panes, dropping invalid tabs and removed accounts. */
 export function restorePanes(raw: string | null, accounts: Account[]): Record<Side, PaneTabs> {
   let saved: Record<string, unknown> = {};
   try { saved = JSON.parse(raw ?? "{}") ?? {}; } catch { /* Start at the root. */ }
-  if (saved.version !== 2) saved = {};
   const known = new Set(accounts.map((a) => a.id));
   function pane(side: Side): PaneTabs {
     const data = saved[side] as { tabs?: { id?: unknown; path?: unknown }[]; active?: unknown } | undefined;

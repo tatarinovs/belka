@@ -16,6 +16,9 @@ struct FakeCloud {
 
 #[async_trait]
 impl StorageProvider for FakeCloud {
+    fn supports_create_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "fake"
     }
@@ -46,6 +49,17 @@ impl StorageProvider for FakeCloud {
     }
     async fn download_to(&self, _: &str, _: &mut dyn Sink, _: &Progress) -> Result<u64> {
         unimplemented!("not used by backups")
+    }
+    async fn upload_new(&self, source: &dyn Source, path: &str, _: &Progress) -> Result<()> {
+        let mut data = Vec::new();
+        source.open_at(0)?.read_to_end(&mut data).await?;
+        let mut files = self.files.lock().unwrap();
+        if files.contains_key(path) {
+            return Err(belka_core::storage::AlreadyExists(path.to_string()).into());
+        }
+        files.insert(path.to_string(), data);
+        self.uploads.lock().unwrap().push(path.to_string());
+        Ok(())
     }
     async fn delete(&self, _: &str, _: bool) -> Result<()> {
         unimplemented!("backups never delete")

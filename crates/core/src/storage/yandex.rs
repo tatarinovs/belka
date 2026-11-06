@@ -114,13 +114,20 @@ impl YandexDiskProvider {
         source: &dyn Source,
         remote: &str,
         progress: &Progress,
+        overwrite: bool,
     ) -> Result<(), Failure> {
         let resp = send("yandex: request upload URL", || {
-            Ok(self
-                .api(Method::GET, "/upload")
-                .query(&[("path", remote), ("overwrite", "true")]))
+            Ok(self.api(Method::GET, "/upload").query(&[
+                ("path", remote),
+                ("overwrite", if overwrite { "true" } else { "false" }),
+            ]))
         })
         .await?;
+        if !overwrite && resp.status() == StatusCode::CONFLICT {
+            return Err(Failure::Fatal(
+                super::AlreadyExists(remote.to_string()).into(),
+            ));
+        }
         if !resp.status().is_success() {
             return Err(Failure::from_response(
                 resp,
@@ -143,6 +150,9 @@ impl YandexDiskProvider {
 
         match resp.status() {
             StatusCode::CREATED | StatusCode::OK | StatusCode::ACCEPTED => Ok(()),
+            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED if !overwrite => Err(
+                Failure::Fatal(super::AlreadyExists(remote.to_string()).into()),
+            ),
             _ => Err(Failure::from_response(resp, format!("Upload of '{remote}' failed")).await),
         }
     }
@@ -211,6 +221,9 @@ impl YandexDiskProvider {
 
 #[async_trait]
 impl StorageProvider for YandexDiskProvider {
+    fn supports_create_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "Yandex Disk"
     }
@@ -297,7 +310,20 @@ impl StorageProvider for YandexDiskProvider {
     ) -> Result<()> {
         let path = normalize_remote_dir(remote_path);
         retry_transient(&format!("yandex: upload '{path}'"), progress, || {
-            self.upload_once(source, &path, progress)
+            self.upload_once(source, &path, progress, true)
+        })
+        .await
+    }
+
+    async fn upload_new(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        let path = normalize_remote_dir(remote_path);
+        retry_transient(&format!("yandex: create '{path}'"), progress, || {
+            self.upload_once(source, &path, progress, false)
         })
         .await
     }

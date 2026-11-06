@@ -5,6 +5,7 @@
   "mainBinaryName": "belka-gui",
   "identifier": "io.github.tatarinovs.belka",
   "build": {
+    "removeUnusedCommands": true,
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",

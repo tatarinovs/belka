@@ -126,6 +126,13 @@ pub trait StorageProvider: Send + Sync {
         false
     }
 
+    /// `upload_new` preserves a concurrently created object, by rejecting
+    /// the write or creating a distinct object (Google Drive). Backends that
+    /// ignore HTTP preconditions need unique names for shared backups.
+    fn supports_create_only(&self) -> bool {
+        false
+    }
+
     /// Uploads or overwrites a file with the data of `source`. The parent
     /// directory must already exist. Dropping the future cancels the upload.
     async fn upload(
@@ -148,16 +155,19 @@ pub trait StorageProvider: Send + Sync {
 
     /// Uploads data the caller knows is not in the cloud yet. Providers that
     /// look the file up before writing (Google Drive, which allows equal
-    /// names) skip the lookup; those that can write only a new file
-    /// (Synology) fail with [`AlreadyExists`] if it appeared meanwhile; the
-    /// others just upload.
+    /// names) create a separate object; other providers must use create-only
+    /// writes and fail with [`AlreadyExists`] if the name appeared meanwhile.
+    /// An unsupported provider must fail rather than silently overwrite.
     async fn upload_new(
         &self,
-        source: &dyn Source,
+        _source: &dyn Source,
         remote_path: &str,
-        progress: &Progress,
+        _progress: &Progress,
     ) -> Result<()> {
-        self.upload(source, remote_path, progress).await
+        bail!(
+            "{} cannot safely create '{remote_path}' without overwriting",
+            self.name()
+        )
     }
 
     /// Uploads a local file that is not in the cloud yet; see

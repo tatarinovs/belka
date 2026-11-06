@@ -105,6 +105,9 @@ impl CryptProvider {
 
 #[async_trait]
 impl StorageProvider for CryptProvider {
+    fn supports_create_only(&self) -> bool {
+        self.inner.supports_create_only()
+    }
     fn name(&self) -> &str {
         &self.name
     }

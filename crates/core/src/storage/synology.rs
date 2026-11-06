@@ -636,6 +636,9 @@ impl SynologyProvider {
 
 #[async_trait]
 impl StorageProvider for SynologyProvider {
+    fn supports_create_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "Synology"
     }

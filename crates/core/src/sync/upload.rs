@@ -10,9 +10,10 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
-/// The index is saved after this many recorded files, so a run that is
-/// stopped halfway does not check them again.
+/// Coalesce checkpoints by both file count and time. Fast uploads must not
+/// repeatedly serialize a large index; callers also save at run completion.
 const SAVE_EVERY: usize = 25;
+const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Names tried for a file whose own name is taken: `a.jpg`, `a (1).jpg`, ...
 const MAX_NAMES: usize = 100;
 
@@ -188,6 +189,7 @@ pub async fn upload(
         .buffer_unordered(opts.parallel.max(1));
 
     let mut unsaved = 0;
+    let mut saved_at = Instant::now();
     while let Some((file, outcome, cloud_path)) = results.next().await {
         match &outcome {
             Outcome::Transferred(bytes) => {
@@ -203,8 +205,9 @@ pub async fn upload(
             let mut index = index.lock().unwrap();
             index.record_at(&file, &cloud_path);
             unsaved += 1;
-            if unsaved >= SAVE_EVERY {
+            if unsaved >= SAVE_EVERY && saved_at.elapsed() >= SAVE_INTERVAL {
                 unsaved = 0;
+                saved_at = Instant::now();
                 if let Err(err) = index.save() {
                     warn!("{err:#}");
                 }
@@ -251,6 +254,23 @@ async fn upload_one(
             .await?
             .expect("not exclusive");
         return Ok((outcome, path));
+    }
+    if !run.provider.supports_create_only() {
+        let target = join_remote(&run.root, &file.relative);
+        if let Some(remote) = run.listing.info(run.provider, &target).await? {
+            if cloud_has(run.provider, &remote, file, false).await? {
+                return Ok((Outcome::Unchanged, file.relative.clone()));
+            }
+        }
+        // Mail.ru ignores If-None-Match. Independent devices must not pick
+        // the same free name; the index keeps this random name stable later.
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("No random source: {e}"))?;
+        let unique = suffixed(&file.relative, &format!("belka-{}", hex::encode(random)));
+        let outcome = place(run, file, &unique, false)
+            .await?
+            .expect("not exclusive");
+        return Ok((outcome, unique));
     }
     for n in 0..MAX_NAMES {
         let name = numbered(&file.relative, n);
@@ -332,7 +352,7 @@ async fn place(
     progress.set_total(file.size);
     run.observer.started(file, &progress);
     let started = Instant::now();
-    if exists {
+    if exists || (!exclusive && !provider.supports_create_only()) {
         provider.upload_file(&file.path, &target, &progress).await?;
     } else {
         match provider
@@ -366,6 +386,10 @@ fn numbered(relative: &str, n: usize) -> String {
     if n == 0 {
         return relative.to_string();
     }
+    suffixed(relative, &n.to_string())
+}
+
+fn suffixed(relative: &str, suffix: &str) -> String {
     let (dir, name) = relative
         .rsplit_once('/')
         .map_or(("", relative), |(d, n)| (d, n));
@@ -373,7 +397,7 @@ fn numbered(relative: &str, n: usize) -> String {
         Some(dot) if dot > 0 => name.split_at(dot),
         _ => (name, ""),
     };
-    let name = format!("{stem} ({n}){ext}");
+    let name = format!("{stem} ({suffix}){ext}");
     if dir.is_empty() {
         name
     } else {

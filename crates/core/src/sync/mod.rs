@@ -97,13 +97,13 @@ impl LocalFile {
         }
     }
 
-    /// Size and modification time in seconds: what the [`Index`] compares.
-    pub fn stamp(&self) -> (u64, i64) {
-        let secs = self
+    /// Size and precise modification time: what the [`Index`] compares.
+    pub fn stamp(&self) -> (u64, u64, u32) {
+        let time = self
             .modified
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs() as i64);
-        (self.size, secs)
+            .unwrap_or_default();
+        (self.size, time.as_secs(), time.subsec_nanos())
     }
 }
 
@@ -176,8 +176,13 @@ pub fn scan(root: &Path, filter: &Filter) -> Result<LocalTree> {
             } else {
                 format!("{relative}/{name}")
             };
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+            let file_type = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(err) => {
+                    tree.errors
+                        .push(format!("{}: {err}", entry.path().display()));
+                    continue;
+                }
             };
             if file_type.is_dir() {
                 if filter.accepts(&child, true) {

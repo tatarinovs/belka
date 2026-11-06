@@ -80,7 +80,7 @@ async fn handle(mut stream: TcpStream, content: &'static [u8], reply: Reply) {
         Reply::Status(code) => (format!("{code} Nope"), &b""[..], String::new(), None),
     };
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: \"fixture-v1\"\r\n{extra}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await.unwrap();
@@ -99,8 +99,11 @@ async fn fetch(url: &str, dest: &Path, progress: &Progress) -> anyhow::Result<u6
     download("test", dest, progress, || async { Ok(client.get(url)) }).await
 }
 
-fn part_of(dest: &Path) -> std::path::PathBuf {
-    dest.with_file_name("out.bin.belka.part")
+fn has_parts(dest: &Path) -> bool {
+    std::fs::read_dir(dest.parent().unwrap()).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        name.starts_with(".belka-") && name.ends_with(".part")
+    })
 }
 
 #[tokio::test]
@@ -116,7 +119,7 @@ async fn downloads_and_reports_progress() {
     assert_eq!(std::fs::read(&dest).unwrap(), CONTENT);
     assert_eq!((progress.done(), progress.total()), (size, size));
     assert_eq!(progress.attempt(), 1);
-    assert!(!part_of(&dest).exists());
+    assert!(!has_parts(&dest));
 }
 
 #[tokio::test]
@@ -165,7 +168,7 @@ async fn failure_keeps_the_existing_file() {
 
     assert!(format!("{err:#}").contains("404"), "{err:#}");
     assert_eq!(std::fs::read(&dest).unwrap(), b"old");
-    assert!(!part_of(&dest).exists());
+    assert!(!has_parts(&dest));
 }
 
 #[tokio::test]
@@ -183,7 +186,7 @@ async fn cancelling_removes_partial_data() {
 
     assert!(result.is_err(), "download should still be running");
     assert_eq!(progress.done(), 20);
-    assert!(!part_of(&dest).exists());
+    assert!(!has_parts(&dest));
     assert!(!dest.exists());
 }
 

@@ -118,6 +118,17 @@
 
   type SortKey = "name" | "size" | "modified";
 
+  function followCrumbs(node: HTMLElement, _path: string | undefined) {
+    const revealCurrent = () => { node.scrollLeft = node.scrollWidth; };
+    const observer = new ResizeObserver(revealCurrent);
+    observer.observe(node);
+    void tick().then(revealCurrent);
+    return {
+      update() { void tick().then(revealCurrent); },
+      destroy() { observer.disconnect(); },
+    };
+  }
+
   let listing = $state<Listing | null>(null);
   let loading = $state(false);
   let error = $state("");
@@ -301,7 +312,7 @@
       if (typeof saved?.showSize === "boolean") showSize = saved.showSize;
       if (typeof saved?.showDate === "boolean") showDate = saved.showDate;
     } catch { /* Ignore damaged UI preferences. */ }
-    navigate(initialPath);
+    void navigate(initialPath);
     // A response from a closed tab or the previous account must not change
     // the current tab's path through onnavigate.
     return () => { requestSeq++; };
@@ -732,14 +743,14 @@
           onkeydown={(e) => { if (e.key === "Escape") { editingPath = false; grid.focus(); e.preventDefault(); } }} />
       </form>
     {:else}
-    <nav class="crumbs" aria-label="Путь" ondblclick={editPath}>
+    <nav class="crumbs" aria-label="Путь" title={displayPath(path)} use:followCrumbs={listing?.path} ondblclick={editPath}>
       <button onclick={() => navigateFocused(rootPath)} title={rootLabel}>
         <Icon name={rootIcon} size={14} />
         <span>{rootLabel}</span>
       </button>
       {#each listing?.crumbs ?? [] as crumb (crumb.path)}
         <Icon name="chevron" size={12} />
-        <button onclick={() => navigateFocused(crumb.path)}>{crumb.name}</button>
+        <button onclick={() => navigateFocused(crumb.path)} title={displayPath(crumb.path)}><span>{crumb.name}</span></button>
       {/each}
     </nav>
     <button class="icon-btn path-edit" title="Ввести путь (Ctrl+L)" aria-label="Ввести путь" onclick={editPath}><Icon name="folder" size={14} /></button>
@@ -965,16 +976,20 @@
     gap: 2px;
     min-width: 0;
     margin-left: 0;
-    overflow: hidden;
+    overflow-x: auto;
+    scrollbar-width: none;
     color: var(--muted);
   }
 
+  .crumbs :global(svg) { flex: none; }
+
   .crumbs button {
     display: inline-flex;
-    flex-shrink: 1;
+    flex: none;
     align-items: center;
     gap: 6px;
     min-width: 0;
+    max-width: min(240px, 100%);
     height: 26px;
     padding: 0 6px;
     border: 0;
@@ -984,11 +999,8 @@
     white-space: nowrap;
   }
 
-  .crumbs button:last-child {
-    flex-shrink: 0;
-  }
-
   .crumbs button span {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
   }

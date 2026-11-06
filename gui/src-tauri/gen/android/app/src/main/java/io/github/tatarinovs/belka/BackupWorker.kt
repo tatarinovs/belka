@@ -11,6 +11,7 @@ import android.media.MediaScannerConnection
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.work.Constraints
+import androidx.work.BackoffPolicy
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
@@ -67,6 +68,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                     TimeUnit.HOURS,
                 )
                     .setConstraints(constraints)
+                    .setBackoffCriteria(BackoffPolicy.LINEAR, 1, TimeUnit.HOURS)
                     .setInputData(workDataOf(KEY_ID to task.id, KEY_NAME to task.name))
                     .build()
                 work.enqueueUniquePeriodicWork(periodic(task.id), ExistingPeriodicWorkPolicy.UPDATE, request)
@@ -77,6 +79,7 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
         /** Starts a task now on any network: the user asked for it. */
         fun runNow(context: Context, id: String, name: String) {
             val request = OneTimeWorkRequestBuilder<BackupWorker>()
+                .setBackoffCriteria(BackoffPolicy.LINEAR, 1, TimeUnit.HOURS)
                 .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .setInputData(workDataOf(KEY_ID to id, KEY_NAME to name))
@@ -93,6 +96,13 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
                 )
             }
         }
+
+        /** Retry failed runs within the interval, but cap retries of errors
+         * such as revoked credentials until the next scheduled run. */
+        internal fun needsRetry(result: JSONObject, attempt: Int): Boolean =
+            shouldRetryBackup(result.optLong("failed"),
+                !result.isNull("error") && result.optString("error").isNotEmpty(),
+                result.optBoolean("busy"), result.optBoolean("cancelled"), attempt)
     }
 
     private val id = inputData.getString(KEY_ID).orEmpty()
@@ -129,8 +139,9 @@ class BackupWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             ticker.cancel()
             result
         }
-        report(JSONObject(json))
-        return Result.success()
+        val result = JSONObject(json)
+        report(result)
+        return if (needsRetry(result, runAttemptCount)) Result.retry() else Result.success()
     }
 
     override suspend fun getForegroundInfo(): ForegroundInfo = foregroundInfo("")

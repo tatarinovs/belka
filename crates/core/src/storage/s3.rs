@@ -261,12 +261,9 @@ impl S3Provider {
             .await?
             .text()
             .await
-            .unwrap_or_default();
-        // CopyObject may report a failure inside a 200 response.
-        if body.contains("<Error>") {
-            bail!("Failed to copy '{from}': {}", body.trim());
-        }
-        Ok(())
+            .with_context(|| format!("Incomplete copy response for '{from}'"))?;
+        validate_s3_result(&body, "CopyObjectResult")
+            .with_context(|| format!("Failed to copy '{from}'"))
     }
 
     async fn list_objects(
@@ -376,8 +373,17 @@ impl S3Provider {
         Ok(())
     }
 
-    async fn put_single(&self, source: &dyn Source, key: &str, progress: &Progress) -> Result<()> {
-        let meta = mtime_header(source);
+    async fn put_single(
+        &self,
+        source: &dyn Source,
+        key: &str,
+        progress: &Progress,
+        create_only: bool,
+    ) -> Result<()> {
+        let mut meta = mtime_header(source);
+        if create_only {
+            meta.push(("If-None-Match", "*".to_string()));
+        }
         let resp = send(&format!("s3: upload '{key}'"), || {
             let (body, len) = (source_body(source, 0, progress)?, source.len());
             Ok(self
@@ -388,6 +394,14 @@ impl S3Provider {
                 .body(body))
         })
         .await?;
+        if create_only
+            && matches!(
+                resp.status(),
+                StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
+            )
+        {
+            return Err(super::AlreadyExists(key.to_string()).into());
+        }
         ensure_success(resp, format!("Upload of '{key}' failed")).await?;
         Ok(())
     }
@@ -398,6 +412,7 @@ impl S3Provider {
         key: &str,
         size: u64,
         progress: &Progress,
+        create_only: bool,
     ) -> Result<()> {
         let meta = mtime_header(source);
         let resp = send("s3: create multipart upload", || {
@@ -429,7 +444,10 @@ impl S3Provider {
             .upload_parts(source, key, &init.upload_id, size, progress)
             .await
         {
-            Ok(etags) => self.complete_multipart(key, &init.upload_id, &etags).await,
+            Ok(etags) => {
+                self.complete_multipart(key, &init.upload_id, &etags, create_only)
+                    .await
+            }
             Err(err) => Err(err),
         };
         std::mem::forget(guard);
@@ -537,7 +555,13 @@ impl S3Provider {
         Ok(etag)
     }
 
-    async fn complete_multipart(&self, key: &str, upload_id: &str, etags: &[String]) -> Result<()> {
+    async fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        etags: &[String],
+        create_only: bool,
+    ) -> Result<()> {
         let mut body = String::from("<CompleteMultipartUpload>");
         for (i, etag) in etags.iter().enumerate() {
             body.push_str(&format!(
@@ -551,23 +575,79 @@ impl S3Provider {
         let hash = hex::encode(Sha256::digest(&body));
 
         let resp = send("s3: complete multipart upload", || {
-            Ok(self
+            let req = self
                 .request(Method::POST, Some(key), &[("uploadId", upload_id)], &hash)
                 .header(CONTENT_TYPE, "application/xml")
                 .timeout(API_TIMEOUT * 10)
-                .body(body.clone()))
+                .body(body.clone());
+            Ok(if create_only {
+                req.header("If-None-Match", "*")
+            } else {
+                req
+            })
         })
         .await?;
+        if create_only
+            && matches!(
+                resp.status(),
+                StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
+            )
+        {
+            return Err(super::AlreadyExists(key.to_string()).into());
+        }
         let text = ensure_success(resp, format!("Failed to complete upload of '{key}'"))
             .await?
             .text()
             .await?;
-        // S3 may report an error with HTTP 200 for this call.
-        if text.contains("<Error>") {
-            bail!("Failed to complete upload of '{key}': {text}");
-        }
-        Ok(())
+        validate_s3_result(&text, "CompleteMultipartUploadResult")
     }
+}
+
+/// CopyObject can return an error inside HTTP 200. A missing or malformed
+/// success document must never authorize deleting the source of a rename.
+fn validate_s3_result(body: &str, root: &str) -> Result<()> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(body);
+    let mut depth = 0usize;
+    let mut closed = false;
+    loop {
+        match reader.read_event()? {
+            Event::Start(tag) => {
+                if depth == 0 && (closed || tag.local_name().as_ref() != root) {
+                    bail!(
+                        "S3 did not confirm {root}: {}",
+                        body.chars().take(400).collect::<String>()
+                    );
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth = depth.checked_sub(1).context("Unexpected XML closing tag")?;
+                if depth == 0 {
+                    closed = true;
+                }
+            }
+            Event::Eof => {
+                anyhow::ensure!(closed && depth == 0, "Incomplete S3 success document");
+                break;
+            }
+            Event::Empty(_) | Event::Text(_) if depth > 0 => {}
+            Event::Decl(_) | Event::Comment(_) => {}
+            Event::Text(text) if text.as_ref().chars().all(char::is_whitespace) => {}
+            _ => bail!("Invalid S3 success document"),
+        }
+    }
+    #[derive(Deserialize)]
+    struct Copied {
+        #[serde(rename = "ETag")]
+        etag: String,
+    }
+    let copied: Copied = quick_xml::de::from_str(body).context("Invalid CopyObjectResult")?;
+    anyhow::ensure!(
+        !copied.etag.trim().is_empty(),
+        "S3 returned an empty copy ETag"
+    );
+    Ok(())
 }
 
 /// Aborts a multipart upload whose future is dropped (a cancelled transfer).
@@ -603,6 +683,9 @@ impl Drop for AbortOnDrop<'_> {
 
 #[async_trait]
 impl StorageProvider for S3Provider {
+    fn supports_create_only(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "S3 compatible storage"
     }
@@ -698,9 +781,28 @@ impl StorageProvider for S3Provider {
         }
         let size = source.len();
         if size > MULTIPART_THRESHOLD {
-            self.put_multipart(source, &key, size, progress).await
+            self.put_multipart(source, &key, size, progress, false)
+                .await
         } else {
-            self.put_single(source, &key, progress).await
+            self.put_single(source, &key, progress, false).await
+        }
+    }
+
+    async fn upload_new(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+    ) -> Result<()> {
+        let key = Self::key_for(remote_path);
+        if key.is_empty() {
+            bail!("Invalid S3 object key for '{remote_path}'");
+        }
+        if source.len() > MULTIPART_THRESHOLD {
+            self.put_multipart(source, &key, source.len(), progress, true)
+                .await
+        } else {
+            self.put_single(source, &key, progress, true).await
         }
     }
 
@@ -939,6 +1041,69 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_requires_a_complete_success_document() {
+        assert!(validate_s3_result(
+            r#"<CopyObjectResult xmlns="urn:s3"><ETag>"hash"</ETag></CopyObjectResult>"#,
+            "CopyObjectResult"
+        )
+        .is_ok());
+        for body in [
+            "",
+            "<Error><Code>SlowDown</Code></Error>",
+            "<CopyObjectResult>",
+            "<CopyObjectResult><ETag>hash</ETag>",
+            "<CopyObjectResult><ETag>hash</ETag></CopyObjectResult><Other/>",
+            "<CopyObjectResult/>",
+            "<Other><ETag>hash</ETag></Other>",
+        ] {
+            assert!(
+                validate_s3_result(body, "CopyObjectResult").is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_completion_is_also_create_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap().to_lowercase();
+            assert!(head.contains("if-none-match: *"));
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            socket.read_exact(&mut vec![0; len]).await.unwrap();
+            socket.write_all(b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let s3 = S3Provider::new(
+            &endpoint,
+            "b".into(),
+            "key".into(),
+            "secret".into(),
+            "region".into(),
+        )
+        .unwrap();
+        let err = s3
+            .complete_multipart("key", "upload", &["etag".into()], true)
+            .await
+            .unwrap_err();
+        assert!(err.is::<super::super::AlreadyExists>());
+        server.await.unwrap();
+    }
 
     fn example_creds() -> Credentials {
         Credentials {

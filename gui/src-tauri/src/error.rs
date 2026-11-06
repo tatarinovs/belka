@@ -44,7 +44,13 @@ pub fn translate(msg: &str) -> String {
     if let Some(text) = known(msg) {
         return text;
     }
-    let reason = if has_any(
+    let reason = if lower.starts_with("google drive has several items named") {
+        Some("В Google Диске есть несколько объектов с одинаковым именем. Переименуйте дубликаты в Google Диске")
+    } else if lower.starts_with("cannot upload an incomplete folder scan") {
+        Some(
+            "Не все файлы удалось прочитать. Загрузка не началась, чтобы не пропустить часть папки",
+        )
+    } else if has_any(
         &lower,
         &["dns error", "failed to lookup address", "no such host"],
     ) {

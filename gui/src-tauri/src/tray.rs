@@ -31,11 +31,14 @@ pub fn show(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
+        if let Err(err) = crate::webview_cache::set_cloaked(&window, false) {
+            tracing::warn!("Cannot reveal the window: {err:#}");
+        }
         let _ = window.set_focus();
     }
 }
 
-/// Late frontend readiness and the startup fallback must not undo a close.
+/// Late frontend readiness must not undo a close made during startup.
 pub fn show_when_ready(app: &AppHandle) {
     if app
         .try_state::<TrayState>()
@@ -47,7 +50,12 @@ pub fn show_when_ready(app: &AppHandle) {
 }
 
 pub fn close(window: &tauri::Window, api: &tauri::CloseRequestApi) {
-    if window.label() != "main" || window.app_handle().tray_by_id("belka").is_none() {
+    // Shutdown destroys the WebView before leaving the event loop. Do not
+    // intercept that close again, or a hidden window keeps the process alive.
+    if exiting(window.app_handle())
+        || window.label() != "main"
+        || window.app_handle().tray_by_id("belka").is_none()
+    {
         return;
     }
     api.prevent_close();

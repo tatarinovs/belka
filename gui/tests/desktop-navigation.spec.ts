@@ -11,17 +11,8 @@ test("cloud addresses preserve account IDs and remote paths without touching loc
   expect(location("")).toEqual({ kind: "root" });
 });
 
-test("old cloud/local tabs are discarded", () => {
-  const panes = restorePanes(JSON.stringify({
-    cloud: { tabs: [{ id: "a", account: "one", path: "/Folder" }], active: "a" },
-    local: { tabs: [{ id: "b", path: "C:\\Folder" }], active: "b" },
-  }), accounts);
-  expect(panes.left.tabs).toEqual([{ id: expect.any(String), path: "" }]);
-  expect(panes.right.tabs).toEqual([{ id: expect.any(String), path: "" }]);
-});
-
 test("universal tabs restore clouds on either side and filter removed accounts", () => {
-  const panes = restorePanes(JSON.stringify({ version: 2,
+  const panes = restorePanes(JSON.stringify({
     left: { tabs: [{ id: "a", path: "C:\\" }], active: "a" },
     right: { tabs: [{ id: "b", path: "cloud://one/" }, { id: "c", path: "cloud://removed/" }], active: "c" },
   }), accounts);
@@ -30,7 +21,7 @@ test("universal tabs restore clouds on either side and filter removed accounts",
 });
 
 test("missing or malformed session data starts both panes at the combined root", () => {
-  for (const raw of [null, "invalid", "null", JSON.stringify({ version: 2, left: { tabs: [null] } })]) {
+  for (const raw of [null, "invalid", "null", JSON.stringify({ left: { tabs: [null] } })]) {
     const panes = restorePanes(raw, accounts);
     expect(panes.left.tabs).toEqual([{ id: expect.any(String), path: "" }]);
     expect(panes.right.tabs).toEqual([{ id: expect.any(String), path: "" }]);

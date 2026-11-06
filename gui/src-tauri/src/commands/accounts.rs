@@ -8,9 +8,7 @@ use anyhow::Context;
 use belka_core::oauth::{self, OAuthApp, Service};
 use belka_core::storage::crypt::CryptProvider;
 use belka_core::{ProviderConfig, StorageProvider};
-use belka_store::accounts::{
-    Account, AccountSource, Backup, CryptFolder, CryptLocation, Imported, CRYPT_KIND,
-};
+use belka_store::accounts::{Account, AccountSource, Backup, CryptFolder, Imported, CRYPT_KIND};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
@@ -20,18 +18,7 @@ use tokio::sync::oneshot;
 
 #[tauri::command]
 pub fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<Account>> {
-    let store = state.accounts.lock().unwrap();
-    let mut accounts = store.list()?;
-    // Encrypted folders added before the location was kept in the list.
-    for account in &mut accounts {
-        if account.kind == CRYPT_KIND && account.crypt.is_none() {
-            account.crypt = store.crypt_folder(&account.id).ok().map(|f| CryptLocation {
-                base: f.base,
-                root: f.root,
-            });
-        }
-    }
-    Ok(accounts)
+    Ok(state.accounts.lock().unwrap().list()?)
 }
 
 /// Builds the provider and checks that the credentials work.

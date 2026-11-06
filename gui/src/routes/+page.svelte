@@ -4,6 +4,7 @@
   import { isMobile } from "$lib/platform";
   import { onMount } from "svelte";
   import { initializeStorage } from "$lib/storage";
+  import { showWhenDrawn } from "$lib/startup";
 
   let ready = $state(false);
   let error = $state("");
@@ -14,6 +15,8 @@
       ready = true;
     } catch (err) {
       error = String(err);
+      // A startup error must be visible too, with its retry button drawn.
+      await showWhenDrawn().catch(console.error);
     }
   }
   onMount(() => { void initialize(); });

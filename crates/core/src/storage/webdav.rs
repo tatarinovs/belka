@@ -101,6 +101,46 @@ impl WebDavProvider {
         self
     }
 
+    async fn upload_with(
+        &self,
+        source: &dyn Source,
+        remote_path: &str,
+        progress: &Progress,
+        create_only: bool,
+    ) -> Result<()> {
+        let path = normalize_remote_dir(remote_path);
+        let url = self.url_for(&path, false);
+        // Nextcloud and ownCloud keep the original file's date from this
+        // header; other servers ignore it.
+        let mtime = source
+            .modified()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string());
+        let resp = send(&format!("webdav: upload '{path}'"), || {
+            let (body, len) = (source_body(source, 0, progress)?, source.len());
+            let mut req = self
+                .request(Method::PUT, &url)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_LENGTH, len)
+                .timeout(upload_timeout(len));
+            if create_only {
+                req = req.header("If-None-Match", "*");
+            }
+            if let Some(mtime) = &mtime {
+                req = req.header("X-OC-Mtime", mtime);
+            }
+            Ok(req.body(body))
+        })
+        .await?;
+        if create_only && resp.status() == StatusCode::PRECONDITION_FAILED {
+            return Err(super::AlreadyExists(path).into());
+        }
+        match resp.status() {
+            StatusCode::CREATED | StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            _ => Err(http_error(resp, format!("Upload of '{path}' failed")).await),
+        }
+    }
+
     fn url_for(&self, remote_path: &str, collection: bool) -> String {
         let mut url = self.base_url.clone();
         let mut has_segments = false;
@@ -234,6 +274,9 @@ impl WebDavProvider {
 
 #[async_trait]
 impl StorageProvider for WebDavProvider {
+    fn supports_create_only(&self) -> bool {
+        !self.errors_mean_missing
+    }
     fn name(&self) -> &str {
         self.display_name
     }
@@ -312,37 +355,12 @@ impl StorageProvider for WebDavProvider {
         Ok(entry.map(|e| self.to_info(e, path)))
     }
 
-    async fn upload(
-        &self,
-        source: &dyn Source,
-        remote_path: &str,
-        progress: &Progress,
-    ) -> Result<()> {
-        let path = normalize_remote_dir(remote_path);
-        let url = self.url_for(&path, false);
-        // Nextcloud and ownCloud keep the original file's date from this
-        // header; other servers ignore it.
-        let mtime = source
-            .modified()
-            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs().to_string());
-        let resp = send(&format!("webdav: upload '{path}'"), || {
-            let (body, len) = (source_body(source, 0, progress)?, source.len());
-            let mut req = self
-                .request(Method::PUT, &url)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .header(CONTENT_LENGTH, len)
-                .timeout(upload_timeout(len));
-            if let Some(mtime) = &mtime {
-                req = req.header("X-OC-Mtime", mtime);
-            }
-            Ok(req.body(body))
-        })
-        .await?;
-        match resp.status() {
-            StatusCode::CREATED | StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
-            _ => Err(http_error(resp, format!("Upload of '{path}' failed")).await),
-        }
+    async fn upload(&self, source: &dyn Source, path: &str, progress: &Progress) -> Result<()> {
+        self.upload_with(source, path, progress, false).await
+    }
+
+    async fn upload_new(&self, source: &dyn Source, path: &str, progress: &Progress) -> Result<()> {
+        self.upload_with(source, path, progress, true).await
     }
 
     async fn download_to(

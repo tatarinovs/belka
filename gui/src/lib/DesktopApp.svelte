@@ -8,6 +8,7 @@
   import { describe } from "$lib/cloud";
   import { explainError } from "$lib/errors";
   import { remember, stored } from "$lib/storage";
+  import { showWhenDrawn } from "$lib/startup";
   import { dnd, paneAt } from "$lib/dnd.svelte";
   import { baseName, parentPath } from "$lib/format";
   import { providerDef } from "$lib/providers";
@@ -90,7 +91,7 @@
     if (panes) panes[side].tabs = ids.map((id) => panes![side].tabs.find((t) => t.id === id)).filter((t) => t !== undefined);
   }
   $effect(() => {
-    if (panes) remember("tabs", JSON.stringify({ version: 2, ...panes }));
+    if (panes) remember("tabs", JSON.stringify(panes));
   });
 
   let adding = $state(false);
@@ -337,7 +338,9 @@
       if (!mounted) return;
       panes = restorePanes(stored("tabs"), list);
       await focusPane("left");
-      api.appReady().catch((err) => (notice = errorText(err)));
+      // The panes are mounted with loading indicators. Remote listings may
+      // take much longer than painting the window and must not delay it.
+      if (mounted) void showWhenDrawn().catch((err) => (notice = errorText(err)));
     });
     const offFinished = transfers.onFinished((transfer) => {
       for (const side of sides) {

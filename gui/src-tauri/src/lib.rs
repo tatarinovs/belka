@@ -20,6 +20,7 @@ use belka_store::secrets::Secrets;
 use belka_store::tasks::TaskStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+#[cfg(mobile)]
 use std::time::Duration;
 use tauri::Manager;
 use tokio::sync::oneshot;
@@ -47,6 +48,9 @@ impl AppState {
         }
         let provider: Arc<dyn StorageProvider> = if self.account(account_id)?.kind == CRYPT_KIND {
             let folder = self.accounts.lock().unwrap().crypt_folder(account_id)?;
+            if self.account(&folder.base)?.kind == CRYPT_KIND {
+                anyhow::bail!("An encrypted folder cannot be placed inside another one");
+            }
             // The base comes from the cache, with its tokens and connections.
             let base = self.provider(&folder.base)?;
             Arc::new(CryptProvider::new(base, &folder.root, &folder.config)?)
@@ -152,7 +156,10 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            let config_dir = app.path().app_config_dir()?;
+            let config_dir = std::env::var_os("BELKA_CONFIG_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or(app.path().app_config_dir()?);
             let ui_state = ui_state::UiState::new(&config_dir)?;
             app.manage(ui_state);
             let preview_dir = app.path().app_cache_dir()?.join("preview");
@@ -190,15 +197,14 @@ pub fn run() {
             // the app runs due tasks itself while it is open.
             commands::backup::reschedule(app.handle(), &app.state::<AppState>());
             commands::backup::start_scheduler(app.handle().clone());
-            // The page shows the hidden window once it is drawn; if it fails
-            // to load, the window still appears.
+            // Desktop readiness comes from the painted layout (or the startup
+            // error page), independently of pending directory requests.
+            // Keep the existing fallback for the Android layout.
+            #[cfg(mobile)]
             if let Some(window) = app.get_webview_window("main") {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     if !window.is_visible().unwrap_or(true) {
-                        #[cfg(target_os = "windows")]
-                        tray::show_when_ready(window.app_handle());
-                        #[cfg(not(target_os = "windows"))]
                         let _ = window.show();
                     }
                 });

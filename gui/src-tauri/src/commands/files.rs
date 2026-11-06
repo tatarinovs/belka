@@ -261,6 +261,17 @@ fn expand_upload(paths: &[PathBuf], remote_dir: &str) -> Result<UploadPlan> {
             .with_context(|| format!("Invalid path '{}'", path.display()))?
             .to_string_lossy();
         let tree = sync::scan(path, &Filter::all())?;
+        if !tree.errors.is_empty() {
+            bail!(
+                "Cannot upload an incomplete folder scan: {}",
+                tree.errors
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
         if tree.single_file {
             files.extend(
                 tree.files
@@ -270,15 +281,17 @@ fn expand_upload(paths: &[PathBuf], remote_dir: &str) -> Result<UploadPlan> {
             continue;
         }
         let base = join_remote(remote_dir, &name);
-        let is_empty = |dir: &str| {
-            let prefix = format!("{dir}/");
-            !tree.files.iter().any(|f| f.relative.starts_with(&prefix))
-                && !tree.dirs.iter().any(|d| d.starts_with(&prefix))
-        };
+        let nonempty: HashSet<String> = tree
+            .files
+            .iter()
+            .map(|f| f.relative.as_str())
+            .chain(tree.dirs.iter().map(String::as_str))
+            .filter_map(|path| path.rsplit_once('/').map(|(parent, _)| parent.to_string()))
+            .collect();
         empty_dirs.extend(
             tree.dirs
                 .iter()
-                .filter(|d| is_empty(d))
+                .filter(|d| !nonempty.contains(*d))
                 .map(|d| join_remote(&base, d)),
         );
         if tree.files.is_empty() && tree.dirs.is_empty() {
