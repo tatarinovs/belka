@@ -33,7 +33,7 @@
 </script>
 
 <script lang="ts">
-  import { onMount, type Snippet } from "svelte";
+  import { onMount, tick, type Snippet } from "svelte";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { SvelteSet } from "svelte/reactivity";
   import { errorText, type Listing } from "$lib/api";
@@ -128,12 +128,23 @@
   let renameValue = $state("");
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let opBusy = $state("");
+  let query = $state("");
+  let searchInput: HTMLInputElement;
+  let addressInput = $state<HTMLInputElement>();
+  let editingPath = $state(false);
+  let address = $state("");
+  let history = $state<string[]>([]);
+  let historyAt = $state(-1);
+  let body: HTMLDivElement;
+
 
   /** Responses for a folder the user has already left are dropped. */
   let requestSeq = 0;
 
   const path = $derived(listing?.path ?? initialPath);
   const entries = $derived(listing?.entries ?? []);
+  const needle = $derived(query.trim().toLocaleLowerCase("ru"));
+  const filtered = $derived(entries.filter((e) => e.name.toLocaleLowerCase("ru").includes(needle)));
   const collator = new Intl.Collator("ru", { numeric: true, sensitivity: "base" });
 
   const sorted = $derived.by(() => {
@@ -152,7 +163,7 @@
       else if (sortKey === "modified") result = (times.get(a) ?? 0) - (times.get(b) ?? 0);
       return (result || byName(a, b)) * dir;
     };
-    return [...entries].sort(compare);
+    return [...filtered].sort(compare);
   });
 
   /** Row keys: Google Drive allows several items with the same name in a
@@ -170,18 +181,18 @@
 
   const summary = $derived.by(() => {
     const picked = selectedEntries;
-    if (picked.length > 1 || (picked.length === 1 && !picked[0].is_dir)) {
+    if (picked.length) {
       const bytes = picked.reduce((sum, e) => sum + (e.is_dir ? 0 : e.size), 0);
       return `Выбрано: ${picked.length} · ${formatBytes(bytes)}`;
     }
-    const files = entries.filter((e) => !e.is_dir);
-    const dirs = entries.length - files.length;
+    const files = filtered.filter((e) => !e.is_dir);
+    const dirs = filtered.length - files.length;
     const bytes = files.reduce((sum, e) => sum + e.size, 0);
-    return `Папок: ${dirs} · файлов: ${files.length} · ${formatBytes(bytes)}`;
+    return `${query.trim() ? `Найдено: ${filtered.length} из ${entries.length} · ` : ""}Папок: ${dirs} · файлов: ${files.length} · ${formatBytes(bytes)}`;
   });
 
   /** Opens `target`; `focus` selects rows there (by default the selection is kept on reload). */
-  export async function navigate(target: string, focus: string[] | null = null) {
+  export async function navigate(target: string, focus: string[] | null = null, historyIndex: number | null = null) {
     const seq = ++requestSeq;
     loading = true;
     error = "";
@@ -190,6 +201,15 @@
       if (seq !== requestSeq) return;
       const changedFolder = result.path !== listing?.path;
       listing = result;
+      if (historyIndex !== null) historyAt = historyIndex;
+      else if (history[historyAt] !== result.path) {
+        history = [...history.slice(0, historyAt + 1), result.path];
+        historyAt = history.length - 1;
+      }
+      if (changedFolder) {
+        query = "";
+        if (body) body.scrollTop = 0;
+      }
       const keep = new Set(result.entries.map((e) => e.path));
       const next = (focus ?? (changedFolder ? [] : [...selected])).filter((p) => keep.has(p));
       selected.clear();
@@ -249,6 +269,39 @@
 
   function goUp() {
     if (listing?.parent != null) navigate(listing.parent, [path]);
+  }
+
+  function travel(step: number) {
+    const next = historyAt + step;
+    if (!loading && next >= 0 && next < history.length) navigate(history[next], null, next);
+  }
+
+  function filter(value: string) {
+    query = value;
+    selected.clear();
+    cursor = null;
+    anchor = null;
+    if (body) body.scrollTop = 0;
+  }
+
+  async function editPath() {
+    address = path;
+    editingPath = true;
+    await tick();
+    addressInput?.focus();
+    addressInput?.select();
+  }
+
+  function paneKey(event: KeyboardEvent) {
+    const ctrl = event.ctrlKey || event.metaKey;
+    if (ctrl && event.code === "KeyF") searchInput.focus();
+    else if (ctrl && event.code === "KeyL") editPath();
+    else if (event.altKey && event.key === "ArrowLeft") travel(-1);
+    else if (event.altKey && event.key === "ArrowRight") travel(1);
+    else if (event.altKey && event.key === "ArrowUp") goUp();
+    else return;
+    event.preventDefault();
+    event.stopPropagation();
   }
 
   function sortBy(key: SortKey) {
@@ -374,7 +427,7 @@
         case "Backspace": goUp(); break;
         case "F5": oncopy(); break;
         case "Tab": onswitch(); break;
-        case "Escape": selected.clear(); break;
+        case "Escape": if (query) filter(""); else selected.clear(); break;
         case " ": {
           const entry = sorted[index];
           if (!entry || entry.is_dir || !onpreview) return;
@@ -586,9 +639,15 @@
 <svelte:window onpointermove={pointermove} onpointerup={pointerup} />
 
 <!-- Any click or focus inside the pane makes it the active one. -->
-<section data-pane={id} class:active onpointerdowncapture={onactivate} onfocusin={onactivate}>
+<section data-pane={id} class:active onpointerdowncapture={onactivate} onfocusin={onactivate} onkeydowncapture={paneKey}>
   <div class="toolbar">
     {@render leading?.()}
+    <button class="icon-btn" title="Назад (Alt+←)" aria-label="Назад" onclick={() => travel(-1)} disabled={loading || historyAt <= 0}>
+      <Icon name="arrowLeft" />
+    </button>
+    <button class="icon-btn" title="Вперёд (Alt+→)" aria-label="Вперёд" onclick={() => travel(1)} disabled={loading || historyAt >= history.length - 1}>
+      <Icon name="arrowRight" />
+    </button>
     <button class="icon-btn" title="Вверх (Backspace)" aria-label="Вверх" onclick={goUp} disabled={listing?.parent == null}>
       <Icon name="up" />
     </button>
@@ -596,7 +655,21 @@
       <Icon name="refresh" />
     </button>
 
-    <nav class="crumbs" aria-label="Путь">
+    {#if editingPath}
+      <form class="address" onsubmit={(e) => {
+        e.preventDefault();
+        const target = address.trim();
+        if (!target && rootPath) return;
+        editingPath = false;
+        navigate(target);
+        grid.focus();
+      }}>
+        <input bind:this={addressInput} bind:value={address} aria-label="Путь к папке" placeholder={rootLabel}
+          spellcheck="false" autocomplete="off" onblur={() => (editingPath = false)}
+          onkeydown={(e) => { if (e.key === "Escape") { editingPath = false; grid.focus(); e.preventDefault(); } }} />
+      </form>
+    {:else}
+    <nav class="crumbs" aria-label="Путь" ondblclick={editPath}>
       <button onclick={() => navigate(rootPath)} title={rootLabel}>
         <Icon name={rootIcon} size={14} />
         <span>{rootLabel}</span>
@@ -606,9 +679,25 @@
         <button onclick={() => navigate(crumb.path)}>{crumb.name}</button>
       {/each}
     </nav>
+    <button class="icon-btn path-edit" title="Ввести путь (Ctrl+L)" aria-label="Ввести путь" onclick={editPath}><Icon name="folder" size={14} /></button>
+    {/if}
 
     {#if actions}
       <div class="actions">{@render actions()}</div>
+    {/if}
+  </div>
+
+  <div class="filter">
+    <Icon name="search" size={14} />
+    <input bind:this={searchInput} value={query} oninput={(e) => filter(e.currentTarget.value)}
+      aria-label="Поиск в текущей папке" placeholder="Найти в этой папке · Ctrl+F" spellcheck="false" autocomplete="off"
+      onkeydown={(e) => {
+        if (e.key === "Escape") { filter(""); grid.focus(); e.preventDefault(); }
+        else if (e.key === "ArrowDown" || e.key === "Enter") { grid.focus(); e.preventDefault(); }
+      }} />
+    {#if query}
+      <span class="matches">{filtered.length} из {entries.length}</span>
+      <button class="icon-btn" title="Сбросить поиск (Esc)" aria-label="Сбросить поиск" onclick={() => { filter(""); searchInput.focus(); }}><Icon name="close" size={14} /></button>
     {/if}
   </div>
 
@@ -634,7 +723,7 @@
       <button role="columnheader" tabindex="-1" aria-sort={ariaSort("modified")} onclick={() => sortBy("modified")}>Изменён{sortMark("modified")}</button>
     </div>
 
-    <div class="body" class:dim={loading} role="presentation" oncontextmenu={(e) => openMenu(e, null)}>
+    <div class="body" bind:this={body} class:dim={loading} role="presentation" oncontextmenu={(e) => openMenu(e, null)}>
       {#each sorted as entry, i (rowKeys[i])}
         <!-- Keyboard navigation is handled by the grid's onkeydown. -->
         <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -690,7 +779,7 @@
         </div>
       {:else}
         {#if !loading && !error}
-          <div class="placeholder">Папка пуста</div>
+          <div class="placeholder">{query.trim() ? "Ничего не найдено в этой папке" : "Папка пуста"}</div>
         {/if}
       {/each}
     </div>
@@ -714,7 +803,34 @@
 {/if}
 
 <style>
+  .filter {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 12px;
+    min-height: 32px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  .filter input {
+    flex: 1;
+    min-width: 0;
+    height: 26px;
+    border: 0;
+    background: transparent;
+    outline-offset: 0;
+  }
+
+  .matches { font-size: 12px; white-space: nowrap; }
+  .address { flex: 1; min-width: 0; }
+  .address input {
+    width: 100%; height: 28px; padding: 0 6px;
+    border: 1px solid var(--accent); border-radius: 4px;
+    background: var(--surface);
+  }
   section {
+    container-type: inline-size;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -730,6 +846,13 @@
     padding: 6px 8px;
     border-bottom: 1px solid var(--border);
     box-shadow: inset 0 2px 0 transparent;
+  }
+
+  @container (max-width: 600px) {
+    .crumbs > button:first-child span { display: none; }
+    .toolbar :global(.btn.arrow span) { display: none; }
+    .toolbar :global(.btn.arrow) { padding: 0 8px; }
+    .path-edit { display: none; }
   }
 
   section.active .toolbar {

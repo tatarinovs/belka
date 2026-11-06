@@ -27,6 +27,7 @@
   import Icon from "$lib/components/Icon.svelte";
   import TabBar, { type Tab } from "$lib/components/TabBar.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
+  import PaneDivider from "$lib/components/PaneDivider.svelte";
 
   const KEY_TABS = "tabs";
   // Used before tabs appeared; read once to keep the last place.
@@ -76,6 +77,19 @@
   let cloudPane = $state<FilePane>();
   let localPane = $state<FilePane>();
   let activePane = $state<"cloud" | "local">("cloud");
+  let panesWidth = $state(1280);
+  const minPane = $derived(Math.max(25, Math.min(49, (320 / panesWidth) * 100)));
+  let paneWidth = $state((() => {
+    const saved = Number(stored("desktop.paneWidth") ?? 50);
+    return Number.isFinite(saved) ? Math.max(25, Math.min(75, saved)) : 50;
+  })());
+  function resizePanes(value: number) {
+    paneWidth = Math.max(minPane, Math.min(100 - minPane, value));
+    remember("desktop.paneWidth", String(paneWidth));
+  }
+  const shownPaneWidth = $derived(Math.max(minPane, Math.min(100 - minPane, paneWidth)));
+  const cloudCount = $derived(cloudPane?.getSelection().length ?? 0);
+  const localCount = $derived(localPane?.getSelection().length ?? 0);
   const cloudTab = $derived(cloudTabs.find((t) => t.id === cloudTabId) ?? null);
   const localTab = $derived(localTabs.find((t) => t.id === localTabId) ?? null);
   const selectedId = $derived(cloudTab?.account ?? null);
@@ -486,7 +500,7 @@
     </button>
   </header>
 
-  <div class="panes">
+  <div class="panes" bind:clientWidth={panesWidth} style:grid-template-columns="minmax(0, {shownPaneWidth}fr) 5px minmax(0, {100 - shownPaneWidth}fr)">
     <div class="slot">
       {#if cloudTabs.length}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -553,11 +567,12 @@
               <button
                 class="btn primary arrow"
                 onclick={toLocal}
-                disabled={!!busy || !localPath}
+                disabled={!!busy || !localPath || !cloudCount}
                 title={localPath ? `Скачать выбранное в ${localPath} (F5)` : "Справа откройте папку на компьютере"}
                 aria-label="Скачать"
               >
                 <Icon name="arrowRight" size={16} />
+                <span>Скачать{cloudCount ? ` (${cloudCount})` : ""}</span>
               </button>
             {/snippet}
           </FilePane>
@@ -582,6 +597,8 @@
         </div>
       {/if}
     </div>
+
+    <PaneDivider value={shownPaneWidth} min={minPane} max={100 - minPane} onchange={resizePanes} />
 
     <div class="slot">
       <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -625,11 +642,12 @@
           <button
             class="btn primary arrow"
             onclick={() => toCloud()}
-            disabled={!!busy || !selected}
-            title="Загрузить выбранное в открытую слева папку облака (F5)"
+            disabled={!!busy || !selected || !localCount}
+            title={selected ? `Загрузить выбранное в ${selected.name}: ${cloudPath} (F5)` : "Сначала подключите облако"}
             aria-label="Загрузить"
           >
             <Icon name="arrowLeft" size={16} />
+            <span>Загрузить{localCount ? ` (${localCount})` : ""}</span>
           </button>
         {/snippet}
       </FilePane>
@@ -800,16 +818,17 @@
   /* The transfer buttons face each other across the divider. */
   .slot :global(.btn.arrow) {
     justify-content: center;
-    width: 36px;
-    padding: 0;
+    min-width: 36px;
+    padding: 0 10px;
+    white-space: nowrap;
   }
 
-  .slot + .slot :global(.btn.arrow) {
+  .slot:last-child :global(.btn.arrow) {
     margin-right: 6px;
   }
 
-  .slot + .slot {
-    border-left: 1px solid var(--border);
+  @media (max-width: 1100px) {
+    .slot :global(.btn.arrow span) { display: none; }
   }
 
   .slot > :global(section) {
