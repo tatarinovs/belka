@@ -1,4 +1,4 @@
-import { api, type Transfer, type TransferCounts } from "./api";
+import { api, type Transfer, type TransferCounts, type TransferFilter } from "./api";
 
 const POLL_MS = 400;
 /** A running transfer without a single byte this long is waiting for the server. */
@@ -15,6 +15,9 @@ const NO_TRANSFERS: TransferCounts = { queued: 0, running: 0, done: 0, failed: 0
  */
 class TransferStore {
   items = $state<Transfer[]>([]);
+  viewItems = $state<Transfer[]>([]);
+  filter = $state<TransferFilter>("all");
+  #requestSeq = 0;
   counts = $state<TransferCounts>(NO_TRANSFERS);
   speeds = $state<Record<number, number>>({});
   /** Running transfers that have received nothing for a while. */
@@ -45,15 +48,25 @@ class TransferStore {
   }
 
   async refresh() {
+    const seq = ++this.#requestSeq;
     try {
-      const { items, counts } = await api.listTransfers();
+      const { items, counts, view_items } = await api.listTransfers(this.filter);
+      if (seq !== this.#requestSeq) return;
       this.#track(items);
       this.items = items;
+      this.viewItems = view_items ?? items;
       this.counts = counts;
       this.error = "";
     } catch (err) {
+      if (seq !== this.#requestSeq) return;
       this.error = String(err);
     }
+  }
+
+  async setFilter(filter: TransferFilter) {
+    this.filter = filter;
+    this.viewItems = [];
+    await this.refresh();
   }
 
   #tick = async () => {

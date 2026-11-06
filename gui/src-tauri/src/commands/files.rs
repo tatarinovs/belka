@@ -2,7 +2,7 @@
 //! queuing uploads and downloads, and managing the queue.
 
 use crate::error::CmdResult;
-use crate::transfers::{CopyFrom, Direction, Spec, TransferList};
+use crate::transfers::{CopyFrom, Direction, Spec, TransferFilter, TransferList};
 use crate::{local, native, AppState};
 use anyhow::{bail, Context, Result};
 use belka_core::sync::{self, Filter, RemoteListing};
@@ -480,8 +480,11 @@ fn local_places(_app: &tauri::AppHandle) -> Vec<local::Place> {
 }
 
 #[tauri::command]
-pub fn list_transfers(state: State<'_, AppState>) -> TransferList {
-    state.transfers.list()
+pub fn list_transfers(state: State<'_, AppState>, filter: Option<TransferFilter>) -> TransferList {
+    match filter.unwrap_or_default() {
+        TransferFilter::All => state.transfers.list(),
+        filter => state.transfers.list_filtered(filter),
+    }
 }
 
 #[tauri::command]
@@ -507,6 +510,45 @@ pub fn retry_transfer(state: State<'_, AppState>, id: u64) -> CmdResult<()> {
         .transpose()?;
     state.transfers.retry(id, provider, source);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct RetryFailures {
+    retried: usize,
+    errors: Vec<String>,
+}
+
+#[tauri::command]
+pub fn retry_failed_transfers(state: State<'_, AppState>) -> RetryFailures {
+    let mut result = RetryFailures {
+        retried: 0,
+        errors: Vec::new(),
+    };
+    for id in state.transfers.failed_ids() {
+        let Some(spec) = state.transfers.retry_spec(id) else {
+            continue;
+        };
+        let providers = (|| -> anyhow::Result<_> {
+            let target = state.provider(&spec.account_id)?;
+            let source = spec
+                .from
+                .as_ref()
+                .map(|from| state.provider(&from.account_id))
+                .transpose()?;
+            Ok((target, source))
+        })();
+        match providers {
+            Ok((target, source)) => {
+                if state.transfers.retry(id, target, source) {
+                    result.retried += 1;
+                }
+            }
+            Err(err) => result
+                .errors
+                .push(crate::error::translate(&format!("{err:#}"))),
+        }
+    }
+    result
 }
 
 #[tauri::command]

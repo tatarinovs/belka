@@ -12,7 +12,7 @@ use belka_core::storage::copy::copy_file;
 use belka_core::sync::{self, LocalFile};
 use belka_core::utils::path::split_remote;
 use belka_core::{Progress, RemoteFileInfo, StorageProvider};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +164,31 @@ pub struct Counts {
 pub struct TransferList {
     items: Vec<TransferView>,
     counts: Counts,
+    /// A filtered slice for display; `items` still feeds completion events.
+    view_items: Option<Vec<TransferView>>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferFilter {
+    #[default]
+    All,
+    Active,
+    Failed,
+    Done,
+    Cancelled,
+}
+
+impl TransferFilter {
+    fn accepts(self, status: &Status) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => status.is_active(),
+            Self::Failed => matches!(status, Status::Failed { .. }),
+            Self::Done => matches!(status, Status::Done),
+            Self::Cancelled => matches!(status, Status::Cancelled),
+        }
+    }
 }
 
 #[derive(Default, PartialEq, Serialize)]
@@ -438,6 +463,10 @@ impl Transfers {
     }
 
     pub fn list(&self) -> TransferList {
+        self.list_filtered(TransferFilter::All)
+    }
+
+    pub fn list_filtered(&self, filter: TransferFilter) -> TransferList {
         let jobs = self.jobs.lock().unwrap();
         let mut counts = Counts::default();
         for job in jobs.iter() {
@@ -458,7 +487,7 @@ impl Transfers {
             0
         };
         let mut queued = 0;
-        let items = jobs
+        let shown: Vec<&Job> = jobs
             .iter()
             .filter(|job| match job.status {
                 Status::Running => true,
@@ -468,9 +497,47 @@ impl Transfers {
                 }
                 _ => job.finished >= oldest_shown,
             })
-            .map(Job::view)
             .collect();
-        TransferList { items, counts }
+        let view_items = match filter {
+            TransferFilter::All => None,
+            TransferFilter::Active => Some(
+                shown
+                    .iter()
+                    .filter(|j| j.status.is_active())
+                    .map(|j| j.view())
+                    .collect(),
+            ),
+            _ => {
+                let mut matches: Vec<&Job> =
+                    jobs.iter().filter(|j| filter.accepts(&j.status)).collect();
+                matches.sort_unstable_by_key(|j| std::cmp::Reverse(j.finished));
+                Some(
+                    matches
+                        .into_iter()
+                        .take(SHOWN_FINISHED)
+                        .map(Job::view)
+                        .collect(),
+                )
+            }
+        };
+        let items = shown.into_iter().map(Job::view).collect();
+        TransferList {
+            items,
+            counts,
+            view_items,
+        }
+    }
+
+    /// Includes failures outside the slice sent to the page. Cancelled jobs
+    /// are retried only explicitly, never by "retry all errors".
+    pub fn failed_ids(&self) -> Vec<u64> {
+        self.jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|j| matches!(j.status, Status::Failed { .. }))
+            .map(|j| j.id)
+            .collect()
     }
 
     /// A summary of the active transfers for the Android progress notification.
@@ -536,14 +603,14 @@ impl Transfers {
         id: u64,
         provider: Arc<dyn StorageProvider>,
         source: Option<Arc<dyn StorageProvider>>,
-    ) {
+    ) -> bool {
         let (spec, progress) = {
             let mut jobs = self.jobs.lock().unwrap();
             let Some(job) = jobs
                 .iter_mut()
                 .find(|j| j.id == id && !j.status.is_active() && j.status != Status::Done)
             else {
-                return;
+                return false;
             };
             job.status = Status::Queued;
             job.finished = 0;
@@ -553,6 +620,7 @@ impl Transfers {
             (job.spec.clone(), job.progress.clone())
         };
         self.start(id, spec, progress, provider, source);
+        true
     }
 
     /// Removes every finished transfer (done, failed or cancelled) from the list.
@@ -626,6 +694,59 @@ mod tests {
             &file(6, None, Some(100))
         ));
         assert!(!same_content(&file(5, None, None), &file(5, None, None)));
+    }
+
+    #[test]
+    fn filtered_errors_include_old_failures_and_bulk_retry_skips_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transfers = Transfers::new(tmp.path().join("copy"));
+        {
+            let mut jobs = transfers.jobs.lock().unwrap();
+            jobs.extend((1..=150).map(|id| {
+                job(
+                    id,
+                    Status::Failed {
+                        error: "offline".into(),
+                    },
+                    id,
+                )
+            }));
+            jobs.push(job(151, Status::Cancelled, 151));
+            jobs.extend((152..=351).map(|id| job(id, Status::Done, id)));
+            jobs.push(job(352, Status::Running, 0));
+            jobs.push(job(353, Status::Queued, 0));
+        }
+        let normal = transfers.list();
+        assert!(normal
+            .items
+            .iter()
+            .all(|j| !matches!(j.status, Status::Failed { .. })));
+        let filtered = transfers.list_filtered(TransferFilter::Failed);
+        assert_eq!(filtered.counts.failed, 150);
+        assert_eq!(filtered.counts.done, 200);
+        let errors = filtered.view_items.unwrap();
+        assert_eq!(errors.len(), SHOWN_FINISHED);
+        assert_eq!(errors[0].id, 150);
+        assert_eq!(errors.last().unwrap().id, 51);
+        assert!(errors
+            .iter()
+            .all(|j| matches!(j.status, Status::Failed { .. })));
+        // The ordinary slice still carries active jobs and recent completions.
+        assert!(filtered.items.iter().any(|j| j.id == 352));
+        assert!(filtered.items.iter().any(|j| j.id == 351));
+        let retry = transfers.failed_ids();
+        assert_eq!(retry, (1..=150).collect::<Vec<_>>());
+        assert!(transfers.retry_spec(352).is_none());
+        let active = transfers
+            .list_filtered(TransferFilter::Active)
+            .view_items
+            .unwrap();
+        assert_eq!(active.iter().map(|j| j.id).collect::<Vec<_>>(), [352, 353]);
+        let cancelled = transfers
+            .list_filtered(TransferFilter::Cancelled)
+            .view_items
+            .unwrap();
+        assert_eq!(cancelled.iter().map(|j| j.id).collect::<Vec<_>>(), [151]);
     }
 
     #[test]

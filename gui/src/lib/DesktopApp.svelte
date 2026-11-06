@@ -4,7 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { ask } from "@tauri-apps/plugin-dialog";
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
-  import { api, errorText, type Account, type BackupTask, type Entry } from "$lib/api";
+  import { api, errorText, newBackupTask, type Account, type BackupTask, type Entry } from "$lib/api";
   import { accounts as accountStore } from "$lib/accounts.svelte";
   import { cloudListing, describe } from "$lib/cloud";
   import { explainError } from "$lib/errors";
@@ -173,6 +173,10 @@
     deleteLabel: "Удалить",
     confirmLabel: "В корзину",
     reveal: (path) => revealItemInDir(path),
+    backup: (entry) => {
+      backupDraft = newBackupTask(entry.path, selected?.id ?? accounts[0]?.id ?? "", selected ? cloudPath : "");
+      backups = true;
+    },
   };
 
   /** Opens `account` in the active cloud tab, as choosing a drive does in Total Commander. */

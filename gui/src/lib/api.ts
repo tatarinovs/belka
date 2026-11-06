@@ -61,6 +61,7 @@ export interface ShareOptions {
 export type ProviderConfig = { kind: ProviderKind } & Record<string, string | number | boolean>;
 
 export type TransferState = "queued" | "running" | "done" | "failed" | "cancelled";
+export type TransferFilter = "all" | "active" | "failed" | "done" | "cancelled";
 
 /** How many transfers are in each state, including ones not in the list. */
 export type TransferCounts = Record<TransferState, number>;
@@ -323,10 +324,11 @@ export const api = {
   localDelete: (paths: string[]) => invoke<void>("local_delete", { paths }),
 
   /** The running transfers, the head of the queue and the latest finished ones. */
-  listTransfers: () => invoke<{ items: Transfer[]; counts: TransferCounts }>("list_transfers"),
+  listTransfers: (filter: TransferFilter = "all") => invoke<{ items: Transfer[]; counts: TransferCounts; view_items?: Transfer[] | null }>("list_transfers", { filter }),
   cancelTransfer: (id: number) => invoke<void>("cancel_transfer", { id }),
   cancelAllTransfers: () => invoke<void>("cancel_all_transfers"),
   retryTransfer: (id: number) => invoke<void>("retry_transfer", { id }),
+  retryFailedTransfers: () => invoke<{ retried: number; errors: string[] }>("retry_failed_transfers"),
   clearTransfers: () => invoke<void>("clear_transfers"),
 
   /** Android: the app may browse the shared storage. Always true on desktops. */

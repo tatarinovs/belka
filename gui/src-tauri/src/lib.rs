@@ -198,6 +198,7 @@ pub fn run() {
             commands::files::cancel_transfer,
             commands::files::cancel_all_transfers,
             commands::files::retry_transfer,
+            commands::files::retry_failed_transfers,
             commands::files::clear_transfers,
             commands::app::storage_access,
             commands::app::request_storage_access,

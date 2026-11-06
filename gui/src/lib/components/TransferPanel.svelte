@@ -1,6 +1,6 @@
 <script lang="ts">
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
-  import { api, type Transfer } from "$lib/api";
+  import { api, errorText, type Transfer, type TransferFilter } from "$lib/api";
   import { explainError } from "$lib/errors";
   import { isMobile } from "$lib/platform";
   import { formatBytes } from "$lib/format";
@@ -14,12 +14,34 @@
   };
 
   let collapsed = $state(false);
+  let working = $state(false);
+  let message = $state("");
+  let actionError = $state("");
+  const filters: [TransferFilter, string][] = [["all", "Все"], ["active", "Активные"], ["failed", "Ошибки"], ["done", "Готово"], ["cancelled", "Отменённые"]];
+  const shownCount = $derived(transfers.filter === "all" ? transfers.total : transfers.filter === "active" ? transfers.activeCount : transfers.counts[transfers.filter]);
+
+  async function act(action: () => Promise<unknown>) {
+    if (working) return;
+    working = true;
+    actionError = message = "";
+    try { await action(); }
+    catch (err) { actionError = errorText(err); }
+    finally { working = false; }
+  }
+
+  async function retryErrors() {
+    const result = await api.retryFailedTransfers();
+    message = `Поставлено на повтор: ${result.retried}`;
+    if (result.errors.length) actionError = `Не удалось повторить: ${result.errors.length}. ${result.errors[0]}`;
+    await transfers.refresh();
+    transfers.kick();
+  }
 
   const queued = $derived(transfers.counts.queued);
   const running = $derived(transfers.counts.running);
   const finished = $derived(transfers.total - transfers.activeCount);
   /** Transfers the backend only counted. */
-  const hidden = $derived(transfers.total - transfers.items.length);
+  const hidden = $derived(Math.max(0, shownCount - transfers.viewItems.length));
 
   const summary = $derived.by(() => {
     const parts: string[] = [];
@@ -69,17 +91,29 @@
       </button>
       <div class="actions">
         {#if transfers.activeCount}
-          <button class="btn small" onclick={() => transfers.cancelAll()}>Отменить все</button>
+          <button class="btn small" disabled={working} onclick={() => act(() => transfers.cancelAll())}>Отменить все</button>
+        {/if}
+        {#if transfers.failedCount}
+          <button class="btn small" disabled={working} onclick={() => act(retryErrors)}>Повторить ошибки ({transfers.failedCount})</button>
         {/if}
         {#if finished}
-          <button class="btn small" onclick={() => transfers.clear()}>{isMobile ? "Очистить" : "Очистить завершённые"}</button>
+          <button class="btn small" disabled={working} title="Убрать из списка завершённые, ошибочные и отменённые передачи" onclick={() => act(() => transfers.clear())}>{isMobile ? "Очистить" : "Очистить завершённые"}</button>
         {/if}
       </div>
     </header>
 
+    {#if actionError || transfers.error}<div class="panel-error" role="alert">{actionError || errorText(transfers.error)}</div>{/if}
+    {#if message}<div class="panel-message" role="status">{message}</div>{/if}
     {#if !collapsed}
+      <nav class="filters" aria-label="Фильтр передач">
+        {#each filters as [filter, label]}
+          {@const count = filter === "all" ? transfers.total : filter === "active" ? transfers.activeCount : transfers.counts[filter]}
+          <button class:chosen={transfers.filter === filter} aria-pressed={transfers.filter === filter}
+            onclick={() => transfers.setFilter(filter)}>{label} <span>{count}</span></button>
+        {/each}
+      </nav>
       <ul>
-        {#each transfers.items as t (t.id)}
+        {#each transfers.viewItems as t (t.id)}
           <li class={t.state}>
             <span class="dir" title={DIRECTIONS[t.direction].title}>
               <Icon name={DIRECTIONS[t.direction].icon} size={14} />
@@ -91,28 +125,36 @@
               </div>
               <div class="bar" role="progressbar" aria-label={t.name} aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(t)}><div style:width="{percent(t)}%"></div></div>
               <div class="detail" title={t.state === "failed" ? t.error : undefined}>{detail(t)}</div>
+              {#if !isMobile}
+                <details class="transfer-info">
+                  <summary>Подробности</summary>
+                  <div><strong>{t.direction === "download" ? "Куда" : "Откуда"}:</strong> {t.local_path}</div>
+                  <div><strong>{t.direction === "download" ? "Откуда" : "Куда"}:</strong> {t.account_name}: {t.remote_path}</div>
+                  {#if t.error}<div class="panel-error">{t.error}</div>{/if}
+                </details>
+              {/if}
             </div>
             <div class="row-actions">
               {#if t.state === "queued" || t.state === "running"}
-                <button class="icon-btn" title="Отменить" aria-label="Отменить передачу" onclick={() => transfers.cancel(t.id)}>
+                <button class="icon-btn" title="Отменить" aria-label="Отменить передачу" disabled={working} onclick={() => act(() => transfers.cancel(t.id))}>
                   <Icon name="close" size={14} />
                 </button>
               {:else if t.state === "failed" || t.state === "cancelled"}
-                <button class="icon-btn" title="Повторить" aria-label="Повторить передачу" onclick={() => transfers.retry(t.id)}>
+                <button class="icon-btn" title="Повторить" aria-label="Повторить передачу" disabled={working} onclick={() => act(() => transfers.retry(t.id))}>
                   <Icon name="retry" size={14} />
                 </button>
               {:else if t.direction === "download" && isMobile}
-                <button class="icon-btn" title="Открыть" aria-label="Открыть файл" onclick={() => api.localOpen(t.local_path).catch(() => {})}>
+                <button class="icon-btn" title="Открыть" aria-label="Открыть файл" onclick={() => act(() => api.localOpen(t.local_path))}>
                   <Icon name="file" size={14} />
                 </button>
               {:else if t.direction === "download"}
-                <button class="icon-btn" title="Показать в папке" aria-label="Показать в папке" onclick={() => revealItemInDir(t.local_path)}>
+                <button class="icon-btn" title="Показать в папке" aria-label="Показать в папке" onclick={() => act(() => revealItemInDir(t.local_path))}>
                   <Icon name="reveal" size={14} />
                 </button>
               {/if}
             </div>
           </li>
-        {/each}
+        {:else}<li class="more">{transfers.error ? "Не удалось получить список передач" : "В этой категории передач нет"}</li>{/each}
         {#if hidden > 0}
           <li class="more">…и ещё {hidden}</li>
         {/if}
@@ -122,6 +164,17 @@
 {/if}
 
 <style>
+  .filters { display: flex; gap: 4px; padding: 5px 8px; border-bottom: 1px solid var(--border); overflow-x: auto; flex-shrink: 0; }
+  .filters button { display: flex; gap: 5px; align-items: center; white-space: nowrap; background: none; border: 0; border-radius: 4px; padding: 4px 8px; color: var(--muted); }
+  .filters button.chosen { background: var(--selected); color: var(--text); }
+  .filters button:hover { background: var(--hover); }
+  .filters span { font-size: 11px; }
+  .panel-error { color: var(--danger); padding: 4px 12px; overflow-wrap: anywhere; }
+  .panel-message { color: var(--muted); padding: 4px 12px; }
+  .transfer-info { margin-top: 3px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .transfer-info summary { cursor: pointer; }
+  .transfer-info div { padding-top: 4px; white-space: pre-wrap; }
+  .transfer-info strong { font-weight: 500; }
   section {
     display: flex;
     flex-direction: column;
@@ -140,6 +193,7 @@
     gap: 8px;
     padding: 4px 8px;
     border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
   }
 
   section.collapsed header {

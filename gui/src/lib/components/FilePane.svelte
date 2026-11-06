@@ -17,6 +17,7 @@
     confirmLabel?: string;
     /** Shows the item (or the open folder) in the system file manager. */
     reveal?(path: string): void;
+    backup?(entry: Entry): void;
     /** Opens access by link and copies the links; set where the cloud supports it. */
     share?(entries: Entry[]): Promise<void>;
     /** Asks for a password and expiry date, then shares; set where the cloud supports them. */
@@ -549,6 +550,10 @@
     if (single?.is_dir) items.push({ label: "Открыть", icon: "folder", shortcut: "Enter", action: () => open(single) });
     if (single?.is_dir && onopentab) {
       items.push({ label: "Открыть в новой вкладке", shortcut: "Ctrl+Enter", action: () => onopentab(single) });
+    }
+    if (single?.is_dir && single.icon !== "drive" && ops?.backup) {
+      const backup = ops.backup;
+      items.push({ label: "Создать автобэкап этой папки", icon: "clock", action: () => backup(single) });
     }
     if (single && !single.is_dir && onopenfile) {
       items.push({ label: "Открыть", icon: "file", shortcut: "Enter", action: () => open(single) });

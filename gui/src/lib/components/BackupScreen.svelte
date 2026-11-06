@@ -4,7 +4,7 @@
   and folders are chosen in the main pane, so the task being edited (`draft`)
   belongs to the page and survives this screen being hidden meanwhile. On a
   desktop it is a dialog: the local folder comes from the system dialog, the
-  cloud folder is typed or taken from the open cloud tab.
+  cloud folder is picked in a dialog, typed or taken from the open cloud tab.
 -->
 <script lang="ts">
   import { onMount } from "svelte";
@@ -13,6 +13,7 @@
   import { formatBytes, formatDate, plural } from "$lib/format";
   import { providerDef } from "$lib/providers";
   import Icon from "./Icon.svelte";
+  import CloudFolderPicker from "./CloudFolderPicker.svelte";
 
   let {
     accounts,
@@ -62,6 +63,7 @@
   let loaded = $state(false);
   let saving = $state(false);
   let error = $state("");
+  let choosingCloud = $state(false);
   /** Filters as the user types them: patterns separated by commas. */
   let includeText = $state("");
   let excludeText = $state("");
@@ -280,7 +282,7 @@
 
 <svelte:window
   onkeydown={(e) => {
-    if (desktop && e.key === "Escape") {
+    if (desktop && !choosingCloud && e.key === "Escape" && !e.defaultPrevented) {
       e.preventDefault();
       if (draft) cancelEdit();
       else onclose();
@@ -351,6 +353,7 @@
               {/each}
             </select>
             <input bind:value={draft.remote} placeholder="/Backups/Документы" spellcheck="false" autocomplete="off" />
+            <button type="button" class="btn" onclick={() => (choosingCloud = true)} disabled={!accounts.length}>Выбрать…</button>
           </div>
           {#if currentCloud}
             <button type="button" class="btn link" onclick={takeCurrentCloud}>
@@ -549,6 +552,15 @@
     </div>
   {/if}
 </div>
+
+{#if desktop && choosingCloud && draft}
+  <CloudFolderPicker {accounts} initialAccount={draft.account_id} initialPath={draft.remote}
+    onclose={() => (choosingCloud = false)}
+    onpick={(accountId, path) => {
+      if (draft) { draft.account_id = accountId; draft.remote = path; }
+      choosingCloud = false;
+    }} />
+{/if}
 
 <style>
   .backdrop {
