@@ -31,6 +31,7 @@ keyring = { version = "3.6", optional = true, features = ["apple-native"] }
 keyring = { version = "3.6", optional = true, features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
+md-5 = "0.10"
 tempfile = "3"
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros"] }

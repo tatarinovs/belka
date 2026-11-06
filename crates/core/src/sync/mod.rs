@@ -219,7 +219,8 @@ pub fn scan(root: &Path, filter: &Filter) -> Result<LocalTree> {
 /// 5. otherwise the local file must not be newer (2s tolerance). This
 ///    matters for multi-volume archives whose parts all have the same size.
 ///
-/// `strict` skips step 3, for when the local file is to be deleted.
+/// `strict` requires a matching content hash, for when the local file is
+/// to be deleted. Size and timestamps alone cannot prove a safe copy.
 pub async fn cloud_has(
     provider: &dyn StorageProvider,
     remote: &RemoteFileInfo,
@@ -244,6 +245,9 @@ pub async fn cloud_has(
             return Ok(false);
         }
         return Ok(true);
+    }
+    if strict {
+        return Ok(false);
     }
     if let (Some(local_time), Some(remote_time)) = (local_time, remote.modified) {
         if local_time > remote_time + chrono::Duration::seconds(2) {

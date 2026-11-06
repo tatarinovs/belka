@@ -161,6 +161,21 @@ pub struct RunResult {
     pub cancelled: bool,
 }
 
+impl RunResult {
+    /// Scan failures are part of the result too: readable files may still
+    /// upload successfully, but the backup is incomplete and needs a retry.
+    fn add_scan_errors(&mut self, errors: &[String]) {
+        self.failed += errors.len() as u64;
+        let remaining = KEPT_FAILURES.saturating_sub(self.failures.len());
+        self.failures.extend(
+            errors
+                .iter()
+                .take(remaining)
+                .map(|error| (String::new(), error.clone())),
+        );
+    }
+}
+
 /// A task with what it is doing now, for the page.
 #[derive(Serialize)]
 pub struct TaskView {
@@ -239,9 +254,7 @@ impl TaskStore {
             })
         }
         #[cfg(target_os = "android")]
-        Ok(StoreGuard {
-            _local: local,
-        })
+        Ok(StoreGuard { _local: local })
     }
 
     /// Claims task `id` for a run in any process; `None` if a run holds it.
@@ -314,7 +327,14 @@ impl TaskStore {
     /// A task that now copies another folder, or into another place,
     /// starts with an empty history and index.
     pub fn save(&self, mut task: Task) -> Result<Task> {
-        task.local = task.local.trim().trim_end_matches(['/', '\\']).to_string();
+        let local = task.local.trim();
+        // A root has no parent: stripping its separator would turn C:\ into
+        // the drive-relative C:, and / into an empty path.
+        task.local = if Path::new(local).parent().is_none() {
+            local.to_string()
+        } else {
+            local.trim_end_matches(['/', '\\']).to_string()
+        };
         task.remote = belka_core::utils::path::normalize_remote_dir(&task.remote);
         task.name = task.name.trim().to_string();
         let clean = |list: &mut Vec<String>| {
@@ -690,6 +710,7 @@ async fn back_up(
     result.unchanged = summary.unchanged;
     result.failed = summary.failed;
     result.failures = summary.failures.into_iter().take(KEPT_FAILURES).collect();
+    result.add_scan_errors(&tree.errors);
     index.lock().unwrap().retain_scanned(&tree);
 
     if let Some(days) = task.free_after_days {
@@ -706,9 +727,9 @@ async fn back_up(
     Ok(())
 }
 
-/// Deletes local files that the cloud holds: the same size and the same MD5
-/// where the cloud can tell one. The cloud is asked again, the index alone
-/// is not proof enough to delete anything.
+/// Deletes local files only after matching their size and content hash
+/// against the cloud. Providers without a hash keep the originals.
+/// The index alone is not proof enough to delete anything.
 async fn free_space(
     provider: &dyn StorageProvider,
     remote_root: &str,

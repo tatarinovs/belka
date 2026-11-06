@@ -374,6 +374,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "keyring",
+ "md-5",
  "serde",
  "serde_json",
  "tempfile",

@@ -3,12 +3,15 @@ use async_trait::async_trait;
 use belka_core::client::{Sink, Source};
 use belka_core::utils::path::{normalize_remote_dir, split_remote};
 use belka_core::RemoteFileInfo;
+use md5::{Digest, Md5};
+use tokio::io::AsyncReadExt;
 
 /// A cloud in memory that counts uploads.
 #[derive(Default)]
 struct FakeCloud {
-    files: Mutex<HashMap<String, u64>>,
+    files: Mutex<HashMap<String, Vec<u8>>>,
     uploads: Mutex<Vec<String>>,
+    without_md5: bool,
 }
 
 #[async_trait]
@@ -25,20 +28,19 @@ impl StorageProvider for FakeCloud {
             .lock()
             .unwrap()
             .get(path)
-            .map(|size| RemoteFileInfo {
+            .map(|data| RemoteFileInfo {
                 name: split_remote(path).1,
                 path: path.to_string(),
                 is_dir: false,
-                size: *size,
-                md5: None,
+                size: data.len() as u64,
+                md5: (!self.without_md5).then(|| format!("{:x}", Md5::digest(data))),
                 modified: Some(Utc::now()),
             }))
     }
     async fn upload(&self, source: &dyn Source, path: &str, _: &Progress) -> Result<()> {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), source.len());
+        let mut data = Vec::new();
+        source.open_at(0)?.read_to_end(&mut data).await?;
+        self.files.lock().unwrap().insert(path.to_string(), data);
         self.uploads.lock().unwrap().push(path.to_string());
         Ok(())
     }
@@ -200,8 +202,80 @@ async fn two_phones_share_a_folder_without_losing_photos() {
         phones.push((settings, photos));
     }
     let files = cloud.files.lock().unwrap();
-    assert_eq!(files["/Backup/IMG_1.jpg"], 5);
-    assert_eq!(files["/Backup/IMG_1 (1).jpg"], 6);
+    assert_eq!(files["/Backup/IMG_1.jpg"], b"first");
+    assert_eq!(files["/Backup/IMG_1 (1).jpg"], b"second");
+}
+
+#[tokio::test]
+async fn freeing_space_keeps_originals_when_cloud_has_no_hash() {
+    let settings = tempfile::tempdir().unwrap();
+    let photos = tempfile::tempdir().unwrap();
+    let photo = photos.path().join("old.jpg");
+    std::fs::write(&photo, b"original").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&photo)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(30 * 86_400))
+        .unwrap();
+    let cloud = Arc::new(FakeCloud {
+        without_md5: true,
+        ..FakeCloud::default()
+    });
+    let store = TaskStore::new(settings.path());
+    let id = store
+        .save(Task {
+            free_after_days: Some(7),
+            ..task(photos.path())
+        })
+        .unwrap()
+        .id;
+    let run = run(&store, &id, &provider(&cloud)).await.unwrap();
+    assert_eq!((run.result.uploaded, run.result.freed), (1, 0));
+    assert!(run.freed.is_empty());
+    assert_eq!(std::fs::read(&photo).unwrap(), b"original");
+}
+
+#[test]
+fn scan_failures_are_visible_in_history_and_trigger_an_early_retry() {
+    let settings = tempfile::tempdir().unwrap();
+    let store = TaskStore::new(settings.path());
+    let saved = store.save(task(settings.path())).unwrap();
+    let now = Utc::now();
+    let mut result = RunResult {
+        started: Some(now - chrono::Duration::minutes(90)),
+        finished: Some(now),
+        uploaded: 3,
+        ..RunResult::default()
+    };
+    let errors: Vec<String> = (0..KEPT_FAILURES + 5)
+        .map(|i| format!("unreadable/{i}: access denied"))
+        .collect();
+    result.add_scan_errors(&errors);
+    store.record(&saved.id, &result).unwrap();
+    let task = store.task(&saved.id).unwrap();
+    let last = task.last().unwrap();
+    assert_eq!(last.uploaded, 3);
+    assert_eq!(last.failed, errors.len() as u64);
+    assert_eq!(last.failures.len(), KEPT_FAILURES);
+    assert_eq!(last.failures[0].1, errors[0]);
+    assert!(task.is_due(now));
+}
+
+#[test]
+fn saving_preserves_filesystem_roots() {
+    let settings = tempfile::tempdir().unwrap();
+    let store = TaskStore::new(settings.path());
+    let roots: &[&str] = if cfg!(windows) {
+        &["/", "C:\\", "D:/", "\\\\server\\share\\"]
+    } else {
+        &["/"]
+    };
+    for &root in roots {
+        let saved = store.save(Task::new(root, "a", "/Backup")).unwrap();
+        assert_eq!(saved.local, root);
+    }
+    assert!(store.save(Task::new("   ", "a", "/Backup")).is_err());
 }
 
 #[test]

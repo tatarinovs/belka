@@ -366,6 +366,24 @@ async fn cloud_has_asks_for_the_md5_only_when_it_must() {
 }
 
 #[tokio::test]
+async fn strict_cloud_comparison_requires_a_hash_even_when_size_and_date_match() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "photo.jpg", b"original");
+    let tree = scan(dir.path(), &Filter::all()).unwrap();
+    let local = &tree.files[0];
+    let cloud = FakeCloud::default();
+    cloud.put("/photo.jpg", b"replaced");
+    let mut remote = cloud.info("/photo.jpg").unwrap();
+    remote.modified = local.modified.map(Into::into);
+    assert!(cloud_has(&cloud, &remote, local, false).await.unwrap());
+    assert!(!cloud_has(&cloud, &remote, local, true).await.unwrap());
+    remote.modified = Some(Utc::now() + chrono::Duration::days(1));
+    assert!(!cloud_has(&cloud, &remote, local, true).await.unwrap());
+    remote.modified = None;
+    assert!(!cloud_has(&cloud, &remote, local, true).await.unwrap());
+}
+
+#[tokio::test]
 async fn upload_dry_run_and_verify() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "a.txt", b"aaa");

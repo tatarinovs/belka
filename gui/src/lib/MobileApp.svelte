@@ -228,6 +228,13 @@
 
   function longPress(event: Event, entry: Entry) {
     event.preventDefault();
+    if (pick?.kind === "backupLocal" || pick?.kind === "backupRemote") {
+      if (!entry.is_dir || loading || error || busy || (mode === "local" && !storageOk)) return;
+      longPressAt = Date.now();
+      navigator.vibrate?.(15);
+      chooseBackupFolder(entry.path);
+      return;
+    }
     if (pick || entry.icon) return;
     longPressAt = Date.now();
     navigator.vibrate?.(15);
@@ -316,14 +323,7 @@
     const current = pick;
     const dir = path;
     if (current.kind === "backupLocal" || current.kind === "backupRemote") {
-      if (backupDraft) {
-        if (current.kind === "backupLocal") backupDraft.local = dir;
-        else if (account) {
-          backupDraft.account_id = account.id;
-          backupDraft.remote = dir;
-        }
-      }
-      pick = null;
+      chooseBackupFolder(dir);
       return;
     }
     busy =
@@ -374,6 +374,16 @@
   // ---- backups ----
 
   const BACKUP_DEFAULT_LOCAL = "/storage/emulated/0/DCIM";
+
+  function chooseBackupFolder(dir: string) {
+    if (!backupDraft || !dir) return;
+    if (pick?.kind === "backupLocal") backupDraft.local = dir;
+    else if (pick?.kind === "backupRemote" && account) {
+      backupDraft.account_id = account.id;
+      backupDraft.remote = dir;
+    } else return;
+    pick = null;
+  }
 
   /** Opens the folder of the task being edited in the pane, to choose another. */
   function pickBackupFolder(side: "local" | "remote") {
@@ -801,9 +811,9 @@
         {:else if pick.kind === "download"}
           Откройте папку на телефоне, куда скачать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
         {:else if pick.kind === "backupLocal"}
-          Откройте папку на телефоне, которую нужно копировать в облако
+          Откройте папку на телефоне, которую нужно копировать в облако, или выберите её длинным тапом
         {:else if pick.kind === "backupRemote"}
-          Откройте папку в облаке, куда складывать копии
+          Откройте папку в облаке, куда складывать копии, или выберите её длинным тапом
         {:else}
           Откройте папку в облаке, куда загрузить {pick.paths.length === 1 ? `«${baseName(pick.paths[0])}»` : `объекты (${pick.paths.length})`}
         {/if}
