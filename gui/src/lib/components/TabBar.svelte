@@ -18,7 +18,7 @@
     activeId: string | null;
     onselect: (id: string) => void;
     onclose: (id: string) => void;
-    /** Opens a copy of the active tab. */
+    /** Opens a new tab at the navigation root. */
     onnew: () => void;
     onreorder: (ids: string[]) => void;
   } = $props();
@@ -40,6 +40,8 @@
       return;
     }
     if (event.button !== 0) return;
+    // The selected pane owns keyboard navigation, including Tab between panes.
+    event.preventDefault();
     onselect(tab.id);
     pressed = { id: tab.id, x: event.clientX };
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);

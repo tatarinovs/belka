@@ -71,6 +71,8 @@
     onopenfile,
     onopentab,
     ontabkey,
+    displayPath = (value: string) => value,
+    resolvePath = (value: string, _current: string) => value,
   }: {
     /** Pane id used for drag and drop between panes. */
     id: string;
@@ -110,6 +112,8 @@
     onopentab?: (entry: Entry) => void;
     /** Ctrl+T, Ctrl+W, Ctrl+Tab and Ctrl+Shift+Tab. */
     ontabkey?: (action: "new" | "close" | "next" | "prev") => void;
+    displayPath?: (value: string) => string;
+    resolvePath?: (value: string, current: string) => string;
   } = $props();
 
   type SortKey = "name" | "size" | "modified";
@@ -247,6 +251,8 @@
     } finally {
       if (seq === requestSeq) loading = false;
     }
+    await tick();
+    if (seq !== requestSeq) return;
     if (focus?.[0]) {
       const row = grid?.querySelector(`[data-path="${CSS.escape(focus[0])}"]`);
       row?.scrollIntoView({ block: "nearest" });
@@ -265,12 +271,27 @@
     return entries;
   }
 
+  export function isLoading() {
+    return loading;
+  }
+
   export function getSelection() {
     return selectedEntries;
   }
 
   export function focus() {
-    grid.focus();
+    grid.focus({ preventScroll: true });
+  }
+
+  /** User navigation owns focus immediately; background reloads never take it. */
+  function navigateFocused(target: string, selection: string[] | null = null, historyIndex: number | null = null) {
+    focus();
+    return navigate(target, selection, historyIndex);
+  }
+
+  function closeMenu(restoreFocus = false) {
+    menu = null;
+    if (restoreFocus) focus();
   }
 
   // The page remounts a pane (via {#key}) whenever its source changes.
@@ -281,11 +302,14 @@
       if (typeof saved?.showDate === "boolean") showDate = saved.showDate;
     } catch { /* Ignore damaged UI preferences. */ }
     navigate(initialPath);
+    // A response from a closed tab or the previous account must not change
+    // the current tab's path through onnavigate.
+    return () => { requestSeq++; };
   });
 
   function open(entry: Entry) {
     if (entry.opensAccount && onopenaccount) onopenaccount(entry.opensAccount);
-    else if (entry.is_dir) navigate(entry.path);
+    else if (entry.is_dir) navigateFocused(entry.path);
     else if (onopenfile) onopenfile(entry);
     else preview(entry);
   }
@@ -295,12 +319,12 @@
   }
 
   function goUp() {
-    if (listing?.parent != null) navigate(listing.parent, [path]);
+    if (listing?.parent != null) navigateFocused(listing.parent, [path]);
   }
 
   function travel(step: number) {
     const next = historyAt + step;
-    if (!loading && next >= 0 && next < history.length) navigate(history[next], null, next);
+    if (!loading && next >= 0 && next < history.length) navigateFocused(history[next], null, next);
   }
 
   function filter(value: string) {
@@ -312,7 +336,7 @@
   }
 
   async function editPath() {
-    address = path;
+    address = displayPath(path);
     editingPath = true;
     await tick();
     addressInput?.focus();
@@ -326,6 +350,8 @@
     else if (event.altKey && event.key === "ArrowLeft") travel(-1);
     else if (event.altKey && event.key === "ArrowRight") travel(1);
     else if (event.altKey && event.key === "ArrowUp") goUp();
+    else if (event.key === "Backspace" && !ctrl && !event.altKey && !event.shiftKey
+      && !(event.target instanceof Element && event.target.closest("input, textarea, select, [contenteditable]"))) goUp();
     else return;
     event.preventDefault();
     event.stopPropagation();
@@ -362,6 +388,7 @@
       suppressClick = false;
       return;
     }
+    grid.focus({ preventScroll: true });
     if (event.shiftKey) {
       selectRange(anchor, entry.path);
     } else if (event.ctrlKey || event.metaKey) {
@@ -412,10 +439,17 @@
 
   function onkeydown(event: KeyboardEvent) {
     if (event.target instanceof HTMLInputElement) return;
+    // Alt+F1/F2 belong to the desktop drive menus, not file commands.
+    if (event.altKey) return;
+    if (loading && ["ArrowDown", "ArrowUp", "Home", "End", "Enter", "F2", "F7", "Delete"].includes(event.key)) {
+      event.preventDefault();
+      return;
+    }
     const index = sorted.findIndex((e) => e.path === cursor);
     const move = (to: number) => {
       const entry = sorted[Math.max(0, Math.min(sorted.length - 1, to))];
       if (!entry) return;
+      grid.focus({ preventScroll: true });
       cursor = entry.path;
       if (event.shiftKey) selectRange(anchor, entry.path);
       else selectOnly(entry.path);
@@ -451,7 +485,6 @@
         case "Home": move(0); break;
         case "End": move(sorted.length - 1); break;
         case "Enter": if (index >= 0) open(sorted[index]); break;
-        case "Backspace": goUp(); break;
         case "F5": oncopy(); break;
         case "Tab": onswitch(); break;
         case "Escape": if (query) filter(""); else selected.clear(); break;
@@ -590,7 +623,7 @@
     if (picked.length && copyLabel) {
       items.push({
         label: copyLabel,
-        icon: id === "cloud" ? "arrowRight" : "arrowLeft",
+        icon: id === "cloud" || id === "left" ? "arrowRight" : "arrowLeft",
         shortcut: "F5",
         disabled: !canCopy,
         action: oncopy,
@@ -682,7 +715,7 @@
     </button>
     </div>
     <div class="location">
-    <button class="icon-btn" title="Вверх (Backspace)" aria-label="Вверх" onclick={goUp} disabled={listing?.parent == null}>
+    <button class="icon-btn" title="Вверх (Alt+↑ / Backspace)" aria-label="Вверх" onclick={goUp} disabled={listing?.parent == null}>
       <Icon name="up" />
     </button>
 
@@ -692,8 +725,7 @@
         const target = address.trim();
         if (!target && rootPath) return;
         editingPath = false;
-        navigate(target);
-        grid.focus();
+        navigateFocused(resolvePath(target, path));
       }}>
         <input bind:this={addressInput} bind:value={address} aria-label="Путь к папке" placeholder={rootLabel}
           spellcheck="false" autocomplete="off" onblur={() => (editingPath = false)}
@@ -701,18 +733,18 @@
       </form>
     {:else}
     <nav class="crumbs" aria-label="Путь" ondblclick={editPath}>
-      <button onclick={() => navigate(rootPath)} title={rootLabel}>
+      <button onclick={() => navigateFocused(rootPath)} title={rootLabel}>
         <Icon name={rootIcon} size={14} />
         <span>{rootLabel}</span>
       </button>
       {#each listing?.crumbs ?? [] as crumb (crumb.path)}
         <Icon name="chevron" size={12} />
-        <button onclick={() => navigate(crumb.path)}>{crumb.name}</button>
+        <button onclick={() => navigateFocused(crumb.path)}>{crumb.name}</button>
       {/each}
     </nav>
     <button class="icon-btn path-edit" title="Ввести путь (Ctrl+L)" aria-label="Ввести путь" onclick={editPath}><Icon name="folder" size={14} /></button>
     {/if}
-    <button class="icon-btn" title="Обновить (Ctrl+R)" aria-label="Обновить" onclick={reload}>
+    <button class="icon-btn" title="Обновить (Ctrl+R)" aria-label="Обновить" onclick={() => navigateFocused(path)}>
       <Icon name="refresh" />
     </button>
     </div>
@@ -841,7 +873,7 @@
 </section>
 
 {#if menu}
-  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={closeMenu} />
 {/if}
 
 <style>

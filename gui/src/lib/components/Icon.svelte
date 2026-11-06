@@ -5,6 +5,7 @@
     up: "M12 19V5m-6 6 6-6 6 6",
     down: "M12 5v14m-6-6 6 6 6-6",
     grip: "M6 9h12M6 15h12",
+    menu: "M4 6h16M4 12h16M4 18h16",
     refresh: "M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4",
     plus: "M12 5v14M5 12h14",
     trash: "M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13",

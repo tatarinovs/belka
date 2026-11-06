@@ -1,4 +1,4 @@
-# Tests of the CLI and the shared crates, and a type check of the GUI page.
+# Tests of the CLI and shared crates, GUI types and keyboard navigation.
 # Runs on pushes and pull requests, and before every release build
 # (android.yml calls it). Actions are pinned by commit: the release job
 # that reuses this has the signing key.
@@ -51,6 +51,12 @@ jobs:
         run: |
           npm ci
           npm run check
+
+      - name: Keyboard navigation in the browser
+        working-directory: gui
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e -- --workers=2
 
   # The app's backend: the transfer queue, previews, local files, errors.
   # Windows, which the desktop app is built for; the page is built first,

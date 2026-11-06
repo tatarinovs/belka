@@ -2,12 +2,9 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { errorText } from "$lib/api";
-  import Icon from "./Icon.svelte";
 
-  let { onclose, onbackup, onabout }: {
+  let { onclose }: {
     onclose: () => void;
-    onbackup: () => void;
-    onabout: () => void;
   } = $props();
 
   let dialog: HTMLDialogElement;
@@ -38,10 +35,6 @@
     }
   }
 
-  function navigate(action: () => void) {
-    dialog.close();
-    action();
-  }
 </script>
 
 <dialog class="modal" bind:this={dialog} onclose={onclose} aria-labelledby="settings-title">
@@ -64,18 +57,6 @@
       <p>Загрузка настроек…</p>
     {/if}
     {#if error}<div class="error" role="alert">{error}</div>{/if}
-    <section class="links" aria-label="Дополнительно">
-      <button class="navigation" onclick={() => navigate(onbackup)}>
-        <Icon name="clock" size={18} />
-        <span class="navigation-text"><strong>Автобэкап</strong><small>Расписание копирования папок в облако</small></span>
-        <Icon name="chevron" size={16} />
-      </button>
-      <button class="navigation" onclick={() => navigate(onabout)}>
-        <Icon name="info" size={18} />
-        <span class="navigation-text"><strong>О приложении</strong><small>Версия и проверка обновлений</small></span>
-        <Icon name="chevron" size={16} />
-      </button>
-    </section>
     <footer><button class="btn primary" onclick={() => dialog.close()}>Закрыть</button></footer>
   </div>
 </dialog>
@@ -96,21 +77,5 @@
   .preference small { grid-column: 2; }
   small, p { color: var(--muted); font-size: 12px; line-height: 1.5; }
   p { margin: 0; }
-  .links { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 2px; }
-  .navigation {
-    display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) 16px;
-    align-items: center;
-    gap: 12px;
-    width: 100%;
-    padding: 10px 8px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    text-align: left;
-  }
-  .navigation:hover { background: var(--hover); }
-  .navigation > :global(svg) { color: var(--muted); }
-  .navigation-text { display: flex; flex-direction: column; gap: 2px; }
   footer { display: flex; justify-content: flex-end; }
 </style>

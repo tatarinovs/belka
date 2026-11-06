@@ -20,7 +20,7 @@ export interface Entry {
   /** Cloud files only, where the cloud keeps a content hash. */
   md5?: string | null;
   /** Local virtual root only. */
-  icon?: "drive" | "place";
+  icon?: "drive" | "place" | "cloud";
   /** Stored encrypted: the row gets a lock, the text is its tooltip. */
   locked?: string;
   /** Opening the row switches to this encrypted folder account. */

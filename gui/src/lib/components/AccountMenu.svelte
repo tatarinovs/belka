@@ -12,6 +12,7 @@
     onedit,
     onmanage,
     onremove,
+    oncancel,
   }: {
     accounts: Account[];
     current: Account;
@@ -20,6 +21,7 @@
     onedit: (account: Account) => void;
     onmanage: () => void;
     onremove: (account: Account) => void;
+    oncancel: () => void;
   } = $props();
 
   let open = $state(false);
@@ -30,7 +32,12 @@
   }
 </script>
 
-<svelte:window onpointerdown={outside} onkeydown={(e) => open && e.key === "Escape" && (open = false)} />
+<svelte:window onpointerdown={outside} onkeydown={(e) => {
+  if (!open || (e.key !== "Escape" && e.key !== "Tab")) return;
+  e.preventDefault();
+  open = false;
+  oncancel();
+}} />
 
 <div class="menu" bind:this={root}>
   <button class="trigger" onclick={() => (open = !open)} aria-expanded={open} title="Сменить аккаунт">

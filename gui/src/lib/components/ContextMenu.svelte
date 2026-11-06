@@ -21,7 +21,7 @@
     x: number;
     y: number;
     items: MenuItem[];
-    onclose: () => void;
+    onclose: (restoreFocus?: boolean) => void;
   } = $props();
 
   let menu: HTMLDivElement;
@@ -37,14 +37,15 @@
   });
 
   function pick(item: Exclude<MenuItem, "separator">) {
-    onclose();
+    onclose(true);
     item.action();
   }
 
   function onkeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
+    if (event.key === "Escape" || event.key === "Tab") {
       event.preventDefault();
-      onclose();
+      event.stopPropagation();
+      onclose(true);
       return;
     }
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -60,7 +61,7 @@
   }
 </script>
 
-<svelte:window onpointerdown={outside} onblur={onclose} onresize={onclose} />
+<svelte:window onpointerdown={outside} onblur={() => onclose()} onresize={() => onclose()} />
 
 <div class="menu" role="menu" tabindex="-1" bind:this={menu} style:left="{left}px" style:top="{top}px" {onkeydown}>
   {#each items as item, i (i)}
@@ -81,6 +82,8 @@
     position: fixed;
     z-index: 100;
     min-width: 220px;
+    max-height: calc(100vh - 8px);
+    overflow-y: auto;
     padding: 4px;
     border: 1px solid var(--border);
     border-radius: 8px;
