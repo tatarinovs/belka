@@ -673,17 +673,17 @@
 <section data-pane={id} class:active onpointerdowncapture={onactivate} onfocusin={onactivate} onkeydowncapture={paneKey}>
   <div class="toolbar">
     {@render leading?.()}
+    <div class="history">
     <button class="icon-btn" title="Назад (Alt+←)" aria-label="Назад" onclick={() => travel(-1)} disabled={loading || historyAt <= 0}>
       <Icon name="arrowLeft" />
     </button>
     <button class="icon-btn" title="Вперёд (Alt+→)" aria-label="Вперёд" onclick={() => travel(1)} disabled={loading || historyAt >= history.length - 1}>
       <Icon name="arrowRight" />
     </button>
+    </div>
+    <div class="location">
     <button class="icon-btn" title="Вверх (Backspace)" aria-label="Вверх" onclick={goUp} disabled={listing?.parent == null}>
       <Icon name="up" />
-    </button>
-    <button class="icon-btn" title="Обновить (Ctrl+R)" aria-label="Обновить" onclick={reload}>
-      <Icon name="refresh" />
     </button>
 
     {#if editingPath}
@@ -712,6 +712,10 @@
     </nav>
     <button class="icon-btn path-edit" title="Ввести путь (Ctrl+L)" aria-label="Ввести путь" onclick={editPath}><Icon name="folder" size={14} /></button>
     {/if}
+    <button class="icon-btn" title="Обновить (Ctrl+R)" aria-label="Обновить" onclick={reload}>
+      <Icon name="refresh" />
+    </button>
+    </div>
 
     {#if actions}
       <div class="actions">{@render actions()}</div>
@@ -886,6 +890,31 @@
     box-shadow: inset 0 2px 0 transparent;
   }
 
+  .history {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 0;
+    margin-right: 6px;
+  }
+
+  .location {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    min-width: 0;
+    padding: 1px 2px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+  }
+
+  .location:focus-within {
+    border-color: var(--accent);
+  }
+
+  .location > .icon-btn { flex: none; }
+
   @container (max-width: 600px) {
     .crumbs > button:first-child span { display: none; }
     .toolbar :global(.btn.arrow span) { display: none; }
@@ -903,7 +932,7 @@
     align-items: center;
     gap: 2px;
     min-width: 0;
-    margin-left: 4px;
+    margin-left: 0;
     overflow: hidden;
     color: var(--muted);
   }
