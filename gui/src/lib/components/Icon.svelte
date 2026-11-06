@@ -39,6 +39,8 @@
     play: "M8 5v14l11-7z",
     stop: "M7 7h10v10H7z",
     search: "M21 21l-5-5m2-6a7 7 0 1 1-14 0 7 7 0 0 1 14 0",
+    star: "m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9z",
+    edit: "m15 5 4 4M4 20l4-1 12-12a2.8 2.8 0 0 0-4-4L4 15z",
   } as const;
   export type IconName = keyof typeof PATHS;
 </script>

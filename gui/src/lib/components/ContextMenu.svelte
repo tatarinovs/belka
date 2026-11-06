@@ -7,6 +7,7 @@
         icon?: IconName;
         shortcut?: string;
         disabled?: boolean;
+        checked?: boolean;
         danger?: boolean;
         action: () => void;
       }
@@ -66,8 +67,8 @@
     {#if item === "separator"}
       <div class="sep" role="separator"></div>
     {:else}
-      <button role="menuitem" class:danger={item.danger} disabled={item.disabled} onclick={() => pick(item)}>
-        <span class="ico">{#if item.icon}<Icon name={item.icon} size={14} />{/if}</span>
+      <button role={item.checked === undefined ? "menuitem" : "menuitemcheckbox"} aria-checked={item.checked} class:danger={item.danger} disabled={item.disabled} onclick={() => pick(item)}>
+        <span class="ico">{#if item.checked}<Icon name="check" size={14} />{:else if item.icon}<Icon name={item.icon} size={14} />{/if}</span>
         <span class="label">{item.label}</span>
         {#if item.shortcut}<span class="key">{item.shortcut}</span>{/if}
       </button>

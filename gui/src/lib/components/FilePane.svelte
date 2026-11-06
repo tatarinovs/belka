@@ -41,6 +41,7 @@
   import { explainError } from "$lib/errors";
   import { dnd, paneAt } from "$lib/dnd.svelte";
   import { formatBytes, formatDate } from "$lib/format";
+  import { stored, remember } from "$lib/storage";
   import ContextMenu, { type MenuItem } from "./ContextMenu.svelte";
   import Icon, { type IconName } from "./Icon.svelte";
 
@@ -137,6 +138,26 @@
   let history = $state<string[]>([]);
   let historyAt = $state(-1);
   let body: HTMLDivElement;
+  let tableWidth = $state(640);
+  let bodyWidth = $state(640);
+  let showSize = $state(true);
+  let showDate = $state(true);
+
+  function saveColumns() {
+    remember(`desktop.columns.${id}`, JSON.stringify({ showSize, showDate }));
+  }
+
+  function columnMenu(event: MouseEvent) {
+    event.preventDefault();
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    menu = { x: event.type === "contextmenu" ? event.clientX : rect.right - 220,
+      y: event.type === "contextmenu" ? event.clientY : rect.bottom, items: [
+        { label: "Размер", checked: showSize,
+          action: () => { showSize = !showSize; saveColumns(); } },
+        { label: "Дата", checked: showDate,
+          action: () => { showDate = !showDate; saveColumns(); } },
+      ] };
+  }
 
 
   /** Responses for a folder the user has already left are dropped. */
@@ -254,6 +275,11 @@
 
   // The page remounts a pane (via {#key}) whenever its source changes.
   onMount(() => {
+    try {
+      const saved = JSON.parse(stored(`desktop.columns.${id}`) ?? "null");
+      if (typeof saved?.showSize === "boolean") showSize = saved.showSize;
+      if (typeof saved?.showDate === "boolean") showDate = saved.showDate;
+    } catch { /* Ignore damaged UI preferences. */ }
     navigate(initialPath);
   });
 
@@ -704,6 +730,7 @@
       <span class="matches">{filtered.length} из {entries.length}</span>
       <button class="icon-btn" title="Сбросить поиск (Esc)" aria-label="Сбросить поиск" onclick={() => { filter(""); searchInput.focus(); }}><Icon name="close" size={14} /></button>
     {/if}
+    <button class="icon-btn" title="Отображение колонок" aria-label="Настроить колонки" onclick={columnMenu}><Icon name="settings" size={14} /></button>
   </div>
 
   {#if error}
@@ -721,14 +748,20 @@
     aria-busy={loading}
     {onkeydown}
     bind:this={grid}
+    bind:clientWidth={tableWidth}
+    style:--columns="minmax(0, 1fr) {showSize ? '90px' : ''} {showDate ? '130px' : ''}"
   >
-    <div class="head" role="row">
+    <div class="head" role="row" tabindex="-1" style:margin-right="{Math.max(0, tableWidth - bodyWidth)}px" oncontextmenu={columnMenu}>
       <button role="columnheader" tabindex="-1" aria-sort={ariaSort("name")} onclick={() => sortBy("name")}>Имя{sortMark("name")}</button>
-      <button role="columnheader" tabindex="-1" class="num" aria-sort={ariaSort("size")} onclick={() => sortBy("size")}>Размер{sortMark("size")}</button>
-      <button role="columnheader" tabindex="-1" aria-sort={ariaSort("modified")} onclick={() => sortBy("modified")}>Изменён{sortMark("modified")}</button>
+      {#if showSize}
+        <button role="columnheader" tabindex="-1" class="num" aria-sort={ariaSort("size")} onclick={() => sortBy("size")}>Размер{sortMark("size")}</button>
+      {/if}
+      {#if showDate}
+        <button role="columnheader" tabindex="-1" aria-sort={ariaSort("modified")} onclick={() => sortBy("modified")}>Изменён{sortMark("modified")}</button>
+      {/if}
     </div>
 
-    <div class="body" bind:this={body} class:dim={loading} role="presentation" oncontextmenu={(e) => openMenu(e, null)}>
+    <div class="body" bind:this={body} bind:clientWidth={bodyWidth} class:dim={loading} role="presentation" oncontextmenu={(e) => openMenu(e, null)}>
       {#each sorted as entry, i (rowKeys[i])}
         <!-- Keyboard navigation is handled by the grid's onkeydown. -->
         <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -779,8 +812,8 @@
               <span class="label" title={entry.name}>{entry.name}</span>
             {/if}
           </span>
-          <span class="num" role="gridcell">{entry.is_dir ? "" : formatBytes(entry.size)}</span>
-          <span class="date" role="gridcell">{formatDate(entry.modified)}</span>
+          {#if showSize}<span class="num" role="gridcell">{entry.is_dir ? "" : formatBytes(entry.size)}</span>{/if}
+          {#if showDate}<span class="date" role="gridcell" title={formatDate(entry.modified)}>{formatDate(entry.modified)}</span>{/if}
         </div>
       {:else}
         {#if !loading && !error}
@@ -925,7 +958,7 @@
   .head,
   .row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 90px 130px;
+    grid-template-columns: var(--columns, minmax(0, 1fr) 90px 130px);
     align-items: center;
   }
 
@@ -934,6 +967,9 @@
   }
 
   .head button {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     height: 28px;
     padding: 0 12px;
     border: 0;

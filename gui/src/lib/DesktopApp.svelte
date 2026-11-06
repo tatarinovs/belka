@@ -28,6 +28,8 @@
   import TabBar, { type Tab } from "$lib/components/TabBar.svelte";
   import TransferPanel from "$lib/components/TransferPanel.svelte";
   import PaneDivider from "$lib/components/PaneDivider.svelte";
+  import SavedLocations from "$lib/components/SavedLocations.svelte";
+  import type { SavedLocation } from "$lib/locations";
 
   const KEY_TABS = "tabs";
   // Used before tabs appeared; read once to keep the last place.
@@ -57,6 +59,7 @@
   let backupDraft = $state<BackupTask | null>(null);
   let about = $state(false);
   let shortcuts = $state(false);
+  let savedLocations = $state(false);
   let notice = $state("");
   const explainedNotice = $derived(explainError(notice));
   let busy = $state("");
@@ -201,6 +204,25 @@
     const at = localTabs.findIndex((t) => t.id === localTabId);
     localTabs.splice(at < 0 ? localTabs.length : at + 1, 0, tab);
     localTabId = tab.id;
+  }
+
+  async function openSaved(location: SavedLocation) {
+    if (location.kind !== "local") {
+      if (!accounts.some((a) => a.id === location.account)) {
+        notice = "Облако этой закладки больше не подключено.";
+        return;
+      }
+      if (cloudTab?.account === location.account) await cloudPane?.navigate(location.remote);
+      else if (cloudTab) { cloudTab.account = location.account; cloudTab.path = location.remote; }
+      else openCloudTab(location.account, location.remote);
+    }
+    if (location.kind !== "cloud") {
+      if (localTab) await localPane?.navigate(location.local);
+      else openLocalTab(location.local);
+    }
+    activePane = location.kind === "local" ? "local" : "cloud";
+    await tick();
+    (activePane === "cloud" ? cloudPane : localPane)?.focus();
   }
 
   function closeTab(side: "cloud" | "local", id: string) {
@@ -498,6 +520,9 @@
     <button class="tool" title="Регулярное копирование папок компьютера в облако" onclick={() => (backups = true)}>
       <Icon name="clock" /> Автобэкап
     </button>
+    <button class="tool" title="Избранные папки и сохранённые пары панелей" onclick={() => (savedLocations = true)}>
+      <Icon name="star" /> Избранное
+    </button>
     <span class="spacer"></span>
     <button class="tool" onclick={() => (about = true)}>
       <Icon name="info" /> О приложении
@@ -751,6 +776,10 @@
 />
 
 <AboutDialog open={about} onclose={() => (about = false)} />
+
+<SavedLocations open={savedLocations} {accounts}
+  cloud={selected ? { account: selected.id, path: cloudPath } : null} local={localPath}
+  onclose={() => (savedLocations = false)} onopen={openSaved} />
 
 <ShortcutsDialog open={shortcuts} onclose={() => (shortcuts = false)} />
 
