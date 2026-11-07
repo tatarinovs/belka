@@ -220,6 +220,8 @@ button {
    larger text and touch-sized controls. `:root.mobile` outweighs the
    components' own scoped rules. */
 :root.mobile {
+  /* Suppress WebView's rectangular tap flash, including in shared dialogs. */
+  -webkit-tap-highlight-color: transparent;
   font-family: system-ui, sans-serif;
   font-size: 15px;
 }

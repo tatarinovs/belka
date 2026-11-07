@@ -41,7 +41,7 @@
   type Pick =
     | { kind: "download"; account: Account; items: Entry[] }
     | { kind: "upload"; paths: string[] }
-    /** Cloud items going to a folder of the same or another cloud. */
+    /** Cloud items going to the phone, the same cloud or another cloud. */
     | { kind: "copy"; account: Account; items: Entry[] }
     | { kind: "backupLocal" }
     | { kind: "backupRemote" };
@@ -165,6 +165,7 @@
   let requestSeq = 0;
 
   async function navigate(target: string) {
+    exitRequestedAt = 0;
     const seq = ++requestSeq;
     const forMode = mode;
     const acc = account;
@@ -186,7 +187,14 @@
     } catch (err) {
       if (seq !== requestSeq) return;
       error = errorText(err);
-      listing ??= { path: target, parent: null, crumbs: [], entries: [] };
+      // A failed restored folder still has a parent; it is not the root.
+      listing ??= {
+        path: target,
+        parent: forMode === "cloud" ? (target === "/" ? null : parentPath(target))
+          : target ? (target === "/" ? "" : parentPath(target)) : null,
+        crumbs: [],
+        entries: [],
+      };
     } finally {
       if (seq === requestSeq) loading = false;
     }
@@ -198,6 +206,9 @@
 
   /** Switches the pane to the cloud or the phone, at the last folder there. */
   function show(next: Mode, target?: string) {
+    exitRequestedAt = 0;
+    longPressAt = 0;
+    ++requestSeq;
     mode = next;
     remember("mode", next);
     listing = null;
@@ -333,7 +344,7 @@
           ? "Подготовка копирования…"
           : "Подготовка загрузки…";
     try {
-      if (current.kind === "copy") {
+      if (current.kind === "copy" && mode === "cloud") {
         if (!account) return;
         if (current.account.id === account.id && current.items.some((e) => parentPath(e.path) === dir)) {
           showToast("Это та же папка: откройте другую", true);
@@ -349,7 +360,7 @@
         pick = null;
         return;
       }
-      if (current.kind === "download") {
+      if (current.kind === "download" || current.kind === "copy") {
         const conflicts = await api.localConflicts(dir, current.items.map((e) => e.name));
         if (conflicts.length && !(await confirmReplace(conflicts, "В этой папке"))) return;
         const count = await api.download(current.account.id, current.items, dir);
@@ -487,8 +498,8 @@
       { label: "Обновить", icon: "refresh", action: reload },
       "separator",
       { label: "По имени", icon: "sort", checked: sortKey === "name", action: () => setSort("name") },
-      { label: "Сначала новые", checked: sortKey === "modified", action: () => setSort("modified") },
-      { label: "Сначала большие", checked: sortKey === "size", action: () => setSort("size") },
+      { label: "Сначала новые", icon: "clock", checked: sortKey === "modified", action: () => setSort("modified") },
+      { label: "Сначала большие", icon: "sort", checked: sortKey === "size", action: () => setSort("size") },
       "separator",
       { label: "Автобэкап", icon: "clock", action: () => (backups = true) },
       { label: "Аккаунты", icon: "settings", action: () => (managing = true) },
@@ -532,7 +543,7 @@
     if (single?.is_dir && mode === "local" && accounts.length) {
       list.push({ label: "Автобэкап этой папки", icon: "clock", action: () => backupFolder(single) });
     }
-    list.push({ label: "Переименовать", disabled: !single, action: () => single && rename(single) });
+    list.push({ label: "Переименовать", icon: "edit", disabled: !single, action: () => single && rename(single) });
     if (mode === "cloud" && items.length) {
       list.push({ label: "Копировать в другую папку или облако", icon: "copy", action: startCopy });
     }
@@ -540,6 +551,7 @@
       if (def.shareOptions) list.push({ label: "Ссылка с паролем или сроком", icon: "link", action: () => (sharing = items) });
       list.push({
         label: "Закрыть доступ по ссылке",
+        icon: "lock",
         action: () =>
           operation("Закрытие доступа…", async () => {
             await api.cloudUnshare(account!.id, items);
@@ -641,31 +653,28 @@
     else if (pick) cancelPick();
     else if (backupDraft) backupDraft = null;
     else if (backups) backups = false;
+    // A pending listing has no reliable parent yet. Never exit during it.
+    else if (loading) return true;
     else if (!atRoot) goUp();
     else return false;
     return true;
   }
 
-  let exitArmed = false;
+  let exitRequestedAt = 0;
 
-  function onpopstate() {
+  function onSystemBack(event: Event) {
     if (back()) {
-      history.pushState({ belka: true }, "");
-    } else if (!exitArmed) {
-      // The next Back leaves the app: there is no history left to go back to.
-      exitArmed = true;
+      exitRequestedAt = 0;
+      event.preventDefault();
+    } else if (!exitRequestedAt || Date.now() - exitRequestedAt > 2000) {
+      exitRequestedAt = Date.now();
+      event.preventDefault();
       showToast("Нажмите «Назад» ещё раз, чтобы выйти");
-      setTimeout(() => {
-        if (exitArmed) {
-          exitArmed = false;
-          history.pushState({ belka: true }, "");
-        }
-      }, 2000);
     }
   }
 
   onMount(() => {
-    history.pushState({ belka: true }, "");
+    window.addEventListener("belka-back", onSystemBack);
     transfers.kick();
     getVersion().then((v) => (version = v));
     checkStorage();
@@ -698,12 +707,14 @@
     // Back from the system settings, where storage access may have been granted.
     const onvisible = () => {
       if (document.visibilityState === "visible") {
+        exitRequestedAt = 0;
         checkStorage();
         transfers.kick();
       }
     };
     document.addEventListener("visibilitychange", onvisible);
     return () => {
+      window.removeEventListener("belka-back", onSystemBack);
       offFinished();
       document.removeEventListener("visibilitychange", onvisible);
     };
@@ -736,7 +747,6 @@
 </script>
 
 <svelte:window
-  {onpopstate}
   onkeydown={(e) => {
     if (e.key !== "Escape") return;
     if (prompt) closePrompt(null);
@@ -788,7 +798,7 @@
           <span class="label">Облако</span>
         {/if}
       </button>
-      <button class:active={mode === "local"} disabled={!!pick} onclick={() => show("local")}>
+      <button class:active={mode === "local"} disabled={!!pick && pick.kind !== "copy"} onclick={() => show("local")}>
         <Icon name="phone" size={18} />
         <span class="label">Телефон</span>
       </button>
@@ -807,7 +817,7 @@
       />
       <span>
         {#if pick.kind === "copy"}
-          Откройте папку в любом облаке, куда скопировать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
+          Откройте папку на телефоне или в облаке, куда скопировать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
         {:else if pick.kind === "download"}
           Откройте папку на телефоне, куда скачать {pick.items.length === 1 ? `«${pick.items[0].name}»` : `объекты (${pick.items.length})`}
         {:else if pick.kind === "backupLocal"}

@@ -136,6 +136,8 @@ for /d %%D in ("%ANDROID_HOME%\ndk\*") do set "NDK_HOME=%%D"
 if not exist "%NDK_HOME%" goto ERR_NO_NDK
 if not exist "gui\src-tauri\gen\android\keystore.properties" echo [!] No keystore.properties: the APK will not be signed
 
+set "ORG_GRADLE_PROJECT_belkaCompressNative=true"
+
 pushd gui
 if not exist node_modules call npm ci
 call npm run tauri -- android build --apk --split-per-abi --target aarch64
