@@ -1,7 +1,6 @@
 //! Preview of cloud files. A file is downloaded into the app cache once and
-//! shown by the page through the asset protocol. The cache is cleared on
-//! start and kept under [`CACHE_LIMIT`], and starting a preview cancels the
-//! one still downloading.
+//! shown by the UI. The cache is cleared on start and kept under [`CACHE_LIMIT`],
+//! and starting a preview cancels the one still downloading.
 
 use anyhow::{bail, Context, Result};
 use belka_core::client::MAX_ATTEMPTS;
@@ -33,22 +32,22 @@ struct Current {
 
 #[derive(Serialize)]
 pub struct Preview {
-    /// The cached file, for the asset protocol.
-    path: String,
+    /// The cached file.
+    pub path: String,
     /// Content of a text file, decoded from UTF-8 or Windows-1251.
-    text: Option<String>,
+    pub text: Option<String>,
     /// The text was cut at [`TEXT_LIMIT`].
-    truncated: bool,
+    pub truncated: bool,
 }
 
 /// How far the preview in progress is.
 #[derive(Serialize)]
 pub struct PreviewProgress {
-    done: u64,
-    total: u64,
+    pub done: u64,
+    pub total: u64,
     /// Above 1 while network failures are retried.
-    attempt: u32,
-    max_attempts: u32,
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 /// A cloud file to preview; `size` and `modified` tell versions apart.
@@ -71,7 +70,7 @@ impl Previews {
     fn cache_path(&self, item: &Item) -> PathBuf {
         let mut hasher = DefaultHasher::new();
         (item.account_id, item.path, item.size, item.modified).hash(&mut hasher);
-        // The extension lets the asset protocol send the right content type.
+        // The extension lets the asset protocol or MediaStore know the content type.
         let ext: String = Path::new(item.path)
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
@@ -108,7 +107,7 @@ impl Previews {
             }
             mark_from_internet(&local);
             let (dir, keep) = (self.dir.clone(), local.clone());
-            tauri::async_runtime::spawn_blocking(move || trim(&dir, &keep, CACHE_LIMIT));
+            tokio::task::spawn_blocking(move || trim(&dir, &keep, CACHE_LIMIT));
         }
         let (text, truncated) = if text {
             let (text, truncated) = read_text(&local)?;
@@ -138,7 +137,7 @@ impl Previews {
         self.current.lock().unwrap().take();
     }
 
-    /// Checks that `path` is a cached preview, so the page cannot open other files.
+    /// Checks that `path` is a cached preview, so the UI cannot open other files.
     pub fn cached(&self, path: &str) -> Result<PathBuf> {
         let path = PathBuf::from(path);
         if path.parent() != Some(self.dir.as_path()) || !path.is_file() {

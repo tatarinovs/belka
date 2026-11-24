@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/store", "crates/cli", "gui/src-tauri"]
+members = ["crates/core", "crates/store", "crates/app", "crates/android", "crates/cli", "gui/src-tauri"]
 default-members = ["crates/cli"]
 
 [workspace.package]
@@ -12,6 +12,7 @@ authors = ["Belka Team"]
 [workspace.dependencies]
 belka-core = { path = "crates/core" }
 belka-store = { path = "crates/store" }
+belka-app = { path = "crates/app" }
 tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
 # TLS is chosen per platform in crates/core.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

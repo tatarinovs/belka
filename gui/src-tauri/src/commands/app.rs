@@ -1,13 +1,12 @@
 //! The app itself: storage access and the full screen on Android, updates.
 
-use crate::error::CmdResult;
 use crate::native;
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use belka_app::error::AppResult;
+use belka_app::Update;
 
 /// The frontend is drawn. On Windows a close made during startup stays hidden.
 #[tauri::command]
-pub fn app_ready(app: tauri::AppHandle) -> CmdResult<()> {
+pub fn app_ready(app: tauri::AppHandle) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     crate::tray::show_when_ready(&app);
     #[cfg(not(target_os = "windows"))]
@@ -28,101 +27,19 @@ pub fn storage_access(app: tauri::AppHandle) -> bool {
 
 /// Opens the system page where the user grants access to all files.
 #[tauri::command]
-pub fn request_storage_access(app: tauri::AppHandle) -> CmdResult<()> {
+pub fn request_storage_access(app: tauri::AppHandle) -> AppResult<()> {
     Ok(native::request_storage_access(&app)?)
 }
 
 /// Android: hides the system bars while a video fills the screen, or shows
 /// them again.
 #[tauri::command]
-pub fn set_immersive(app: tauri::AppHandle, on: bool) -> CmdResult<()> {
+pub fn set_immersive(app: tauri::AppHandle, on: bool) -> AppResult<()> {
     Ok(native::immersive(&app, on)?)
-}
-
-#[derive(Serialize)]
-pub struct Update {
-    version: String,
-    /// The release page.
-    page: String,
-    /// The Android package of the release, if it has one.
-    apk: Option<String>,
 }
 
 /// The latest release on GitHub if it is newer than this build.
 #[tauri::command]
-pub async fn check_update() -> CmdResult<Option<Update>> {
-    #[derive(Deserialize)]
-    struct Release {
-        tag_name: String,
-        html_url: String,
-        #[serde(default)]
-        draft: bool,
-        #[serde(default)]
-        prerelease: bool,
-        #[serde(default)]
-        assets: Vec<Asset>,
-    }
-    #[derive(Deserialize)]
-    struct Asset {
-        name: String,
-        browser_download_url: String,
-    }
-    async {
-        let release: Release = reqwest::Client::builder()
-            .user_agent(concat!("belka-gui/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(20))
-            .build()?
-            .get("https://api.github.com/repos/tatarinovs/belka/releases/latest")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let version = release.tag_name.trim_start_matches('v').to_string();
-        if release.draft || release.prerelease || !is_newer(&version, env!("CARGO_PKG_VERSION")) {
-            return Ok(None);
-        }
-        // A universal package or the one for 64-bit ARM phones.
-        let apk = release
-            .assets
-            .iter()
-            .filter(|a| a.name.ends_with(".apk"))
-            .min_by_key(|a| !(a.name.contains("arm64") || a.name.contains("universal")))
-            .map(|a| a.browser_download_url.clone());
-        Ok(Some(Update {
-            version,
-            page: release.html_url,
-            apk,
-        }))
-    }
-    .await
-    .map_err(|err: anyhow::Error| err.context("Failed to check for updates").into())
-}
-
-/// Compares dotted versions number by number; a suffix like "-beta" is ignored.
-fn is_newer(candidate: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split(['-', '+'])
-            .next()
-            .unwrap_or_default()
-            .split('.')
-            .map(|n| n.parse().unwrap_or(0))
-            .collect()
-    };
-    parse(candidate) > parse(current)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn newer_versions() {
-        assert!(is_newer("1.2.0", "1.1.0"));
-        assert!(is_newer("1.10.0", "1.9.3"));
-        assert!(is_newer("2.0", "1.9.9"));
-        assert!(!is_newer("1.1.0", "1.1.0"));
-        assert!(!is_newer("1.0.9", "1.1.0"));
-        assert!(!is_newer("1.1.0-beta", "1.1.0"));
-    }
+pub async fn check_update() -> AppResult<Option<Update>> {
+    belka_app::state::check_update(env!("CARGO_PKG_VERSION")).await
 }

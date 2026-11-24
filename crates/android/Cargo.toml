@@ -1,0 +1,24 @@
+[package]
+name = "belka-android"
+description = "JNI bridge between the native Android Kotlin UI and Belka Rust core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "belka_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+belka-core.workspace = true
+belka-store.workspace = true
+belka-app.workspace = true
+anyhow.workspace = true
+base64 = "0.22"
+jni = "0.21"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "tracing-log"] }

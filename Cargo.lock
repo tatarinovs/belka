@@ -304,6 +304,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "belka-android"
+version = "1.3.1"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "belka-app",
+ "belka-core",
+ "belka-store",
+ "jni",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "belka-app"
+version = "1.3.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "belka-core",
+ "belka-store",
+ "bytes",
+ "chrono",
+ "encoding_rs",
+ "futures-util",
+ "getrandom 0.3.4",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "trash",
+]
+
+[[package]]
 name = "belka-core"
 version = "1.3.1"
 dependencies = [
@@ -338,15 +377,11 @@ version = "1.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "belka-app",
  "belka-core",
  "belka-store",
- "bytes",
  "chrono",
- "encoding_rs",
- "futures-util",
- "getrandom 0.3.4",
  "jni",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
@@ -361,7 +396,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "trash",
  "windows-sys 0.61.2",
  "winreg",
 ]

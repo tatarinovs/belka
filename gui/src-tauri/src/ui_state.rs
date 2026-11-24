@@ -1,5 +1,5 @@
 //! UI preferences live outside the disposable browser profile.
-use crate::error::CmdResult;
+use belka_app::error::AppResult as CmdResult;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -1,16 +1,12 @@
-//! Streaming of cloud media. The page plays a video or audio file from a
+//! Streaming of cloud media. The player plays a video or audio file from a
 //! small HTTP server on 127.0.0.1 while the file downloads: playback starts
 //! at once and seeking fetches only the part needed. The player asks for
 //! byte ranges, which are read from the cloud in aligned chunks, kept for a
 //! while and read ahead.
 //!
-//! A URI scheme of the webview would need no port, but Android WebView
-//! applies the requested range to the scheme's response itself, as if the
-//! response were the whole file, so a scheme cannot serve ranges there.
 //! Other apps on the device can reach the port too: the URL carries a random
 //! token, and only the file being previewed and the one handed to an
-//! external player (VLC and the like, for what the webview cannot play) are
-//! served.
+//! external player (VLC and the like) are served.
 
 use anyhow::{anyhow, bail, Context, Result};
 use belka_core::StorageProvider;
@@ -36,7 +32,6 @@ const MAX_HEAD: usize = 16 * 1024;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// An external player counts as playing this long after its last request,
 /// so a pause between requests does not stop the stream.
-#[cfg(mobile)]
 const PLAYER_IDLE: Duration = Duration::from_secs(60);
 
 /// The files being streamed and the tokens of their URLs.
@@ -141,7 +136,6 @@ impl Streams {
 
     /// The name of the file an external player is streaming, while it is:
     /// Android keeps the app running for it under a notification.
-    #[cfg(mobile)]
     pub fn player_activity(&self) -> Option<String> {
         let slots = self.current.lock().unwrap();
         let (_, stream) = slots.player.as_ref()?;
@@ -159,12 +153,12 @@ impl Streams {
             .context("Failed to start the media server")?;
         let port = listener.local_addr()?.port();
         let current = self.current.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, _)) => {
                         let current = current.clone();
-                        tauri::async_runtime::spawn(async move {
+                        tokio::spawn(async move {
                             // The player drops connections it no longer needs.
                             if let Err(err) = serve(socket, &current).await {
                                 debug!("Media request ended: {err:#}");
@@ -316,7 +310,7 @@ impl Stream {
                 break;
             }
             let stream = self.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(err) = stream.chunk(ahead).await {
                     warn!("Reading ahead '{}' failed: {err:#}", stream.path);
                 }
@@ -372,8 +366,8 @@ fn parse_range(value: &str, size: u64) -> Option<(u64, u64)> {
     (first <= last).then_some((first, last))
 }
 
-/// The types the preview or an external player plays; see `previewKind` in
-/// the page. Android picks the apps to offer by them.
+/// The types the preview or an external player plays; see `previewKind`.
+/// Android picks the apps to offer by them.
 pub fn mime_type(path: &str) -> &'static str {
     let ext = path.rsplit_once('.').map(|(_, e)| e.to_lowercase());
     match ext.as_deref().unwrap_or_default() {

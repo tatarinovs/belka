@@ -2,28 +2,19 @@
 //! `native.rs`); on desktops the app runs due tasks itself while it is open,
 //! and `belka task run` can do it from the system scheduler otherwise.
 
-use crate::error::{translate, CmdResult};
 use crate::{native, AppState};
+use belka_app::error::AppResult;
 use belka_store::tasks::{self, Task, TaskView};
 use tauri::{Manager, State};
 
-/// The tasks with their history; errors are stored as the core wrote them
-/// and translated for the page here.
 #[tauri::command]
-pub fn backup_tasks(state: State<'_, AppState>) -> CmdResult<Vec<TaskView>> {
-    let mut views = state.tasks.views()?;
-    for run in views.iter_mut().flat_map(|v| v.task.history.iter_mut()) {
-        run.error = run.error.as_deref().map(translate);
-        for (_, reason) in &mut run.failures {
-            *reason = translate(reason);
-        }
-    }
-    Ok(views)
+pub fn backup_tasks(state: State<'_, AppState>) -> AppResult<Vec<TaskView>> {
+    state.backup_tasks()
 }
 
 /// Hands the schedule to the system on Android; nothing to do elsewhere.
 pub fn reschedule(app: &tauri::AppHandle, state: &AppState) {
-    match state.tasks.list() {
+    match state.backup_list() {
         Ok(tasks) => {
             if let Err(err) = native::schedule_backups(app, &tasks) {
                 tracing::warn!("Failed to schedule backups: {err:#}");
@@ -33,25 +24,13 @@ pub fn reschedule(app: &tauri::AppHandle, state: &AppState) {
     }
 }
 
-/// Adds a task (an empty id) or changes one.
 #[tauri::command]
 pub fn backup_save(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     task: Task,
-) -> CmdResult<Task> {
-    state.account(&task.account_id)?;
-    if tasks::is_running(&task.id) {
-        // A run must not record its index for a target the task no longer has.
-        if let Ok(old) = state.tasks.task(&task.id) {
-            if (&old.local, &old.account_id, &old.remote)
-                != (&task.local, &task.account_id, &task.remote)
-            {
-                tasks::cancel(&task.id);
-            }
-        }
-    }
-    let task = state.tasks.save(task)?;
+) -> AppResult<Task> {
+    let task = state.backup_save(task)?;
     reschedule(&app, &state);
     Ok(task)
 }
@@ -61,21 +40,18 @@ pub fn backup_remove(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
-) -> CmdResult<()> {
-    tasks::cancel(&id);
-    state.tasks.remove(&id)?;
+) -> AppResult<()> {
+    state.backup_remove(&id)?;
     reschedule(&app, &state);
     Ok(())
 }
 
-/// Starts a task now. On Android the run goes through WorkManager, which
-/// keeps it going in the background under a notification.
 #[tauri::command]
-pub fn backup_run(app: tauri::AppHandle, id: String) -> CmdResult<()> {
+pub fn backup_run(app: tauri::AppHandle, id: String) -> AppResult<()> {
     if tasks::is_running(&id) {
         return Ok(());
     }
-    let task = app.state::<AppState>().tasks.task(&id)?;
+    let task = app.state::<AppState>().backup_task(&id)?;
     if !native::run_backup(&app, &task)? {
         spawn_run(app, id);
     }
@@ -83,8 +59,8 @@ pub fn backup_run(app: tauri::AppHandle, id: String) -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub fn backup_cancel(id: String) {
-    tasks::cancel(&id);
+pub fn backup_cancel(state: State<'_, AppState>, id: String) {
+    state.backup_cancel(&id);
 }
 
 /// Runs a task in the app's own runtime.
@@ -95,8 +71,7 @@ fn spawn_run(app: tauri::AppHandle, id: String) {
             return;
         }
         let state = app.state::<AppState>();
-        let provider = |account: &str| state.provider(account);
-        if let Err(err) = tasks::run(&state.tasks, &id, &provider).await {
+        if let Err(err) = state.run_backup_task(&id).await {
             tracing::warn!("{err:#}");
         }
     });
@@ -116,8 +91,7 @@ pub fn start_scheduler(app: tauri::AppHandle) {
             let now = chrono::Utc::now();
             let due: Vec<String> = app
                 .state::<AppState>()
-                .tasks
-                .list()
+                .backup_list()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|t| t.is_due(now) && !tasks::is_running(&t.id))

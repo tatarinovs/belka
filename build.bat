@@ -121,7 +121,7 @@ rem goto ALL_DONE
 
 REM ---------------------------------------------------------------------
 REM Build Android APK (arm64), signed with the key from
-REM gui\src-tauri\gen\android\keystore.properties.
+REM android\keystore.properties or gui\src-tauri\gen\android\keystore.properties.
 REM ---------------------------------------------------------------------
 :BUILD_ANDROID
 echo.
@@ -134,19 +134,18 @@ if defined NDK_HOME goto ANDROID_NDK_OK
 for /d %%D in ("%ANDROID_HOME%\ndk\*") do set "NDK_HOME=%%D"
 :ANDROID_NDK_OK
 if not exist "%NDK_HOME%" goto ERR_NO_NDK
-if not exist "gui\src-tauri\gen\android\keystore.properties" echo [!] No keystore.properties: the APK will not be signed
+if not exist "android\keystore.properties" if not exist "gui\src-tauri\gen\android\keystore.properties" echo [!] No keystore.properties: the APK will not be signed
 
 set "ORG_GRADLE_PROJECT_belkaCompressNative=true"
 
-pushd gui
-if not exist node_modules call npm ci
-call npm run tauri -- android build --apk --split-per-abi --target aarch64
+pushd android
+call gradlew.bat assembleRelease -PbelkaAbis=arm64-v8a
 set ANDROID_ERR=%errorlevel%
 popd
 if not "%ANDROID_ERR%"=="0" goto ERR_BUILD_ANDROID
 
-for /f "usebackq delims=" %%V in (`node -p "require('./gui/package.json').version"`) do set "APP_VERSION=%%V"
-copy /Y "gui\src-tauri\gen\android\app\build\outputs\apk\arm64\release\app-arm64-release.apk" "dist\belka-%APP_VERSION%-arm64.apk" >nul
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "$re = [regex]'(?s)\[workspace\.package\].*?\nversion\s*=\s*\x22([^\x22]*)'; $re.Match([IO.File]::ReadAllText('Cargo.toml')).Groups[1].Value"`) do set "APP_VERSION=%%V"
+copy /Y "android\app\build\outputs\apk\release\app-release.apk" "dist\belka-%APP_VERSION%-arm64.apk" >nul
 echo [OK] Android package ready: dist\belka-%APP_VERSION%-arm64.apk
 goto ALL_DONE
 

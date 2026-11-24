@@ -1,4 +1,5 @@
-use crate::{error::CmdResult, ui_state::UiState};
+use crate::ui_state::UiState;
+use belka_app::error::AppResult as CmdResult;
 use serde::Serialize;
 use tauri::State;
 

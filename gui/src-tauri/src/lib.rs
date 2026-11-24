@@ -1,97 +1,29 @@
 mod commands;
-mod error;
-mod local;
 mod native;
-mod preview;
 mod settings;
-mod stream;
-mod transfers;
 #[cfg(target_os = "windows")]
 mod tray;
 mod ui_state;
 #[cfg(target_os = "windows")]
 mod webview_cache;
 
-use anyhow::Result;
-use belka_core::storage::crypt::CryptProvider;
-use belka_core::StorageProvider;
-use belka_store::accounts::{Account, AccountSource, AccountStore, CRYPT_KIND};
+use belka_app::AppCore;
 use belka_store::secrets::Secrets;
-use belka_store::tasks::TaskStore;
-use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 #[cfg(mobile)]
 use std::time::Duration;
 use tauri::Manager;
-use tokio::sync::oneshot;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::prelude::*;
-use transfers::Transfers;
 
-pub(crate) struct AppState {
-    /// Serializes changes of the account list.
-    accounts: Mutex<AccountStore>,
-    /// Providers are built lazily and reused, so tokens and connections are kept.
-    providers: Mutex<HashMap<String, Arc<dyn StorageProvider>>>,
-    transfers: Arc<Transfers>,
-    /// Aborts the browser sign-in in progress.
-    sign_in_cancel: Mutex<Option<oneshot::Sender<()>>>,
-    previews: preview::Previews,
-    streams: stream::Streams,
-    tasks: TaskStore,
-}
+pub(crate) struct AppState(pub Arc<AppCore>);
 
-impl AppState {
-    fn provider(&self, account_id: &str) -> Result<Arc<dyn StorageProvider>> {
-        if let Some(p) = self.providers.lock().unwrap().get(account_id) {
-            return Ok(p.clone());
-        }
-        let provider: Arc<dyn StorageProvider> = if self.account(account_id)?.kind == CRYPT_KIND {
-            let folder = self.accounts.lock().unwrap().crypt_folder(account_id)?;
-            if self.account(&folder.base)?.kind == CRYPT_KIND {
-                anyhow::bail!("An encrypted folder cannot be placed inside another one");
-            }
-            // The base comes from the cache, with its tokens and connections.
-            let base = self.provider(&folder.base)?;
-            Arc::new(CryptProvider::new(base, &folder.root, &folder.config)?)
-        } else {
-            let config = self.accounts.lock().unwrap().credentials(account_id)?;
-            config.build()?.into()
-        };
-        self.providers
-            .lock()
-            .unwrap()
-            .insert(account_id.to_string(), provider.clone());
-        Ok(provider)
-    }
+impl Deref for AppState {
+    type Target = AppCore;
 
-    fn account(&self, account_id: &str) -> Result<Account> {
-        self.accounts.lock().unwrap().account(account_id)
-    }
-
-    /// Uses `provider` for the account from now on. Encrypted folders in it
-    /// hold the old one, so they are rebuilt on next use.
-    fn replace_provider(&self, account_id: &str, provider: Arc<dyn StorageProvider>) {
-        let dependent: Vec<String> = {
-            let store = self.accounts.lock().unwrap();
-            store
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|a| a.kind == CRYPT_KIND)
-                .filter(|a| {
-                    store
-                        .crypt_folder(&a.id)
-                        .is_ok_and(|f| f.base == account_id)
-                })
-                .map(|a| a.id)
-                .collect()
-        };
-        let mut providers = self.providers.lock().unwrap();
-        for id in dependent {
-            providers.remove(&id);
-        }
-        providers.insert(account_id.to_string(), provider);
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -106,6 +38,7 @@ pub fn run() {
                 .with_default(LevelFilter::WARN)
                 .with_target("belka_core", LevelFilter::INFO)
                 .with_target("belka_store", LevelFilter::INFO)
+                .with_target("belka_app", LevelFilter::INFO)
                 .with_target("belka_gui_lib", LevelFilter::INFO)
         });
     tracing_subscriber::fmt()
@@ -162,21 +95,13 @@ pub fn run() {
                 .unwrap_or(app.path().app_config_dir()?);
             let ui_state = ui_state::UiState::new(&config_dir)?;
             app.manage(ui_state);
-            let preview_dir = app.path().app_cache_dir()?.join("preview");
+            let cache_dir = app.path().app_cache_dir()?;
             // On Android the file is in the app's private folder; desktops
             // use the keyring, which the CLI shares.
             let secrets = Secrets::system_or(app.path().app_data_dir()?.join("secrets.json"));
-            let transfers = Transfers::new(app.path().app_cache_dir()?.join("copy"));
-            native::watch_transfers(app.handle().clone(), transfers.clone());
-            app.manage(AppState {
-                tasks: TaskStore::new(&config_dir),
-                accounts: Mutex::new(AccountStore::new(&config_dir, secrets)),
-                providers: Mutex::new(HashMap::new()),
-                transfers,
-                sign_in_cancel: Mutex::new(None),
-                previews: preview::Previews::new(preview_dir),
-                streams: stream::Streams::default(),
-            });
+            let core = Arc::new(AppCore::new(&config_dir, &cache_dir, secrets));
+            native::watch_transfers(app.handle().clone(), core.transfers.clone());
+            app.manage(AppState(core));
             #[cfg(target_os = "windows")]
             {
                 // Allocate only after the single-instance check, so repeated

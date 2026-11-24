@@ -6,7 +6,7 @@
 //! draws PDF pages, which Android WebView cannot show.
 //! On desktops the commands answer as if everything were allowed.
 
-use crate::transfers::Transfers;
+use belka_app::transfers::Transfers;
 use belka_store::tasks::Task;
 use std::path::Path;
 use std::sync::Arc;
@@ -356,7 +356,7 @@ struct PdfPageSize {
 /// loads the library itself, so they work while the page is not running.
 #[cfg(target_os = "android")]
 mod jni_api {
-    use crate::error::translate;
+    use belka_app::error::translate;
     use belka_store::accounts::AccountStore;
     use belka_store::secrets::Secrets;
     use belka_store::tasks::{self, TaskStore};

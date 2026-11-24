@@ -1,17 +1,30 @@
-//! Errors of the commands, as the page shows them: in Russian where the
+//! Errors of the GUI operations, as the UI shows them: in Russian where the
 //! message is known, otherwise as the libraries wrote it. The core and the
 //! CLI speak English; only the GUI translates.
 
 use serde::{Serialize, Serializer};
+use std::fmt;
 
-/// A command error: the whole context chain, translated.
+/// An application error: the whole context chain, translated.
 #[derive(Debug)]
-pub struct CmdError(String);
+pub struct AppError(pub String);
 
-pub type CmdResult<T> = Result<T, CmdError>;
+pub type AppResult<T> = Result<T, AppError>;
 
-impl From<anyhow::Error> for CmdError {
-    /// Also logged: the page shows the message, but the log keeps it.
+impl AppError {
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    /// Also logged: the UI shows the message, but the log keeps it.
     fn from(err: anyhow::Error) -> Self {
         let msg = format!("{err:#}");
         tracing::warn!("{msg}");
@@ -19,13 +32,13 @@ impl From<anyhow::Error> for CmdError {
     }
 }
 
-impl Serialize for CmdError {
+impl Serialize for AppError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
     }
 }
 
-/// Separates the explanation from the original message; the page splits
+/// Separates the explanation from the original message; the UI splits
 /// the text here to show the original under "Подробнее".
 pub const DETAIL_MARK: &str = ". Подробности: ";
 
@@ -206,7 +219,10 @@ const EXACT: &[(&str, &str)] = &[
         "No player is set for files of this type",
         "В системе не назначена программа для файлов этого типа",
     ),
-    ("No app can play the video", "Нет приложения, которое может воспроизвести это видео"),
+    (
+        "No app can play the video",
+        "Нет приложения, которое может воспроизвести это видео",
+    ),
     ("Cannot access ", "Нет доступа к "),
     ("Cannot open folder ", "Не удаётся открыть папку "),
     ("Invalid name ", "Недопустимое имя "),

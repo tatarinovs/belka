@@ -1,5 +1,5 @@
-//! Local file system browsing for the right-hand pane. The empty path is the
-//! virtual "This PC" root: well-known folders followed by the drives.
+//! Local file system browsing. The empty path is the virtual root:
+//! well-known folders followed by the drives.
 
 use anyhow::{bail, Context, Result};
 use belka_core::storage::check_name;
@@ -9,35 +9,55 @@ use std::path::{Component, Path, PathBuf};
 
 #[derive(Serialize)]
 pub struct LocalEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-    size: u64,
-    modified: Option<DateTime<Utc>>,
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<DateTime<Utc>>,
     /// Icon hint for entries of the virtual root: "drive" or "place".
     #[serde(skip_serializing_if = "Option::is_none")]
-    icon: Option<&'static str>,
+    pub icon: Option<&'static str>,
 }
 
 #[derive(Serialize)]
 pub struct Crumb {
-    name: String,
-    path: String,
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Serialize)]
 pub struct LocalListing {
-    path: String,
+    pub path: String,
     /// `None` at the virtual root; `""` means "go up to the root".
-    parent: Option<String>,
-    crumbs: Vec<Crumb>,
-    entries: Vec<LocalEntry>,
+    pub parent: Option<String>,
+    pub crumbs: Vec<Crumb>,
+    pub entries: Vec<LocalEntry>,
 }
 
 /// A well-known folder shown at the virtual root.
 pub struct Place {
     pub name: &'static str,
     pub path: PathBuf,
+}
+
+/// The shared storage of Android devices, visible with "All files access".
+pub const ANDROID_STORAGE: &str = "/storage/emulated/0";
+
+/// The shared storage folders every Android device has.
+pub fn android_places() -> Vec<Place> {
+    let root = PathBuf::from(ANDROID_STORAGE);
+    [
+        ("Загрузки", "Download"),
+        ("Документы", "Documents"),
+        ("Камера", "DCIM"),
+        ("Изображения", "Pictures"),
+    ]
+    .into_iter()
+    .map(|(name, dir)| Place {
+        name,
+        path: root.join(dir),
+    })
+    .collect()
 }
 
 pub fn list(path: &str, places: &[Place]) -> Result<LocalListing> {
@@ -82,14 +102,25 @@ pub fn list(path: &str, places: &[Place]) -> Result<LocalListing> {
 
     Ok(LocalListing {
         path: dir.display().to_string(),
-        parent: Some(
-            dir.parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-        ),
+        parent: Some(parent_dir(&dir)),
         crumbs: crumbs(&dir),
         entries,
     })
+}
+
+#[cfg(any(target_os = "android", test))]
+fn is_android_drive_root(dir: &Path) -> bool {
+    dir == Path::new(ANDROID_STORAGE) || dir.parent() == Some(Path::new("/storage"))
+}
+
+fn parent_dir(dir: &Path) -> String {
+    #[cfg(target_os = "android")]
+    if is_android_drive_root(dir) {
+        return String::new();
+    }
+    dir.parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
 }
 
 /// Rejects names the local file system cannot store.
@@ -128,8 +159,8 @@ pub fn rename(path: &str, new_name: &str) -> Result<String> {
     Ok(to.display().to_string())
 }
 
-/// Moves files and folders to the Recycle Bin.
-#[cfg(desktop)]
+/// Moves files and folders to the Recycle Bin on desktops.
+#[cfg(all(not(target_os = "android"), feature = "trash"))]
 pub fn delete(paths: &[String]) -> Result<()> {
     if paths.iter().any(|p| Path::new(p).parent().is_none()) {
         bail!("A drive cannot be deleted");
@@ -138,7 +169,7 @@ pub fn delete(paths: &[String]) -> Result<()> {
 }
 
 /// Android has no Recycle Bin: files and folders are deleted permanently.
-#[cfg(mobile)]
+#[cfg(any(target_os = "android", not(feature = "trash")))]
 pub fn delete(paths: &[String]) -> Result<()> {
     for path in paths.iter().map(Path::new) {
         if path.parent().is_none() || path == Path::new(ANDROID_STORAGE) {
@@ -179,7 +210,7 @@ fn root_entries(places: &[Place]) -> Vec<LocalEntry> {
     places.chain(drives).collect()
 }
 
-#[cfg(desktop)]
+#[cfg(not(target_os = "android"))]
 fn drive_name(path: &Path) -> String {
     path.display()
         .to_string()
@@ -187,7 +218,7 @@ fn drive_name(path: &Path) -> String {
         .to_string()
 }
 
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 fn drive_name(path: &Path) -> String {
     if path == Path::new(ANDROID_STORAGE) {
         "Внутренняя память".to_string()
@@ -210,18 +241,14 @@ fn drives() -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(all(not(windows), desktop))]
+#[cfg(all(not(windows), not(target_os = "android")))]
 fn drives() -> Vec<PathBuf> {
     vec![PathBuf::from("/")]
 }
 
-/// The shared storage of the device, visible with "All files access".
-#[cfg(mobile)]
-pub const ANDROID_STORAGE: &str = "/storage/emulated/0";
-
 /// The internal shared storage plus memory cards, which Android mounts
 /// as `/storage/XXXX-XXXX`.
-#[cfg(mobile)]
+#[cfg(target_os = "android")]
 fn drives() -> Vec<PathBuf> {
     let mut drives = vec![PathBuf::from(ANDROID_STORAGE)];
     if let Ok(entries) = std::fs::read_dir("/storage") {
@@ -355,5 +382,13 @@ mod tests {
         let listing = list("", &[]).unwrap();
         assert!(listing.parent.is_none());
         assert!(listing.entries.iter().any(|e| e.icon == Some("drive")));
+    }
+
+    #[test]
+    fn android_drive_roots_skip_unreadable_parents() {
+        assert!(is_android_drive_root(Path::new("/storage/emulated/0")));
+        assert!(is_android_drive_root(Path::new("/storage/emulated/0/")));
+        assert!(is_android_drive_root(Path::new("/storage/1234-5678")));
+        assert!(!is_android_drive_root(Path::new("/storage/emulated/0/Download")));
     }
 }

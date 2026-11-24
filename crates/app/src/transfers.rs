@@ -1,9 +1,9 @@
 //! The transfer queue: uploads, downloads and copies between clouds run as
-//! background tasks, at most
-//! [`MAX_PARALLEL`] at a time. The frontend polls [`Transfers::list`] and reads
-//! progress counters directly, so running transfers never block on the UI.
-//! A queue can hold thousands of files, so the page gets the running ones,
-//! the head of the queue and the latest finished ones, plus counts of all.
+//! background tasks, at most [`MAX_PARALLEL`] at a time. The UI polls
+//! [`Transfers::list`] and reads progress counters directly, so running
+//! transfers never block on the UI. A queue can hold thousands of files, so
+//! the UI gets the running ones, the head of the queue and the latest finished
+//! ones, plus counts of all.
 
 use crate::error::translate;
 use anyhow::{Context, Result};
@@ -17,13 +17,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use tauri::async_runtime::{spawn, JoinHandle};
+use tokio::spawn;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 const MAX_PARALLEL: usize = 3;
-/// Queued transfers sent to the page; the rest are only counted.
+/// Queued transfers sent to the UI; the rest are only counted.
 const SHOWN_QUEUED: usize = 50;
-/// The most recently finished transfers sent to the page.
+/// The most recently finished transfers sent to the UI.
 const SHOWN_FINISHED: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -93,7 +94,7 @@ struct Job {
 impl Job {
     fn view(&self) -> TransferView {
         let (remote_dir, name) = split_remote(&self.spec.remote);
-        // Kept as the core wrote it, for the log; the page gets Russian.
+        // Kept as the core wrote it, for the log; the UI gets Russian.
         let status = match &self.status {
             Status::Failed { error } => Status::Failed {
                 error: translate(error),
@@ -133,39 +134,39 @@ impl Job {
 
 #[derive(Serialize)]
 pub struct TransferView {
-    id: u64,
-    direction: Direction,
-    account_id: String,
-    account_name: String,
-    name: String,
-    local_path: String,
-    remote_path: String,
-    remote_dir: String,
+    pub id: u64,
+    pub direction: Direction,
+    pub account_id: String,
+    pub account_name: String,
+    pub name: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub remote_dir: String,
     #[serde(flatten)]
-    status: Status,
-    unchanged: bool,
-    done: u64,
-    total: u64,
+    pub status: Status,
+    pub unchanged: bool,
+    pub done: u64,
+    pub total: u64,
     /// Above 1 while network failures are retried.
-    attempt: u32,
-    max_attempts: u32,
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 #[derive(Default, Serialize)]
 pub struct Counts {
-    queued: usize,
-    running: usize,
-    done: usize,
-    failed: usize,
-    cancelled: usize,
+    pub queued: usize,
+    pub running: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub cancelled: usize,
 }
 
 #[derive(Serialize)]
 pub struct TransferList {
-    items: Vec<TransferView>,
-    counts: Counts,
+    pub items: Vec<TransferView>,
+    pub counts: Counts,
     /// A filtered slice for display; `items` still feeds completion events.
-    view_items: Option<Vec<TransferView>>,
+    pub view_items: Option<Vec<TransferView>>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -195,14 +196,14 @@ impl TransferFilter {
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
     /// Queued and running transfers.
-    active: usize,
+    pub active: usize,
     /// Of them uploads.
-    uploads: usize,
+    pub uploads: usize,
     /// A running file, to name in the notification.
-    name: String,
+    pub name: String,
     /// Progress of the running files.
-    done_bytes: u64,
-    total_bytes: u64,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
     /// The file an external player is streaming, or "".
     pub player: String,
 }
@@ -554,7 +555,7 @@ impl Transfers {
         }
     }
 
-    /// Includes failures outside the slice sent to the page. Cancelled jobs
+    /// Includes failures outside the slice sent to the UI. Cancelled jobs
     /// are retried only explicitly, never by "retry all errors".
     pub fn failed_ids(&self) -> Vec<u64> {
         self.jobs
@@ -567,7 +568,6 @@ impl Transfers {
     }
 
     /// A summary of the active transfers for the Android progress notification.
-    #[cfg_attr(desktop, allow(dead_code))]
     pub fn activity(&self) -> Activity {
         let jobs = self.jobs.lock().unwrap();
         let mut activity = Activity::default();
@@ -614,7 +614,6 @@ impl Transfers {
         }
     }
 
-    #[cfg(target_os = "windows")]
     pub fn active_count(&self) -> usize {
         self.jobs
             .lock()
@@ -626,7 +625,6 @@ impl Transfers {
 
     /// Stop accepting jobs before cancelling, including scans still preparing
     /// their upload plans while the user confirms exiting.
-    #[cfg(target_os = "windows")]
     pub fn shutdown(&self) {
         self.closing.store(true, Ordering::Release);
         self.cancel_all();
@@ -847,7 +845,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
     fn shutdown_cancels_active_jobs_and_preserves_finished_results() {
         let tmp = tempfile::tempdir().unwrap();
         let transfers = Transfers::new(tmp.path().join("copy"));
